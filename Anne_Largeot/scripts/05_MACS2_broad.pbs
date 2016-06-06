@@ -1,0 +1,69 @@
+#!/bin/sh
+#
+# Set name of job
+#PBS -N MACS2_broadPeak
+
+# Set the number of nodes and processors per node
+#PBS -l nodes=2:ppn=8
+
+# Define job queue: bioinfo (short), genome (long), vlm (high mem)
+#PBS -q bioinf.q
+
+# Mail alert at (b)eginning, (e)end and (a)bortion of execution
+#PBS -m bea
+#PBS -M zaki.fadlullah@cruk.manchester.ac.uk 
+
+#Set Working Directory
+cd $PBS_O_WORKDIR
+echo "Working directory is $PWD"
+
+# or you can define where to write output
+#PBS -o $PBS_O_WORKDIR
+#PBS -e $PBS_O_WORKDIR
+#PBS -j oe
+
+# Export all my environment variables to the job
+#PBS -V
+
+module load apps/python
+module load apps/R/3.1.0/gcc-4.4.7
+
+# ----------------------------------------------------------------------------- #
+# Specifying files
+# ----------------------------------------------------------------------------- #
+# Directory which contains deduped BAM files
+master=/data/stemcell/sczaki/project/anne
+
+GL16Dir=${master}/GL16-18/bam_merged/sorted/chr_filtered/remove_dupe
+GL20Dir=${master}/GL20/bam_merged/chr_filtered/removed_dupe
+GL24Dir=${master}/GL24/bam_lanewise/sorted/chr_filtered/remove_dupe
+
+
+# MT2 Project Input
+input_ckit_WT=${GL20Dir}/input_ckit_wt.bam
+input_ckit_diff=${GL20Dir}/input_ckit_diff.bam
+input_MT2=${GL20Dir}/input_MT2.bam
+
+MT2_outdir=${master}/MT2_MOZ/MT2/broadPeaak # Change the folder
+mkdir ${MT2_outdir}
+
+
+
+# ----------------------------------------------------------------------------- #
+# Calling Peaks with broadPeak settings
+# ----------------------------------------------------------------------------- #
+
+# MT2 Project
+macs2 callpeak -t ${GL20Dir}/H39K9_14A_MT2.bam -c ${input_MT2} --broad --format BAM -g mm -n GL20_H39K9_14A_MT2_0.001 --outdir ${MT2_outdir} --broad-cutoff 0.001
+
+macs2 callpeak -t ${GL20Dir}/H39K9_14A_ckit.bam -c ${input_ckit_WT} --broad --format BAM -g mm -n GL20_H39K9_14A_ckit_0.001 --outdir ${MT2_outdir} --broad-cutoff 0.001
+
+macs2 callpeak -t ${GL20Dir}/H39K9_14A_ckit_diff.bam -c ${input_ckit_diff} --broad --format BAM -g mm -n GL20_H39K9_14A_ckit_diff_0.001 --outdir ${MT2_outdir} --broad-cutoff 0.001
+
+
+
+
+
+
+
+

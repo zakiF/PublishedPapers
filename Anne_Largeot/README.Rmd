@@ -1,0 +1,55 @@
+---
+title: "Workflow"
+author: "Zaki Fadlullah"
+date: "06 June 2016"
+output: html_document
+---
+
+## Chip seq workflow
+
+1. Align sequencing reads to mouse genome mm10 (bowtie 2)  
+*sh scripts/bowtie2.sh*
+
+2. Convert SAM to BAM  
+*sh scripts/sam2bam.sh*
+
+3. Merge BAM files from the same samples together  
+*sh scripts/mergeBAM.sh*
+
+4. Remove PCR duplicates  
+*sh scripts/remove_dupe.sh*
+
+5. Calling Peaks   
+**Note**  
+The setting for Peak calling depends on the type of the Chip-seq experiments.  
+ -- For **Histone makrs** - Use broadPeak calling settings  
+ *sh scripts/MACS2_broad.pbs*  
+ -- For **Transcription factors** - Use various p value settings and determine which is gives the most sensible results  
+ *sh scripts/MACS2_pValue.pbs*   
+
+6. Remove peaks located in black listed region  
+ *sh scripts/remove_blacklist.sh*
+
+7. Extend the peak by 250 from each end [Only for the Transcrption factor peaks]  
+ *sh scripts/extend.sh*
+
+8. Merge peaks which are 100bp apart from each other & generate bigBed file  
+ *sh scripts/merge.sh*  
+
+9. Generate bigWig track  
+ *sh scripts/Homer_makeTag*
+ 
+Upload the bigWig and bigBed file to ftp server
+
+
+## After peak calling
+
+After the peak is called we could do the following
+
+1. Annotate the peaks
+
+2. Get the number of raw reads at the peak region
+
+3. Normalise with RPKM
+
+
