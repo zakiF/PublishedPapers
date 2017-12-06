@@ -5,7 +5,7 @@ Overview
 This document describes the workflow to process the single cell rna-seq data presented in the paper.
 
 
-All required input files can be obtained from GEO at the accession nunber  [GSE107653](https://www.ncbi.nlm.nih.gov/geo/query/acc.cgi?acc=GSE107653). 
+All required input files can be obtained from GEO at the accession number  [GSE107653](https://www.ncbi.nlm.nih.gov/geo/query/acc.cgi?acc=GSE107653). 
 
 
 Differential expression results can be found at `output/DESeq2`. 
