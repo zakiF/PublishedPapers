@@ -11,6 +11,12 @@ All required input files can be obtained from GEO at the accession number  [GSE1
 Differential expression results can be found at `output/DESeq2`. 
 
 
+Rmarkdown file containing the processing workflow are located at ;
+
+* scWorkflow.Rmd  
+* scWorkflow.html  
+
+
 
 Pre-processing of sequence data
 ===============================
