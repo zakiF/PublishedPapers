@@ -1,0 +1,1685 @@
+# Import results from DPSF {#preProcessing}
+
+
+## Objective
+
+We want to process a new sequening run. These are ACE+ cells sorted by Neo. We have INDEX-FACS of the levels of ACE, CD44, CDH5 
+
+## Pre-processing
+
+### Library
+
+Load required library
+
+```{r, warning=FALSE, message=FALSE}
+library(ggplot2)
+library(dplyr)
+library(scater)
+library(here) 
+library(gghighlight)
+```
+
+
+### Directory
+
+
+Check if the correct directory is specified
+
+```{r}
+dr_here()
+```
+
+
+
+```{r}
+#workDir <- here()
+workDir <- "/Users/zfadlullah/Dropbox (The University of Manchester)/zaki/PhD/sequencing_runs/2019/191001_MZ_009"
+dataDir <- file.path(workDir, "data")
+outDir <- file.path(workDir, "output")
+dir.create(outDir)
+outDir_cur <- file.path(outDir, "Chapter_10_AcePos")
+dir.create(outDir_cur)
+set.seed(100)
+```
+
+
+### Import GTF
+
+This is the gencode gtf annotation combined with the ERCC. Since the GTF file is large (~700Mb), we did not store this GTF in our data folder. A copy can be provided or available to donwload from the link given above.
+
+```{r, eval=FALSE}
+myGTF <- file.path(dataDir, "gencode_noERCC.gtf")
+newGTF <- import.gff(myGTF)
+gtfdf <- as.data.frame(newGTF)
+gtf_sub <- dplyr::select(gtfdf, gene_id, gene_name, gene_type, seqnames) %>%
+  dplyr::distinct(.keep_all = TRUE)
+# Save this to the ouputfolder
+#write.table(gtf_sub, file.path(outDir, "simple_gtf.txt"), quote=F, sep="\t")
+
+# The above is enough, but we want to get the width as well
+gtf_w <- dplyr::select(gtfdf, gene_id, type, width) %>%
+  dplyr::filter(type == "gene") %>%
+  dplyr::select(gene_id, width) %>%
+  dplyr::distinct(.keep_all = TRUE)
+
+# Combine the information
+gtf_sub <- dplyr::left_join(gtf_sub, gtf_w)
+# Save this to the data / outputfolder
+write.table(gtf_sub, file.path(outDir, "simple_gtf.txt"), quote=F, sep="\t")
+```
+
+
+Load the simplified gtf
+
+```{r}
+simple_gtf <- read.delim(file.path(dataDir, "GTF/simple_gtf.txt"),
+                         stringsAsFactors = FALSE)
+```
+
+
+Since the ERCC have no **gene_name** and **gene_type** is NA, we have to manually insert this information.
+
+```{r}
+simple_gtf$seqnames <- as.character(simple_gtf$seqnames)
+simple_gtf$seqnames[is.na(simple_gtf$gene_type)]  <- "ERCC"
+simple_gtf$gene_type[is.na(simple_gtf$gene_type)]  <- "ERCC"
+simple_gtf$gene_name[is.na(simple_gtf$gene_name)] <- simple_gtf$gene_id[is.na(simple_gtf$gene_name)] 
+knitr::kable(tail(simple_gtf))
+```
+
+We rename "seqname" columns to "chrNum"
+
+```{r}
+colnames(simple_gtf) <- c("gene_id", "gene_name", "gene_type", "chrNum")
+```
+
+
+## Cell annotation
+
+Here we annotate the cells. Based on information curated before sequencing. We have information such as the cDNA concentration, cell type (Populaion) of the samples and INDEX data. We read this information into R.
+
+
+```{r}
+GL69_anno <- read.csv(file.path(dataDir, "GL69/GL69_metadata.csv"), stringsAsFactors = FALSE)
+```
+
+Have a look at some of the info
+
+```{r}
+knitr::kable(head(GL69_anno))
+```
+
+Add a UniqID in terms of the plate and well combination
+
+```{r}
+GL69_anno <- GL69_anno %>%
+  dplyr::mutate(Plate_Well = paste(Plate, OriWell, sep="_"))
+```
+
+Alternatively, as the sequencing run GL69 invovles multiple projects. We combine all the information into one files
+
+```{r}
+# We load 2 files (AGM_repeat and AGM_ACE)
+load(file.path(dataDir, "GL69/GL69_metadata.Rdata"))
+
+AGM_ACE <- GL69_anno %>%
+  dplyr::select(Plate_Well, ACE:KIT, Stage, cDNA, Population2)
+
+GL69_anno <- dplyr::full_join(AGM_ACE, AGM_repeat)
+
+```
+
+### Plate layout
+
+This is to re-create how the cell was in the 384 well plate
+
+```{r LibraryPlate, fig.cap="Position of cell in the 384 well plate during library preparation", fig.width=5, fig.height=4}
+n <- 12
+sec1 <- rep(c("A", "B", "C", "D", "E", "F", "G", "H"), each = n)
+sec1 <- paste0(sec1, sprintf("%02d",1:n))
+part1 <- rep("P1", length(sec1))
+cell1 <- sprintf("%03d",1:96)
+
+sec2 <- rep(c("I", "J", "K", "L", "M", "N", "O", "P"), each = n)
+sec2 <- paste0(sec2, sprintf("%02d",1:n))
+part2 <- rep("P2", length(sec2))
+cell2 <- sprintf("%03d",97:192)
+
+sec3 <- rep(c("A", "B", "C", "D", "E", "F", "G", "H"), each = n)
+sec3 <- paste0(sec3, sprintf("%02d",13:24))
+part3 <- rep("P3", length(sec3))
+cell3 <- sprintf("%03d",193:288)
+
+sec4 <- rep(c("I", "J", "K", "L", "M", "N", "O", "P"), each = n)
+sec4 <- paste0(sec4, sprintf("%02d",13:24))
+part4 <- rep("P4", length(sec4))
+cell4 <- sprintf("%03d",289:384)
+
+plate_df <- data.frame(Cell = c(cell1,cell2,cell3,cell4),
+                       OriWell = c(sec1,sec2,sec3,sec4),
+                       Part = c(part1,part2,part3,part4))
+
+
+df_plot <- dplyr::mutate(plate_df, y = gsub('[0-9]', "", OriWell))
+
+df_plot <- 
+  dplyr::mutate(df_plot, y = factor(y,
+                           levels = rev(
+                             c("A", "B", "C", "D", "E", "F", "G", "H",
+                                      "I", "J", "K", "L", "M", "N", "O", "P"))))
+
+df_plot <- dplyr::mutate(df_plot, x = as.numeric(gsub('[A-P]', "", OriWell)))
+
+col_part <- RColorBrewer::brewer.pal(4, "Pastel1")
+ggplot(df_plot, aes(x=x, y=y, color=Part, label=Cell)) +
+  geom_point(size=5) +
+  theme_bw() +
+  scale_x_continuous(breaks=c(1:23))  +
+  scale_colour_manual(values=col_part) +
+  geom_text(colour="black", size = 2)
+```
+
+
+
+## STAR mapping stats
+
+STAR mapping outputs a few files ;
+
+  * Log.out
+  * SJ.out.tab
+  * Log.progress.out
+  * Log.final.out
+
+We extract the information from *Log.final.out* get the mapping stats.
+
+### GL69
+
+We process the STAR mapping results
+
+```{r}
+STARdir <- file.path(dataDir, "GL69/fromDPSF/STAR_log")
+list_files <- list.files(file.path(STARdir), full.names = T, pattern="*.out")
+
+NumReads <- UniqReads <- MultiMapped <- UnMapped <- BN <- vector("numeric", length(list_files)) 
+for (i in seq_along(list_files)){
+  d1 <- read.delim(file.path(list_files[i]), header = F)
+  NumReads[i] <- as.numeric(as.vector(d1[grep("Number of input reads", d1$V1),2]))
+  UniqReads[i] <- as.numeric(as.vector(d1[grep("Uniquely mapped reads number", d1$V1),2]))
+  MultiMapped[i] <- as.numeric(as.vector(d1[grep("Number of reads mapped to multiple loci", d1$V1),2]))
+# The number of Unmapped reads can be obtained by substracting the total reads with the uniquely mapped reads + multi mapped reads
+  UnMapped[i] <- NumReads[i] - (UniqReads[i] +  MultiMapped[i])
+# Names of the sample (each cell)
+  BN[i] <- basename(list_files[i])
+  BN[i] <- gsub("Log.final.out", "", BN[i])
+  #BN[i] <- gsub("GL34_..._", "", BN[i])
+}
+```
+
+Compile all data into a data frame.
+
+```{r}
+df_map <- data.frame(sampleName = BN,
+                     TotalReads = NumReads,
+                     UniqueMap = UniqReads,
+                     MulitMap = MultiMapped,
+                     UnMap = UnMapped)
+```
+
+We extract some metaData 
+
+```{r}
+runInfo_GL69 <- df_map %>%
+  dplyr::mutate(SequencingRun = gsub("_.*", "", sampleName),
+                Site = gsub(".*_AGM_.*", "AGM", sampleName),
+                Site = gsub(".*_YS_.*", "YS", Site),
+                Site = gsub(".*_Roshana_.*", "Roshana", Site),
+                SC_project = gsub(".*GL43-plate2.*", "GL43-p2", sampleName),
+                SC_project = gsub(".*GL43-plate1.*", "GL43-p1", SC_project),
+                SC_project = gsub(".*_WN-", "WN-", SC_project),
+                SC_project = gsub("*_.*", "", SC_project),
+                SC_project = gsub("*WN-S8-1", "WN_S8_p1", SC_project),
+                SC_project = gsub("*WN-S2-1", "WN_S2_p1", SC_project),
+                #SC_plate = gsub("WN-S[2-5]-", "", SC_project),
+                SC_plate = gsub("WN-", "", SC_project),
+                SC_plate = gsub("GL43-p2", "p2", SC_plate),
+                SC_plate = gsub("GL43-p1", "p1", SC_plate),
+                FACS_well = gsub(".*_WN-S[1-9]-[1-99]_", "", sampleName),
+                FACS_well = gsub(".*GL43-plate2.", "", FACS_well),
+                FACS_well = gsub(".*GL43-plate1.", "", FACS_well),
+                FACS_well = gsub("_.*", "", FACS_well),
+                #FACS_well = gsub("GL69.*", "noInfo", FACS_well),
+                Library_well = gsub(".*GL69_", "", sampleName),
+                Library_well = gsub("_.*", "", Library_well),
+                Population = gsub(".*_Endo", "Endo", sampleName),
+                Population = gsub(".*_ACE_pos", "ACE_pos", Population),
+                Population = gsub(".*_HE_Runx1", "HE_Runx1", Population),
+                Population = gsub(".*_HE_Gfi1", "HE_Gfi1", Population),
+                Population = gsub(".*_Roshana_Gfi1_IAHC", "Gfi1_IAHC", Population),
+                Population = gsub("_S[1-3].*", "", Population),
+                Plate_Well = paste(SC_project, FACS_well, sep="_"))
+
+write.csv(runInfo_GL69, file.path(outDir_cur, "runInfo_GL69.csv"))
+```
+
+
+#### Merging Annotations
+
+
+We combine the STAR mapping results with the cell annotation
+
+
+```{r}
+# Rename the cell
+GL69_anno_2 <- GL69_anno #%>% dplyr::select(-Population)
+cellAnno_GL69 <- dplyr::select(runInfo_GL69, sampleName:Plate_Well) %>%
+  dplyr::inner_join(GL69_anno_2, by="Plate_Well")
+n_GL69 <- gsub("GL69_*", "C", cellAnno_GL69$sampleName)
+n_GL69 <- gsub("_R1.*", "", n_GL69)
+rownames(cellAnno_GL69) <- n_GL69
+```
+
+## Mapped percentage
+
+We also get the mapped and unmapped percentage
+
+
+```{r}
+cellAnno_GL69 <- dplyr::mutate(cellAnno_GL69, UnMap_per = ( UnMap / TotalReads) *100 ,
+                              UniqRead_per = (UniqueMap / TotalReads) * 100,
+                            MultiRead_per = (MulitMap / TotalReads) * 100,
+                            Mapped_per = UniqRead_per + MultiRead_per) %>%
+  dplyr::rename(CellOld = Cell)
+
+```
+
+
+
+Plot in a boxplot
+
+```{r}
+ggplot(cellAnno_GL69, aes(x=SequencingRun, y=UniqRead_per, colour=SequencingRun)) +
+  geom_boxplot() +
+  theme_bw()
+```
+
+
+## htSeq results
+
+We read in the ht-seq results
+
+
+GL69
+
+```{r}
+count <- read.delim(file.path(dataDir, "GL69/fromDPSF/HtseqCounts_GL69_full.tsv"))
+row.names(count) <- count$X
+count <- count[,-1]
+# Rename the columns
+SampleName <- colnames(count)
+SampleName <- gsub("\\.", "-", SampleName)
+
+# Subset only the cells we are interested in
+## Extract the Plate_Well info
+SampleName_htSeq <- data.frame(sampleName = SampleName) %>%
+  dplyr::mutate(SC_project = gsub(".*GL43-plate2.*", "GL43-p2", sampleName),
+                SC_project = gsub(".*GL43-plate1.*", "GL43-p1", SC_project),
+                SC_project = gsub(".*_WN-", "WN-", SC_project),
+                SC_project = gsub("*_.*", "", SC_project),
+                SC_project = gsub("*WN-S8-1", "WN_S8_p1", SC_project),
+                SC_project = gsub("*WN-S2-1", "WN_S2_p1", SC_project),
+                FACS_well = gsub(".*_WN-S[1-9]-[1-99]_", "", sampleName),
+                FACS_well = gsub(".*GL43-plate2.", "", FACS_well),
+                FACS_well = gsub(".*GL43-plate1.", "", FACS_well),
+                FACS_well = gsub("_.*", "", FACS_well),
+                Plate_Well = paste(SC_project, FACS_well, sep="_"))
+## Filter to samples present in MetaData
+SampleName_htSeq_sub <- SampleName_htSeq %>%
+  dplyr::filter(Plate_Well %in% cellAnno_GL69$Plate_Well)
+## Subset the htseq count matrix
+count_sub <- count[,SampleName_htSeq_sub$sampleName]
+
+# We manually checked the column names and it is the same, so we just rename it
+#xx <- data.frame(MBCF_name = n_GL69,HTSeq_name=colnames(count_sub))
+colnames(count_sub) <- n_GL69
+
+# The last 5 lines needs to be removed as this is ht-seq features
+count_GL69 <- count_sub[-((nrow(count_sub)-4):nrow(count_sub)),]
+#colnames(count_GL58) <- n_GL58
+```
+
+
+## Create se object
+
+First we check if the count data have the same gene_id as our gtf.
+
+```{r}
+# We reorder the gtf to match our counts matrix row names
+rData <- simple_gtf[base::match(row.names(count_GL69), simple_gtf$gene_id),]
+rownames(rData) <- rData$gene_id
+# Check if the order of genes in the annotation file is the same as count table
+identical(rData$gene_id, row.names(count_GL69))
+```
+
+
+GL69
+
+```{r}
+se_GL69 <- 
+  SingleCellExperiment(
+  assays = list(counts = as.matrix(count_GL69)),
+  colData = cellAnno_GL69,
+  rowData = rData)
+```
+
+
+```{r,eval=FALSE}
+# To upload to GEO, only library from WN_S8_p1 
+se_GL69_geo <- se_GL69[, se_GL69$SC_plate == "WN_S8_p1"]
+cD <- as.data.frame(colData(se_GL69_geo))
+# For duplicated gene names, we merge them with the ENSEMBL IDs to avoid confusion.
+new.row.names <- uniquifyFeatureNames(
+    rowData(se_GL69_geo)$gene_id,
+    rowData(se_GL69_geo)$gene_name
+)
+#rownames(se_GL69_geo) <- new.row.names
+counts_ace <- assay(se_GL69_geo, "counts")
+# Rename columns
+df_name <- data.frame(
+  SampleNam = cD$sampleName,
+  Cell = paste0("Cell_",sprintf("%04d",1:nrow(cD))),
+  Pop = cD$Population
+) %>%
+  dplyr::mutate(
+    GEOname = case_when(
+      Pop == "Endo" ~ "FACS-ENDO",
+      Pop == "ACE_pos" ~ "FACS-ACE_SinglePos",
+      Pop == "HE_Gfi1" ~ "FACS-HE_DoublePos"),
+    GEOname = paste0(Cell, "_",GEOname))
+
+se_GL69_geo$PopGeo <- df_name$Pop
+scater::plotExpression(se_GL69_geo, "ENSMUSG00000029275.17",  x="PopGeo", exprs_values = "counts")
+
+
+write.csv(df_name, "~/Desktop/GEO_ace2.csv")
+colnames(counts_ace) <- df_name$GEOname
+
+# Extract gene name and ens symbol
+gene_nam <- as.data.frame(rowData(se_GL69_geo))
+
+# Merge the the gene name with count
+gene_nam_counts <- gene_nam %>%
+  dplyr::select(gene_id, gene_name) %>%
+  dplyr::mutate(gene_id = gsub("\\..*", "", gene_id)) %>%
+  cbind(counts_ace)
+
+write.csv(gene_nam_counts, file.path(outDir_cur, "RawCounts.csv"), row.names = FALSE)
+```
+
+
+```{r}
+se <- se_GL69
+ERCC_gene <- rowData(se)$gene_type == "ERCC"
+MT_gene <- rowData(se)$chrNum == "MT"
+Ribosome_gene <- rowData(se)$gene_type == "rRNA"
+
+# Getting the hemoglobin genes
+Hbbs <- c("Hba-x", "Hbb-bh1", "Hbb-y", "Hba-a1")
+# Get the Ens ID
+Hb_ens <- rData %>%
+  dplyr::filter(gene_name %in% Hbbs)
+Hbb_gene <- rowData(se)$gene_id %in% Hb_ens$gene_id
+```
+
+Calculate QC
+
+```{r}
+# Calculate QC
+se_GL69 <- 
+  scater::calculateQCMetrics(se_GL69,
+                             feature_controls = 
+                               list(MT= MT_gene,
+                                    Ribosome = Ribosome_gene,
+                                    Hbb = Hbb_gene))
+
+# Remove all ERCC
+#se <- se_GL69[-grep("ERCC", rownames(se_GL69)), ]
+
+
+# Annotation
+#cD <- as.data.frame(colData(se))
+# Normalisation
+#clusters <- quickCluster(se, method="igraph", min.mean=1)
+#se <- computeSumFactors(se, cluster=clusters, min.mean=1)
+#se <- scater::normalize(se)
+#se <- runUMAP(se)
+#plotUMAP(se, colour_by="Population2")
+#plotUMAP(se, colour_by="Gfi1_GFP")
+```
+
+## Save metadata
+
+We save the metadata of the single cell object we are interested in
+
+```{r}
+cD1 <- as.data.frame(colData(se_GL69)) %>%
+  tibble::rownames_to_column(var = "Cell") %>%
+  dplyr::select(Cell:UnMap, SequencingRun, Population)
+
+# Add some other information required for GEO
+cD1 <- cD1 %>%
+  dplyr::mutate(CellName = paste0("Cell_",sprintf("%04d",1:nrow(cD1))),
+                MouseModel = "RUNX1_RFP_GFI1_GFP",
+                eStage = "E10.5")
+
+write.csv(cD1, file.path(outDir_cur, "GL69_colData.csv"))
+```
+
+## Filter low quality cells
+
+For all of the run, we apply a threshold to filter the cells. We will use the follwoing 
+
+* Number of sequencing reads
+* Number of genes detected
+* Percentage of Mitochondira reads
+* Percentage of Ribosome reads
+* Percentage of Hemoglobin (Hbb) genes
+* Percentage of ERCC
+
+
+We firstly apply the following cut-off. 
+
+* Percentage of Unmapped reads < 30%
+* Percentage of Hemoglobin (Hbb) genes < 20%
+* Percentage of ERCC < 25%
+
+```{r}
+cut_off_UnmapPer <- 30
+cut_off_ERCC <- 20
+cut_off_Hbb <- 10
+cut_off_MT <- 15
+cut_off_Ribo <- 20
+cut_off_features <- 2000
+```
+
+
+First we examine the distibution of the data in each of the run 
+
+```{r}
+df_rData <- as.data.frame(colData(se_GL69))
+
+# Filtered df
+df_rData_sub <- df_rData %>%
+  dplyr::select(sampleName, Population, SequencingRun, SC_project, SC_plate, 
+                TotalReads, UnMap_per, total_counts, total_features_by_counts,
+                pct_counts_MT, pct_counts_Ribosome, Plate_Well)
+```
+
+
+We plot the the distibution of various features
+
+```{r}
+
+p0 <- 
+  ggplot(df_rData, aes(x=Population, y=TotalReads, colour=Population)) +
+  geom_jitter() +
+  theme_bw() +
+  #geom_hline(yintercept = 10^cut_off_UMI, linetype="dashed") +
+  #scale_colour_manual(values=colp) +
+  theme(axis.text.x= element_blank()) +
+  NULL
+
+p0.1 <- 
+  ggplot(df_rData, aes(x=Population, y=UnMap_per, colour=Population)) +
+  geom_jitter() +
+  theme_bw() +
+  geom_hline(yintercept = cut_off_UnmapPer, linetype="dashed") +
+  #scale_colour_manual(values=colp) +
+  theme(axis.text.x= element_blank()) +
+  NULL
+
+
+p1 <- 
+  ggplot(df_rData, aes(x=Population, y=total_counts, colour=Population)) +
+  geom_jitter() +
+  theme_bw() +
+  #geom_hline(yintercept = 10^cut_off_reads, linetype="dashed") +
+  #scale_colour_manual(values=colp) +
+  theme(axis.text.x= element_blank()) +
+  NULL
+
+
+p2 <- 
+  ggplot(df_rData, aes(x=Population, y=total_features_by_counts, colour=Population)) +
+  geom_jitter() +
+  theme_bw()  +
+  geom_hline(yintercept = cut_off_features, linetype="dashed") +
+  #scale_colour_manual(values=colp) +
+  theme(axis.text.x= element_blank()) +
+  NULL
+
+p3 <- 
+  ggplot(df_rData, aes(x=Population, y=pct_counts_MT, colour=Population)) +
+  geom_jitter() +
+  geom_hline(yintercept = cut_off_MT, linetype="dashed") +
+  theme_bw() +
+  #scale_colour_manual(values=colp) +
+  theme(axis.text.x= element_blank()) +
+  NULL
+
+p4 <- 
+  ggplot(df_rData, aes(x=Population, y=pct_counts_Ribosome, colour=Population)) +
+  geom_jitter() +
+  geom_hline(yintercept = cut_off_Ribo, linetype="dashed") +
+  theme_bw() +
+  #scale_colour_manual(values=colp) +
+  theme(axis.text.x= element_blank()) +
+  NULL
+
+
+p6 <- 
+  ggplot(df_rData, aes(x=Population, y=pct_counts_Hbb, colour=Population)) +
+  geom_jitter() +
+  geom_hline(yintercept = cut_off_Hbb, linetype="dashed") +
+  theme_bw() +
+  #scale_colour_manual(values=colp) +
+  theme(axis.text.x= element_blank()) +
+  NULL
+
+pdf(file.path(outDir_cur, "GL69_QC_overview.pdf"), width = 14, height = 11)
+p0 + p0.1 + p1 + p2 + p3 + p4 + p6 + plot_layout(ncol=2, heights = c(3,3,3,3)) 
+dev.off()
+
+p0 + p0.1 + p1 + p2 + p3 + p4  + p6 + plot_layout(ncol=2, heights = c(3,3,3,3)) 
+```
+
+
+Now we remove the cells
+
+```{r}
+df_rData <- as.data.frame(colData(se_GL69))
+
+df_rData_fil <- df_rData %>%
+  dplyr::filter(UnMap_per < cut_off_UnmapPer, 
+                #pct_counts_ERCC < cut_off_ERCC,
+                pct_counts_Hbb < cut_off_Hbb,
+                pct_counts_MT < cut_off_MT,
+                pct_counts_Ribosome < cut_off_Ribo,
+                total_features_by_counts >= cut_off_features)
+```
+
+
+We get the number of cells before and after filtering
+
+```{r CellAfterFilter}
+BeforeFiltering <- table(df_rData$Population)
+AfterFiltering <- table(df_rData_fil$Population)
+Diffr <- BeforeFiltering - AfterFiltering
+
+knitr::kable(t(rbind(
+  BeforeFiltering,AfterFiltering,Diffr)),
+  caption="Number of cells after filtering") %>%
+  scroll_box(width = "100%", height = "100%")
+
+
+BeforeFiltering <- table(df_rData$SequencingRun)
+AfterFiltering <- table(df_rData_fil$SequencingRun)
+Diffr <- BeforeFiltering - AfterFiltering
+
+knitr::kable(rbind(
+  BeforeFiltering,AfterFiltering,Diffr),
+  caption="Number of cells after filtering") %>%
+  scroll_box(width = "100%", height = "100%")
+```
+
+
+We create sce with the filtered cells and save this Robject
+
+```{r}
+se_Cellfilter_GL69 <- se_GL69[, se_GL69$sampleName %in% df_rData_fil$sampleName]
+
+
+save(se_Cellfilter_GL69,
+     file=file.path(outDir_cur, "se_Cellfilter_GL69.Robject"))
+```
+
+
+
+## Classification of Cell cycle
+
+We use the prediction method described by [Scialdone et al. (2015)](http://www.sciencedirect.com/science/article/pii/S1046202315300098) to classify cells into cell cycle phases based on the gene expression data. Using a training dataset, the sign of the difference in expression between two genes was computed for each pair of genes. Pairs with changes in the sign across cell cycle phases were chosen as markers. Cells in a test dataset can then be classified into the appropriate phase, based on whether the observed sign for each marker pair is consistent with one phase or another.
+
+
+We do the cell cycle classification before gene filtering as this provides more precise cell cycle phase classifications. Because during filtering some of the genes might be dropped that were efficiently pairing with other genes during cell-cycle phase.
+
+```{r loadScran}
+# Load the genes marking cell cycle
+mm.pairs <- readRDS(system.file("exdata", "mouse_cycle_markers.rds", package="scran"))
+```
+
+Some additional work is necessary to match the gene symbols in the data to the Ensembl annotation in the pre-trained marker set.
+
+```{r}
+geneID <- rowData(se_Cellfilter_GL69)$gene_id
+# Remove decimal place
+geneID <- gsub("\\..*", "", geneID)
+# Create a new sceSet with the corrected annotation
+sceSet_tmp <- se_Cellfilter_GL69
+rownames(sceSet_tmp) <- geneID
+```
+
+Now we do the cell cycle assignement.
+
+```{r}
+assignments <- cyclone(sceSet_tmp, mm.pairs,
+                       gene.names=rownames(sceSet_tmp))
+```
+
+Add the cell cycle stage to the sceSet
+
+```{r}
+tmp_cc <- assignments$phases
+colData(se_Cellfilter_GL69)$cell_cycle <- tmp_cc
+
+colData(se_Cellfilter_GL69)$G1 <- assignments$scores$G1 
+colData(se_Cellfilter_GL69)$G2M <- assignments$scores$G2M 
+```
+
+## Gene filter
+
+We conduct two stage of gene filtering ;
+
+
+1) Removing low-abundance genes
+2) Remove over-represented genes
+
+### Low abundance
+
+Low-abundance genes are problematic as zero or near-zero counts do not contain enough information for reliable statistical inference. In addition, the discreteness of the counts may interfere with downstream statistical procedures, e.g., by compromising the accuracy of continuous approximations. These genes are likely to be dominated by drop-out events [Brennecke et al., 2013](https://www.nature.com/nmeth/journal/v10/n11/full/nmeth.2645.html), which limits their usefulness in later analyses. Removal of these genes mitigates discreteness and reduces the amount of computational work without major loss of information.
+
+
+Here, low-abundance genes are defined as ; 
+
+
+* Those with an average count below a filter threshold of 1.
+* Expressed in at less than 3 cells
+
+
+Filtering by average count
+```{r}
+se <- se_Cellfilter_GL69
+ave.counts <- rowMeans(counts(se))
+cutOFFval <- 2
+keep <- ave.counts >= cutOFFval
+print(paste0("Before filtering Gene Numbers (including the 0 expression ones): ", dim(rowData(se))[1]))
+print(paste0('After filtering Gene Numbers: ',sum(keep)))
+se <- se[keep, ]
+```
+
+
+Check this cut-off. It looks okay
+
+```{r}
+hist(log10(ave.counts), breaks=200, main="", col="grey80",
+     xlab=expression(Log[10]~"average count"), cex.lab=1.3, cex.axis=1.1)
+abline(v=log10(cutOFFval), col="blue", lwd=2, lty=2)
+```
+
+Another alternative approach to gene filtering is to select genes that have non-zero counts in at least n cells. This provides some more protection against genes with outlier expression patterns, i.e., strong expression in only one or two cells. Such outliers are typically uninteresting as they can arise from amplification artifacts that are not replicable across cells. (The exception is for studies involving rare cells where the outliers may be biologically relevant)
+
+
+```{r}
+ncell <- 3
+numcells <- scater::nexprs(se, byrow=TRUE)
+keep_gene <- numcells >= ncell
+print(paste0("Before filtering Gene Numbers: ", dim(rowData(se))[1]))
+print(paste0('After filtering Gene Numbers: ',sum(keep_gene)))
+```
+
+Applying this filter only removes **`r sum(keep) - sum(keep_gene)`** genes. So will **BE** applying this filter
+
+```{r}
+se <- se[keep_gene, ]
+```
+
+
+Plotting the over-represented genes
+
+Do the scater QC
+
+```{r}
+ERCC_gene <- rowData(se)$gene_type == "ERCC"
+MT_gene <- rowData(se)$chrNum == "MT"
+Ribosome_gene <- rowData(se)$gene_type == "rRNA"
+
+# Getting the hemoglobin genes
+Hbbs <- c("Hba-x", "Hbb-bh1", "Hbb-y", "Hba-a1")
+# Get the Ens ID
+rData <- as.data.frame(rowData(se))
+Hb_ens <- rData %>%
+  dplyr::filter(gene_name %in% Hbbs)
+Hbb_gene <- rowData(se)$gene_id %in% Hb_ens$gene_id
+```
+
+Calculate QC
+
+```{r}
+sce_Genefilter <- 
+  calculateQCMetrics(se,
+                     feature_controls = 
+                       list(ERCC = ERCC_gene,
+                            MT= MT_gene,
+                            Ribosome = Ribosome_gene,
+                            Hbb = Hbb_gene)
+  )
+```
+
+Another way to look at the data
+```{r}
+df_rowData <- as.data.frame(rowData(sce_Genefilter))
+#  Get the percentage of cells expressing this gene
+# First, we calculate the total number of reads
+total_reads <- sum(df_rowData$total_counts)
+# Second, we divide the total number of counts for each gene with the total number of reads.
+yAxis <- df_rowData$total_counts  / total_reads * 100
+df_rowData$pct_gene_count <- yAxis
+rowData(sce_Genefilter) <- df_rowData
+plotRowData(sce_Genefilter, x = "n_cells_by_counts", y = "pct_gene_count")
+```
+
+
+
+We have a look at top 5 genes taking the most sequencing reads.
+
+```{r}
+knitr::kable(
+  dplyr::select(df_rowData, gene_id, gene_name, gene_type, chrNum, n_cells_by_counts, pct_gene_count) %>%
+    dplyr::arrange(desc(pct_gene_count)) %>%
+    dplyr::top_n(5, pct_gene_count)
+)
+```
+
+
+
+
+Remove genes more than 5% of sequencing reads
+
+```{r}
+df_rowData_f <- df_rowData %>%
+  dplyr::filter(pct_gene_count <= 5)
+
+sce_Genefilter <- sce_Genefilter[row.names(sce_Genefilter) %in% df_rowData_f$gene_id, ]
+```
+
+
+To enable a user-friendly analysis, it is convenient to exchange the ENSEMBL IDs with the name of the genes. 
+
+
+For duplicated gene names, we merge them with the ENSEMBL IDs to avoid confusion.
+
+
+```{r}
+new.row.names <- uniquifyFeatureNames(
+    rowData(sce_Genefilter)$gene_id,
+    rowData(sce_Genefilter)$gene_name
+)
+rownames(sce_Genefilter) <- new.row.names
+head(rownames(sce_Genefilter), 20)
+```
+
+
+Save the filtered se object
+
+```{r}
+save(sce_Genefilter,
+     file=file.path(outDir_cur, "GL69_GeneFiltered.Robject"))
+
+#load(file=file.path(outDir_cur, "GL69_GeneFiltered.Robject"))
+```
+
+
+## Normalisation
+
+
+We perform normalisation. Now since some runs have ERCC and some do not, we will remove all ERCC reads from all sequencing runs.
+
+
+```{r}
+# Remove all ERCC
+#se <- sce_Genefilter[-grep("ERCC", rownames(sce_Genefilter)), ]
+se <- sce_Genefilter
+# Remove unrelated library
+se <- se[,se$SC_project %in% c("WN_S8_p1")]
+# Normalisation
+is.spike <- grepl("^ERCC", rownames(se))
+ERCC_loc <- grep("ERCC",rowData(se)$gene_type)
+GENE_loc <- grep("ERCC",rowData(se)$gene_type, invert = TRUE)
+
+
+# Annotation
+cD <- as.data.frame(colData(se))
+# Normalisation
+clusters <- quickCluster(se, method="igraph", min.mean=1)
+se <- computeSumFactors(se, cluster=clusters, min.mean=1)
+#isSpike(se, "ERCC") <-  ERCC_loc
+#se <- computeSpikeFactors(se, general.use=FALSE)
+se <- scater::logNormCounts(se)
+
+```
+
+
+
+## Find HVG & Dim reduction
+
+If we find the HVG
+
+```{r}
+dec.se <- modelGeneVar(se)
+# Taking the top 1000 genes here:
+hvg.var <- getTopHVGs(dec.se, prop = 0.1)
+```
+
+Run PCA
+
+```{r}
+se <- runPCA(se, subset_row=hvg.var, ncomponents = 20)
+```
+
+
+Run UMAP
+
+```{r}
+se <- runUMAP(se, dimred="PCA")
+plotReducedDim(se, dimred="UMAP", colour_by="Population2")
+plotReducedDim(se, dimred="UMAP", colour_by="cell_cycle")
+seACE <- se
+```
+
+## Regress cell ccyle
+
+```{r}
+cc.genesBiomart <- biomaRt::select(org.Mm.eg.db, keys="GO:0007049", keytype="GOALL", column="ENSEMBL")
+# Remove cell cycle genes
+## Remove decimle place in the ens gene id
+rD_ace <- as.data.frame(rowData(seACE)) %>%
+  dplyr::mutate(gene_id = gsub("\\..*", "" ,gene_id))
+
+se.block <-  seACE[!rD_ace$gene_id %in% cc.genesBiomart$ENSEMBL,]
+dec.se2 <- modelGeneVar(se.block, 
+                    assay.type= "logcounts")
+fit.se2 <- metadata(dec.se2)
+# Taking the top 1000 genes here:
+hvg.var2 <- getTopHVGs(dec.se2, n=1000)
+set.seed(12345)
+se.block <- runPCA(se.block, subset_row=hvg.var2, ncomponents = 20)
+se.block <- runUMAP(se.block, dimred="PCA")
+plotReducedDim(se.block, dimred="UMAP", colour_by="Population2")
+plotReducedDim(se.block, dimred="UMAP", colour_by="cell_cycle")
+plotReducedDim(se.block, dimred="UMAP", colour_by="Gfi1")
+se.block.ace <- se.block
+#saveRDS(se.block.ace, "~/Desktop/seACE_block.RDS")
+```
+
+Method 2
+
+```{r,eval=FALSE}
+# Regress cell cycle
+assignments <- data.frame(G1 = seACE$G1,
+                          G2M = seACE$G2M)
+design <- model.matrix(~ G1 + G2M, assignments)
+fit.block <- modelGeneVar(seACE, design=design, parametric=TRUE)
+
+assay(seACE, "corrected") <- removeBatchEffect(
+  logcounts(seACE), covariates=design[,-1])
+
+seACE <- denoisePCA(seACE, technical=fit.block, 
+                       assay.type="corrected")
+hvg.ace <- getTopHVGs(fit.block, prop=0.1)
+
+se.block <- runUMAP(seACE, exprs_values = "corrected", subset_row=hvg.ace)
+
+plotReducedDim(se.block, dimred="UMAP",
+               colour_by="Population2") 
+```
+
+
+
+Method 3
+
+```{r,eval=FALSE}
+library(batchelor)
+assignments <- data.frame(G1 = se$G1,
+                          G2M = se$G2M)
+design <- model.matrix(~ G1 + G2M, assignments)
+dec.nocycle <- modelGeneVar(se, design=design)
+hvg.ace <- getTopHVGs(dec.nocycle, prop=0.1)
+reg.nocycle <- regressBatches(se, batch=se$cell_cycle)
+
+set.seed(100011)
+reg.nocycle <- runPCA(reg.nocycle, exprs_values="corrected",
+    subset_row=hvg.ace)
+
+se.block2 <- runUMAP(reg.nocycle, dimred="PCA")
+se.block2$Population2 <- se.block$Population2
+se.block2$cell_cycle <- se.block$cell_cycle
+plotReducedDim(se.block2, dimred="UMAP", colour_by="Population2")
+plotReducedDim(se.block2, dimred="UMAP", colour_by="cell_cycle")
+
+plotReducedDim(se.block2, dimred="UMAP", colour_by="Gfi1", 
+by_exprs_values="corrected")
+
+#se.block.ace <- se.block2
+save(se.block.ace,  seACE, hvg.ace, file="~/Desktop/ACE.Rdata")
+```
+
+
+## Seurat
+
+```{r}
+# Convert single cell to Seurat
+seu <- Seurat::as.Seurat(se.block.ace)
+```
+
+Standard Seurat workflow
+
+```{r}
+seuset <- NormalizeData(
+  object = seu, 
+  normalization.method = "LogNormalize", 
+  scale.factor = 10000
+)
+s.genes <- cc.genes$s.genes
+g2m.genes <- cc.genes$g2m.genes
+seuset <- CellCycleScoring(seuset, s.features = s.genes, g2m.features = g2m.genes, set.ident = FALSE)
+seu.ace <- seuset
+# Feature selections
+seuset <- 
+  FindVariableFeatures(object = seuset, selection.method = "vst", nfeatures = 2000)
+# Scaling the data
+all.genes <- rownames(x = seuset)
+seuset <- ScaleData(object = seuset, 
+                    #vars.to.regress = c("S.Score", "G2M.Score"),
+                    features = all.genes)
+
+# These are now standard steps in the Seurat workflow for visualization and clustering
+seuset <- RunPCA(seuset, verbose = FALSE)
+ElbowPlot(object = seuset, ndims = 30)
+seuset <- RunUMAP(seuset, dims = 1:30, verbose = FALSE)
+
+seuset <- FindNeighbors(seuset, dims = 1:30, verbose = FALSE)
+seuset <- FindClusters(seuset, verbose = FALSE)
+
+# Plot the reduced dimension
+DimPlot(seuset, reduction="umap", label = FALSE, group.by = "Population2") 
+DimPlot(seuset, reduction="umap", label = FALSE, group.by = "Phase") 
+FeaturePlot(seuset, "Gfi1", reduction="umap")
+```
+
+
+
+
+## Seurat integration
+
+Make Seurat object
+
+```{r,eval=TRUE}
+# Load seurat Object
+#seu.AGM <- readRDS("~/Desktop/SeuratAGM.RDS")
+seu.AGM <- readRDS("~/Dropbox (The University of Manchester)/zaki/PhD/Blood_2020/Misc/SeuratAGM.RDS")
+#seu.AGM <- readRDS("~/Desktop/seu_AGM.RDS")
+#seu.AGM <- readRDS("~/Desktop/seu.AGM.RDS")
+seu.AGM <- seu.AGM[,!seu.AGM$finalCluster2 %in% c("C09", "C10", "C04")]
+seu.AGM <- seu.AGM[,!seu.AGM$Mutant %in% c("KO")]
+
+seu.AGM <- CellCycleScoring(seu.AGM, 
+                            s.features = s.genes, g2m.features = g2m.genes, set.ident = FALSE)
+
+# Remove Cell cycle genes
+rD2 <- as.data.frame(rowData(se)) %>%
+  dplyr::mutate(gene_id = gsub("\\..*", "" ,gene_id))
+
+
+## Get the gene symbol                     
+rD2_sub <- rD2 %>%
+  dplyr::filter(!gene_id %in% cc.genesBiomart$ENSEMBL) %>%
+  dplyr::filter(gene_type %in% "protein_coding") 
+  
+seu.AGM2 <- seu.AGM[row.names(seu.AGM) %in% rD2_sub$gene_name,]
+# Remove the repeated sequenced cells
+seu.ace2 <- seu.ace[row.names(seu.ace) %in% rD2_sub$gene_name,]
+seu.ace2 <- seu.ace2[,seu.ace2$SC_project %in% c("WN_S8_p1")]
+
+seu.ace2 <- FindVariableFeatures(object = seu.ace2, selection.method = "vst", nfeatures = 500)
+seu.AGM2 <- FindVariableFeatures(object = seu.AGM2, selection.method = "vst", nfeatures = 500)
+
+
+su.anchors <- FindIntegrationAnchors(object.list = c(seu.ace2,seu.AGM2), 
+                                     dims = 1:20)
+su.integrated <- IntegrateData(anchorset = su.anchors, dims = 1:20)
+```
+
+
+Visualise integration
+
+```{r,eval=TRUE}
+# set during IntegrateData
+DefaultAssay(su.integrated) <- "integrated"
+
+#su.integrated <- CellCycleScoring(su.integrated, s.features = s.genes, g2m.features = g2m.genes, set.ident = FALSE)
+su.integrated$exp <- c(rep("ACE",ncol(seu.ace2)),
+                        rep("AGM",ncol(seu.AGM2)))
+
+# Run the standard workflow for visualization and clustering
+su.integrated <- ScaleData(su.integrated, 
+                           #vars.to.regress = c("S.Score", "G2M.Score"),
+                           vars.to.regress = c("exp"),
+                           verbose = TRUE)
+
+
+#seedVal <- 20210101
+su.integrated <- RunPCA(su.integrated, verbose = FALSE) #seed.use=seedVal)
+su.integrated <- RunUMAP(su.integrated, reduction = "pca", dims = 1:20
+                         #seed.use=seedVal
+                         #min.dist = 0.01)
+)
+
+su.integrated <- RunTSNE(su.integrated, reduction = "pca", dims = 1:20
+                         #seed.use=seedVal
+                         #min.dist = 0.01)
+)
+
+```
+
+
+Plot
+
+
+```{r,eval=TRUE}
+col_wt <- c(Col[1:3],
+            Col[5],
+            Col[7:9])
+DimPlot(su.integrated, reduction = "umap", group.by = "exp")
+DimPlot(su.integrated, reduction = "umap", group.by = "finalCluster2") +
+  scale_colour_manual(values=c(col_wt))
+DimPlot(su.integrated, reduction = "umap", group.by = "Population2") 
+
+FeaturePlot(su.integrated, reduction = "umap", "Aplnr") 
+
+
+# TSNE
+DimPlot(su.integrated, reduction = "tsne", group.by = "finalCluster2") +
+  scale_colour_manual(values=c(col_wt))
+DimPlot(su.integrated, reduction = "tsne", group.by = "exp")
+
+```
+
+Find cluster
+
+```{r,eval=FALSE}
+su.integrated <- FindNeighbors(su.integrated, dims = 1:10)
+su.integrated <- FindClusters(su.integrated, resolution = 2)
+
+DimPlot(su.integrated, reduction = "umap")
+```
+
+Find De
+
+```{r,eval=FALSE}
+#int.markers <- FindAllMarkers(su.integrated, only.pos = TRUE, min.pct = 0.25, logfc.threshold = 0.25)
+int.markers <- FindMarkers(su.integrated, 
+                           ident.1 = "8",
+                           ident.2 = "7",
+                          min.pct = 0.25, logfc.threshold = 0.25)
+```
+
+Visualise the integration
+
+Extract Seurat UMAP coordinate
+
+```{r}
+df_dim <- Embeddings(su.integrated, reduction="umap") %>%
+  as.data.frame() %>%
+  tibble::rownames_to_column(var = "Cell")
+# Metadata from Seurat object
+df_meta <- su.integrated[[]] %>%
+  tibble::rownames_to_column(var = "Cell")
+# Join the two
+df_dim <- left_join(df_dim, df_meta)
+
+# Adjust the levels
+df_dim <- df_dim %>%
+  dplyr::mutate(Population2 = factor(Population2,
+                                     levels=c("AGM_E10.5_Endo", "AGM_E10.5_ACE_pos",
+                                              "AGM_E10.5_HE_Gfi1")))
+
+```
+
+
+
+```{r}
+p_theme <-   theme_bw() +
+  theme(
+    axis.text.y = element_blank(),
+    axis.title.y = element_blank(),
+    axis.text.x = element_blank(),
+    axis.title.x = element_blank(),
+    panel.grid.major = element_line(linetype = "blank"),
+    panel.grid.minor = element_line(linetype = "blank"),
+    axis.ticks = element_blank()
+    
+    ) 
+
+# Create a joint category
+df_dim$ComClus <- df_dim$finalCluster2
+df_dim$ComClus[is.na(df_dim$ComClus)] <- 
+  df_dim$Population2[is.na(df_dim$ComClus)] 
+
+
+# Show the location of the cells
+p_int_agm <- 
+ggplot(df_dim, 
+       #aes(x=tSNE_1, y=tSNE_2, colour=Population2)) +
+       aes(x=UMAP_1, y=UMAP_2, colour=finalCluster2)) +
+  geom_point() +
+  gghighlight(use_direct_label = FALSE) +
+  theme(legend.position = "right") +
+  facet_wrap(~finalCluster2) +
+  scale_colour_manual(values=c(col_wt)) +
+  p_theme +
+  labs(title="Highlighting the Ins clusters in combined data")
+
+p_int_ace <- 
+ggplot(df_dim, 
+       #aes(x=tSNE_1, y=tSNE_2, colour=Population2)) +
+       aes(x=UMAP_1, y=UMAP_2, colour=Population2)) +
+  geom_point() +
+  gghighlight(use_direct_label = FALSE) +
+  theme(legend.position = "right") +
+  facet_wrap(~Population2) +
+  p_theme +
+  labs(title="Highlighting the Ins clusters in combined data")
+
+pdf(file.path(outDir_cur, "Seurat_integrate.pdf"), height=10, width = 8)
+p_int_agm + p_int_ace + plot_layout(ncol=1) 
+dev.off()
+
+# All plots
+gHue <- gg_color_hue(3)
+p_int_all <- 
+ggplot(df_dim, 
+       #aes(x=tSNE_1, y=tSNE_2, colour=Population2)) +
+       aes(x=UMAP_1, y=UMAP_2, colour=ComClus)) +
+  geom_point() +
+  gghighlight(use_direct_label = FALSE) +
+  theme(legend.position = "right") +
+  facet_wrap(~ComClus, ncol=3) +
+  scale_colour_manual(values=c(gHue, col_wt)) +
+  p_theme +
+  labs(title="Highlighting the Ins clusters in combined data")
+
+pdf(file.path(outDir_cur, "Seurat_integrate_2.pdf"), height=5, width = 8)
+p_int_all
+dev.off()
+
+
+png(file.path(outDir_cur, "Seurat_integrate_2.png"), height=550, width = 500)
+p_int_all
+dev.off()
+
+```
+
+Make the plot for publication
+
+```{r}
+# Group C1-C3
+df_dim2 <- df_dim %>%
+  dplyr::mutate(ClusGroup =
+                  case_when(ComClus == "C01" ~ "C01-C03",
+                            ComClus == "C02" ~ "C01-C03",
+                            ComClus == "C03" ~ "C01-C03",
+                            
+                            ComClus == "C05" ~ "C05-C06",
+                            ComClus == "C06_WT" ~ "C05-C06",
+                            
+                            ComClus == "C07" ~ "C07-C08",
+                            ComClus == "C08" ~ "C07-C08",
+                            
+                            TRUE ~ ComClus))
+
+
+p_int_all <- 
+ggplot(df_dim2, 
+       #aes(x=tSNE_1, y=tSNE_2, colour=Population2)) +
+       aes(x=UMAP_1, y=UMAP_2, colour=ComClus)) +
+  geom_point() +
+  gghighlight(use_direct_label = FALSE) +
+  theme(legend.position = "right") +
+  facet_wrap(~ClusGroup, ncol=3) +
+  scale_colour_manual(values=c(gHue, col_wt)) +
+  p_theme +
+  labs(title="Highlighting the Ins clusters in combined data")
+
+
+p_int_all2 <- 
+ggplot(df_dim2, 
+       #aes(x=tSNE_1, y=tSNE_2, colour=Population2)) +
+       aes(x=UMAP_1, y=UMAP_2, colour=ComClus)) +
+  geom_point() +
+  gghighlight(use_direct_label = FALSE) +
+  theme(legend.position = "right") +
+  facet_wrap(~ClusGroup, ncol=6) +
+  scale_colour_manual(values=c(gHue, col_wt)) +
+  p_theme +
+  labs(title="Highlighting the Ins clusters in combined data")
+
+
+png(file.path(outDir_cur, "Seurat_integrate_3.png"), height=350, width = 500)
+p_int_all
+dev.off()
+
+png(file.path(outDir_cur, "Seurat_integrate_4.png"), height=170, width = 1000)
+p_int_all2
+dev.off()
+
+```
+
+
+
+Lets try to categories the ACE sorted cells
+
+```{r}
+df_dim <- df_dim %>%
+  dplyr::mutate(
+    ACE_cat =
+      case_when(ACE > 3 & CD44 < 3 & Population2 == "AGM_E10.5_ACE_pos" ~ "ACEposCD44neg",
+                ACE > 3 & CD44 >=3 & Population2 == "AGM_E10.5_ACE_pos" ~ "ACEposCD44pos")
+    )
+
+
+```
+
+### Knn prediction
+
+Now we try to predict what the ACE cluster falls into based on AGM data. We use k-nearest neighbours to do this
+
+```{r}
+df_dim_train <- df_dim %>%
+    dplyr::filter(exp == "AGM")
+train_umap <- df_dim_train %>%
+  dplyr::select(UMAP_1, UMAP_2)
+  
+df_dim_test <- df_dim %>%
+  dplyr::filter(exp == "ACE")
+test_umap <- df_dim_test %>%
+  dplyr::select(UMAP_1, UMAP_2)
+
+# Get the cluster from AGM data
+AGMcluster <- as.factor(as.character(df_dim_train$finalCluster2))
+
+# Predict the outcome
+
+knn_pred = class::knn(train_umap, test_umap, AGMcluster, k = 10, prob = FALSE)
+set.seed(123)
+df_knn <- data.frame(
+  Population = df_dim_test$Population,
+  knnClus = knn_pred) %>%
+  dplyr::mutate(Population =
+                  factor(Population,
+                         levels=(c("Endo", "ACE_pos", "HE_Gfi1"))),
+                knnClus = factor(knnClus,levels=rev(unique(knnClus))),
+                Cell = df_dim_test$Cell)
+
+#write.csv(table(knn_pred, df_dim_test$Population), "~/Desktop/tmp22.csv")
+```
+
+Calculate the percentage per ACE sort
+
+```{r}
+tab <- xtabs(~  knnClus + Population,  df_knn)
+
+pop_lvl <- c("Endo", "ACE_pos", "HE_Gfi1")
+clus_lvl <- c("C01", "C02", "C03", "C05", "C06_WT", "C07", "C08")
+
+# The perentage of cells
+tab_perc <- round( t(t(tab) / colSums(tab) * 100),1)
+df_tab <- as.data.frame(tab_perc) %>%
+  dplyr::group_by(knnClus) %>%
+  dplyr::mutate(Perc = paste0(Freq, "%"))
+
+df_tab_x <- as.data.frame(tab_perc) %>%
+  dplyr::group_by(knnClus) %>%
+  dplyr::mutate(Perc = paste0(Freq, "%")) %>%
+    dplyr::mutate(Population = factor(Population, levels=(pop_lvl)),
+                knnClus = factor(knnClus, levels=rev(clus_lvl)))
+
+
+# Get number of cells
+df_tab2 <- as.data.frame(tab) %>%
+  dplyr::group_by(knnClus) %>%
+  dplyr::mutate(Num = paste0("n=", Freq))
+
+p_clust <- 
+ggplot(df_tab_x, aes(x=Population, y=knnClus, fill =Freq))+
+ geom_tile(color = "grey50") +
+ scale_fill_gradient2(low = "white", high = "red", 
+   midpoint = 2, limit = c(0,100), space = "Lab", 
+    name="Percentage") +
+  theme_minimal()+ # minimal theme
+ theme(axis.text.x = element_text(angle = 45, vjust = 1, 
+    size = 12, hjust = 1)) +
+  geom_text(aes(x=Population, y=knnClus, label = Perc), color = "black", size = 4) +
+  geom_text(data=df_tab2, aes(x=Population, y=knnClus, label = Num), color = "black", size = 3,
+            vjust=3) +
+ coord_fixed()
+
+
+df_tab3 <- df_tab %>%
+  dplyr::mutate(Population = factor(Population, levels=rev(pop_lvl)),
+                knnClus = factor(knnClus, levels=(clus_lvl)))
+
+# Get number of cells
+df_tab4 <- as.data.frame(tab) %>%
+  dplyr::group_by(knnClus) %>%
+  dplyr::mutate(Num = paste0("n=", Freq))
+
+p_clust2 <- 
+ggplot(df_tab3, aes(x=knnClus, y=Population, fill =Freq))+
+ geom_tile(color = "grey50") +
+ scale_fill_gradient2(low = "white", high = "red", 
+   midpoint = 2, limit = c(0,100), space = "Lab", 
+    name="Percentage") +
+  theme_minimal()+ # minimal theme
+ theme(axis.text.x = element_text(angle = 45, vjust = 1, 
+    size = 12, hjust = 1)) +
+  geom_text(aes(x=knnClus, y=Population, label = Perc), color = "black", size = 4) +
+  geom_text(data=df_tab4, aes(x=knnClus, y=Population, label = Num), color = "black", size = 3,
+            vjust=3) +
+ coord_fixed()
+```
+
+
+Repeat all the above, now calculate the FACS clusters
+
+```{r}
+df_dim_train <- df_dim %>%
+    dplyr::filter(exp == "AGM")
+train_umap <- df_dim_train %>%
+  dplyr::select(UMAP_1, UMAP_2)
+  
+df_dim_test <- df_dim %>%
+  dplyr::filter(exp == "ACE")
+test_umap <- df_dim_test %>%
+  dplyr::select(UMAP_1, UMAP_2)
+
+# Get the cluster from AGM data
+AGMcluster <- as.factor(as.character(df_dim_train$Population))
+AGMcluster <- gsub("AGM_E10.5_Endo_Gfi", "Endo", AGMcluster)
+AGMcluster <- gsub("AGM_E10.5_Endo_Runx", "Endo", AGMcluster)
+# Predict the outcome
+
+knn_pred = class::knn(train_umap, test_umap, AGMcluster, k = 3, prob = FALSE)
+set.seed(123)
+df_knn <- data.frame(
+  Population = df_dim_test$Population,
+  knnClus = knn_pred) %>%
+  dplyr::mutate(Population =
+                  factor(Population,
+                         levels=rev(c("Endo", "ACE_pos", "HE_Gfi1"))))
+
+tab <- xtabs(~  knnClus + Population,  df_knn)
+
+# The perentage of cells
+tab_perc <- round( t(t(tab) / colSums(tab) * 100),1)
+df_tab <- as.data.frame(tab_perc) %>%
+  dplyr::group_by(knnClus) %>%
+  dplyr::mutate(Perc = paste0(Freq, "%"),
+                knnClus = gsub("AGM_E10.5_Endo_Gfi", "Endo", knnClus),
+                knnClus = gsub("AGM_E10.5_Endo_Runx", "Endo", knnClus)) %>%
+  dplyr::mutate(knnClus = factor(knnClus,
+                                 levels = c(
+                                   "Endo","AGM_E10.5_Runx_pos",
+    "AGM_E10.5_HE", "AGM_E10.5_EHT", "AGM_E10.5_IAHC")))
+
+# Get number of cells
+df_tab2 <- as.data.frame(tab) %>%
+  dplyr::group_by(knnClus) %>%
+  dplyr::mutate(Num = paste0("n=", Freq),
+                knnClus = gsub("AGM_E10.5_Endo_Gfi", "Endo", knnClus),
+                knnClus = gsub("AGM_E10.5_Endo_Runx", "Endo", knnClus)) %>%
+  dplyr::mutate(knnClus = factor(knnClus,
+                                 levels = c(
+                                   "Endo","AGM_E10.5_Runx_pos",
+    "AGM_E10.5_HE", "AGM_E10.5_EHT", "AGM_E10.5_IAHC")))
+
+
+
+p_facs <- 
+ggplot(df_tab, aes(x=knnClus, y=Population, fill =Freq))+
+ geom_tile(color = "grey50") +
+ scale_fill_gradient2(low = "white", high = "red", 
+   midpoint = 2, limit = c(0,100), space = "Lab", 
+    name="Percentage") +
+  theme_minimal()+ # minimal theme
+ theme(axis.text.x = element_text(angle = 45, vjust = 1, 
+    size = 12, hjust = 1)) +
+  geom_text(aes(x=knnClus, y=Population, label = Perc), color = "black", size = 4) +
+  geom_text(data=df_tab2, aes(x=knnClus, y=Population, label = Num), color = "black", size = 3,
+            vjust=3) +
+ coord_fixed()
+```
+
+Save the two files
+
+```{r}
+pdf(file.path(outDir_cur, "knn_prediction.pdf"), height=6, width = 5)
+p_clust
+p_facs 
+dev.off()
+
+
+pdf(file.path(outDir_cur, "knn_prediction_transpose.pdf"), height=5, width = 6)
+p_clust2 
+dev.off()
+```
+
+
+
+## Correlation between FACS and RNA-seq
+
+One of the reviewer asked about gene expression and protein correlation. How can we address this?
+
+We scale all the FACS values to minimum (make it 0)
+
+```{r}
+setmp <- se.block.ace
+setmp$Population <- factor(setmp$Population, levels=c("Endo", "ACE_pos", "HE_Gfi1"))
+
+setmp$CDH5 = setmp$CDH5 - min(setmp$CDH5)
+setmp$ACE = setmp$ACE - min(setmp$ACE)
+setmp$CD44 = setmp$CD44 - min(setmp$CD44)
+setmp$KIT = setmp$KIT - min(setmp$KIT)
+setmp$GFI1 = setmp$Gfi1_GFP - min(setmp$Gfi1_GFP)
+```
+
+Compile all the protein and gene expression
+
+```{r}
+df_facs <- 
+  data.frame(
+    #CDH5 = log10(se.block.ace$CDH5),
+    CDH5 = setmp$CDH5,
+    ACE = setmp$ACE,
+    CD44 = setmp$CD44,
+    #KIT = log10(se.block.ace$KIT),
+    KIT = setmp$KIT,
+    GFI1 = setmp$GFI1,
+    
+    cdh5 = assay(setmp, "logcounts")["Cdh5",],
+    ace = assay(setmp, "logcounts")["Ace",],
+    cd44 = assay(setmp, "logcounts")["Cd44",],
+    kit = assay(setmp, "logcounts")["Kit",],
+    gfi1 = assay(setmp, "logcounts")["Gfi1",],
+    
+    Population = setmp$Population,
+    Cluster = as.character(df_knn$knnClus)
+
+  ) %>%
+  tibble::rownames_to_column(var= "Cell") %>%
+  dplyr::mutate(Cluster = factor(Cluster, levels=sort(unique(Cluster))))
+
+m <- df_facs %>%
+  dplyr::select(Cell, Population, cdh5:gfi1) %>%
+  melt()
+```
+
+
+Show the violin plot of gene expression and protein expression
+
+```{r}
+# Plot
+pTheme1 <- stat_summary(fun.y = mean, fun.ymin = mean, fun.ymax = mean,
+                 geom = "crossbar", width = 0.3, alpha = 0.5, colour="grey50") 
+pTheme2 <-   scale_fill_manual(values=gHue) 
+cdh5_g <- ViolGene_pop(DF=df_facs, "cdh5")
+ace_g <- ViolGene_pop(DF=df_facs, "CDH5")
+
+
+ViolGene_pop(DF=df_facs, "gfi1")
+ViolGene_clus(DF=df_facs, "gfi1")
+```
+
+
+A faceted plot
+
+```{r}
+# Calculate drop-off for each gene in each population
+df_g <- m %>%
+    group_by(Population, variable) %>%
+    summarise(Ncell = n(),
+              Nexp = sum(value >0 )) %>%
+    dplyr::mutate(PecExp = round(Nexp / Ncell * 100, 1),
+                  PecExp2 = paste0(PecExp, "%"),
+                  Text = paste0(Nexp, "/", Ncell, "=", PecExp, "%")) 
+
+# Calculate drop-off for each gene in ALL population
+df_g2 <- m %>%
+    group_by(variable) %>%
+    summarise(Ncell = n(),
+              Nexp = sum(value <=0 )) %>%
+    dplyr::mutate(PecExp = round(Nexp / Ncell * 100, 1),
+                  Text = paste0(Nexp, "/", Ncell, "=", PecExp, "%"))  %>%
+  dplyr::arrange(PecExp)
+
+m <- m %>%
+  dplyr::mutate(variable=factor(variable, levels=(df_g2$variable)))
+
+pViolgene <-
+    ggplot(m, aes(x=Population, y=value, colour=Population)) +
+    geom_violin(fill=NA, scale="width") +
+    geom_quasirandom(groupOnX=TRUE, size = 0.8, alpha = 0.5, width = 0.4) +
+    stat_summary(fun.y = mean, fun.ymin = mean, fun.ymax = mean,
+                 geom = "crossbar", width = 0.3, alpha = 0.8, colour="black") +
+    scale_colour_manual(values=gHue) +
+    theme_bw() +
+    theme(legend.position = "none",
+          panel.grid.major = element_line(linetype = "blank"), 
+          panel.grid.minor = element_line(linetype = "blank"),
+          axis.text.x = element_text(angle = 45, hjust = 1)) +
+    labs(x = paste0("Group"), 
+         y = "Normalised Expression (log)") +
+  facet_wrap(~variable, ncol=5) +
+    geom_text(data=df_g ,
+              aes(x = Population, y = max(m$value + 0.1), label=PecExp2),
+              color="black", size = 4) +
+    NULL
+
+pdf(file.path(outDir_cur, "CS_exprssion.pdf"), height=4, width = 10)
+pViolgene
+dev.off()
+```
+
+
+
+Now plot correlation
+
+```{r}
+library(ggpubr)
+ggplot(df_facs, aes(x= ACE,y=ace)) +
+  geom_point() +
+  theme_bw() +
+  facet_wrap(~Population) +
+   #geom_smooth(method = "lm") +
+  stat_cor(method="pearson",
+   aes(label = paste(..rr.label.., ..p.label.., sep = "~`,`~")))
+  NULL
+```
+
+We can try a faceted population as well
+
+```{r}
+m2 <- df_facs %>%
+  dplyr::select(Cell, CDH5:GFI1) %>%
+  melt() %>%
+  dplyr::rename(value2 = value) %>%
+  dplyr::mutate(variable=tolower(variable),
+                variable=factor(variable, levels=(df_g2$variable))) %>%
+  dplyr::left_join(m)
+
+p_cor <- 
+ggplot(m2, aes(x= value2,y=value, colour=Population)) +
+  geom_point(size=2) +
+  theme_bw() +
+  facet_wrap(~variable, scales = "free_x", ncol=5) +
+  ylab("Transcript expression") +
+  xlab("Protein expression") +
+  theme(legend.position = "none") +
+   #geom_smooth(method = "lm") +
+  NULL
+  
+ggplot(m2, aes(x= value2,y=value)) +
+  geom_point() +
+  theme_bw() +
+  facet_wrap(~variable, scales = "free_x") +
+  ylab("Transcript expression") +
+  xlab("Protein expression") +
+   #geom_smooth(method = "lm") +
+  stat_cor(method="pearson",
+   aes(label = paste(..r.label.., ..p.label.., sep = "~`,`~"))) +
+  NULL  
+
+pdf(file.path(outDir_cur, "CS_exp_correlation.pdf"), height=5, width = 10)
+pViolgene + p_cor + plot_layout(nrow = 2)
+dev.off()
+
+```
+
+Just ACE and ace
+
+```{r}
+df_cor2 <- df_facs %>%
+  dplyr::select(Population, ACE, ace) %>%
+  #dplyr::filter(ace >0) %>%
+  #dplyr::filter(!Population == "Endo")
+
+p_cor <- 
+ggplot(df_cor2, aes(x= ACE,y=ace, colour=Population)) +
+  geom_point(size=2) +
+  theme_bw() +
+  #facet_wrap(~Population,ncol=3) +
+  ylab("Transcript expression") +
+  xlab("Protein expression") +
+  theme(legend.position = "none") +
+  stat_cor(method="pearson",
+   aes(label = paste(..r.label.., ..p.label.., sep = "~`,`~"))) +
+  NULL  
+
+cor(df_cor2$ACE, df_cor2$ace)
+```
+
+
+# Save
+
+```{r}
+save.image(file=file.path(outDir_cur, "All.Rdata"))
+#load(file.path(outDir_cur, "All.Rdata"))
+```
+

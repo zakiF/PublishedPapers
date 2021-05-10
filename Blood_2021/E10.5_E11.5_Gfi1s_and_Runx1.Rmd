@@ -1,0 +1,3566 @@
+# E10.5 and E11.5 {#E10.5_E11.5}
+
+
+## Objective
+
+Here we will focus on the clustering and analysiss of Gfi mouse only
+
+## Conclusion
+
+* Selected E10.5 and E11.5 AGM data
+
+
+* Performed Dimension redcution & Independent clustering with Dynamic Tree Cut
+    - Figure \@ref(fig:UMAPcutTree)
+    - Table \@ref(tab:TreeCutTable)
+
+
+* Find Endo sub-Population
+    - Draw heatmap of Arterial Venous related genes (Figure \@ref(fig:ArVeHeatmap))
+    - PCA representation using the Av and Ve genes (Figure \@ref(fig:PCAArVe))
+    - Score based on combination (Figure \@ref(fig:ArVeScoring))
+    - Number of cells in each population Table \@ref(tab:AvTable)
+
+
+## Pre-processing
+
+### Library
+
+```{r, message=FALSE, warning=FALSE}
+# CRAN packages
+library(ggplot2)
+library(plyr)
+library(dplyr)
+library(textclean)
+library(purrr)
+library(reshape2)
+library(scales)
+#library(knitr)
+library(kableExtra) # Nice html table
+library(umap) # Dimension reduction & Clustering
+library(dendextend)
+library(pheatmap)
+library(seriation) # Dimension reduction & Clustering
+library(RColorBrewer) # Colours
+library(testit)
+library(ggridges)
+library(ggbeeswarm)
+library(ggrepel)
+library(ggsignif)
+library(alluvial)
+library(here) # Directory structure
+# Dev packages
+library(patchwork)
+library(paletteer) # Colours
+# Bioconductor
+library(scater)
+library(scran) 
+library(dynamicTreeCut)
+#library(monocle)
+library(edgeR) # DE
+library(fgsea) # Pathways
+library(clusterProfiler) # Pathways
+library(org.Mm.eg.db) # Pathways
+library(stringr)
+set.seed(100)
+```
+
+
+### Directory
+
+Check if the correct directory is specified
+
+```{r}
+dr_here()
+```
+
+
+```{r}
+#workDir <- here()
+workDir <- "/Users/zfadlullah/Dropbox (The University of Manchester)/zaki/PhD/sequencing_runs/2019/191001_MZ_009"
+dataDir <- file.path(workDir, "data")
+outDir <- file.path(workDir, "output")
+dir.create(outDir)
+outDir_C3 <- file.path(outDir, "Chapter_03_UnsupervisedClustering_E10_E11_Gfi1")
+dir.create(outDir_C3)
+set.seed(100)
+```
+
+
+
+### Load previous data
+
+Load the se object where ;
+  - Low-quality cells have been filtered
+  - Lowly expressed genes have been removed
+  - Cell cycle has been annotated
+
+```{r}
+#load(file.path(outDir, "Chapter_02_Filtering/seCombined_Cellfilter_CC.Robject"))
+#load(file.path(outDir, "Chapter_02_Filtering/seCombined_GeneFiltered.Robject"))
+load(file.path(outDir, "Chapter_02_Filtering/seGeneFilter.Rdata"))
+```
+
+Load Baron 2018 data
+
+```{r}
+outDir_C5 <- "/Users/zfadlullah/Dropbox (The University of Manchester)/zaki/PhD/sequencing_runs/2018/2018_08_15_Robin/output/Chapter_05"
+load(file=file.path(outDir_C5, "se.Robj"))
+```
+
+
+Load function 
+
+```{r}
+source(file.path(workDir, "functions.R"))
+```
+
+
+#### TF & CS 
+
+We download the list of transcription factors from two site http://fantom.gsc.riken.jp/5/sstar/Browse_Transcription_Factors_mm9 and http://genome.gsc.riken.jp/TFdb/tf_list.html. The list of cell surfurce marker from here http://wlab.ethz.ch/cspa/#downloads (CSPA validated surfaceome proteins). We read the following file into R.
+
+```{r}
+tf_dat <- read.csv(file.path(dataDir, "Others/TF_listRiken.csv"))
+tf_dat2 <- read.delim(file.path(dataDir, "Others/TF_list.txt"))
+cs_dat <- read.delim(file.path(dataDir, "Others/Cell_Surface.txt"), stringsAsFactors = FALSE)
+#cs_dat$gene_name <- toupper(cs_dat$gene_name)
+tf_dat$Symbol <- toupper(tf_dat$Symbol)
+tf_dat2$Symbol <- toupper(tf_dat2$Symbol)
+
+
+tf_all <- unique(c(tf_dat$Symbol, tf_dat2$Symbol))
+# Lower case
+tf_all2 <- tolower(tf_all)
+tf_all2 <- as.character(mapply(simpleCap, tf_all2))
+```
+
+
+The list of cell surfurce was not complete, so we add from this [resource](https://www.genenames.org/). We go to custom download and downlad everything. As the list is not just cell surfurce marker, we find the genes with "CD" in thier names.
+
+```{r}
+cs_dat2 <- read.delim(file.path(dataDir, "Others/Cell_Surface_genenames.org.txt"),stringsAsFactors = FALSE)
+cs_dat2$Synonyms <- paste(cs_dat2$Synonyms, cs_dat2$Previous.symbols, sep=",")
+
+# There is a column called Synonyms which have the cell surface names. It is seperated by ", 
+Syn_list <- strsplit(cs_dat2$Synonyms, ',')
+# Remove any blank space
+Syn_list <- base::lapply(Syn_list, str_trim,  "left")
+
+# In each of the list we want to find things that begins with CD
+Syn_CD <- base::lapply(Syn_list, grepl,  pattern="^CD[0-9]")
+
+# For any columns which is TRUE (ie have a CD, we keep it)
+Syn_CD <- base::lapply(Syn_CD, sum)
+
+# Subset the orignal data to these genes
+cs_dat_f <- cs_dat2[Syn_CD > 0,] %>%
+   dplyr::select(Approved.symbol, Synonyms)
+
+# We also find the genes that begins with CD
+cs_dat_f2 <- cs_dat2 %>%
+  # Look at the column with gene name
+  dplyr::mutate(isCS= grepl("^CD[0-9]", Approved.symbol)) %>%
+  dplyr::filter(isCS == "TRUE") %>%
+  dplyr::select(Approved.symbol, Synonyms)
+
+# Combine the two list 
+cs_dat2_master <- rbind(cs_dat_f, cs_dat_f2) %>% 
+  # Convert so only first letter is uppercase
+  dplyr::mutate(gene_name =  tolower(Approved.symbol)) %>%
+  dplyr::mutate(gene_name =  as.character(mapply(simpleCap, gene_name)))
+
+# Also read renaud cell surfarce makers
+cs_dat3 <- read.delim(file.path(dataDir, "Others/RM_cur_CS_mouse.txt"),stringsAsFactors = FALSE)
+
+
+
+# Save this back to the data folder
+write.csv(cs_dat2_master, file.path(dataDir, "Others/Cell_Surface_genenames.org_simple.csv"))
+```
+
+We combine the two resource from different database
+
+```{r}
+#cs_dat <- data.frame(gene_name = unique(c(cs_dat$gene_name, cs_dat2_master$gene_name)))
+cs_dat <- cs_dat2_master
+```
+
+
+### Select interested population
+
+We want to select ONLY the population we are interested in
+
+```{r}
+popSel <- c("AGM_E10.5_Endo_Gfi", 
+            
+            # For now we exclude the Runx population
+            #"AGM_E10.5_Endo_Runx", 
+            #"AGM_E10.5_Runx_pos", 
+            
+            "AGM_E10.5_HE", 
+            "AGM_E10.5_EHT", "AGM_E10.5_IAHC",
+            
+            "AGM_E11.5_Endo", "AGM_E11.5_HE", "AGM_E11.5_EHT", "AGM_E11.5_IAHC")
+
+
+se <- sce_Genefilter[, sce_Genefilter$Population %in% popSel]
+se$Population <- factor(se$Population)
+```
+
+Show a table of the number of cells in each population
+
+```{r SelCells}
+cD <- as.data.frame(colData(se))
+tab <- xtabs(~ Population,  cD)
+kable(tab, caption = "Selected cells") %>%
+  kable_styling("striped", full_width = F) %>%
+  scroll_box(width = "100%", height = "100%")
+```
+
+
+
+
+
+Show a table of the number of cells in each population by the seuqencing run
+
+```{r}
+cD <- as.data.frame(colData(se))
+tab <- xtabs(~ Population + SequencingRun, cD)
+kable(tab, caption = "Selected cells") %>%
+  kable_styling("striped", full_width = F) %>%
+  scroll_box(width = "100%", height = "100%")
+```
+
+
+
+After selecting the interested population we discard genes that are not expressed
+
+```{r}
+ave.counts <- calcAverage(se, use_size_factors=FALSE)
+keep <- ave.counts > 0
+se <- se[keep,]
+summary(keep)
+```
+
+
+Add embryonic stage
+
+```{r}
+Stage <- gsub("AGM_", "", se$Population)
+Stage <- gsub("_.*", "", Stage)
+
+se$eStage <- Stage
+```
+
+
+Set the colour scheme
+
+```{r}
+colp <- df_col$Col[df_col$Population %in% se$Population]
+```
+
+Re-calculate QC
+
+
+```{r}
+ERCC_gene <- rowData(se)$gene_type == "ERCC"
+MT_gene <- rowData(se)$chrNum == "MT"
+Ribosome_gene <- rowData(se)$gene_type == "rRNA"
+
+# Getting the hemoglobin genes
+Hbbs <- c("Hba-x", "Hbb-bh1", "Hbb-y", "Hba-a1")
+# Get the Ens ID
+rData <- as.data.frame(rowData(se))
+Hb_ens <- rData %>%
+  dplyr::filter(gene_name %in% Hbbs)
+Hbb_gene <- rowData(se)$gene_id %in% Hb_ens$gene_id
+
+
+# Get the TF genes
+TF_gene <- rowData(se)$gene_name %in% tf_all2
+  
+# Get the cell surfarce markers
+CS_gene <- rowData(se)$gene_name %in% cs_dat3$symbol
+
+se <- 
+  calculateQCMetrics(se,
+                     feature_controls = 
+                       list(ERCC = ERCC_gene,
+                            MT= MT_gene,
+                            Ribosome = Ribosome_gene,
+                            Hbb = Hbb_gene,
+                            CS = CS_gene,
+                            TF = TF_gene)
+  )
+```
+
+
+Get some stats to put in the paper
+
+```{r}
+cD <- as.data.frame(colData(se))
+print(paste0("Total number of genes detected ", nrow(se)))
+print(paste0("Median number of genes detected in each cell ", median(cD$total_features_by_counts_endogenous)))
+print(paste0("Mean number of genes detected in each cell ", mean(cD$total_features_by_counts_endogenous)))
+print(paste0("Median number of reads in each cell ", median(cD$TotalReads)))
+print(paste0("Median percentage of Mapped sequence ", median(cD$Mapped_per)))
+```
+
+## Normalisation
+
+
+We perform normalisation. Now since some runs have ERCC and some do not, we will remove all ERCC reads from all sequencing runs.
+
+
+```{r}
+# Remove all ERCC
+se <- se[-grep("ERCC", rownames(se)), ]
+# Normalisation
+is.spike <- grepl("^ERCC", rownames(se))
+ERCC_loc <- grep("ERCC",rowData(se)$gene_type)
+GENE_loc <- grep("ERCC",rowData(se)$gene_type, invert = TRUE)
+
+
+# Annotation
+cD <- as.data.frame(colData(se))
+# Normalisation
+clusters <- quickCluster(se, method="igraph", min.mean=1)
+se <- computeSumFactors(se, cluster=clusters, min.mean=1)
+#isSpike(se, "ERCC") <-  ERCC_loc
+#se <- computeSpikeFactors(se, general.use=FALSE)
+se <- normalize(se)
+```
+
+## Compare to baron
+
+Get robin stats
+
+Recalculate feature in Robin data
+
+```{r}
+ERCC_gene <- rowData(se_g)$gene_type == "ERCC"
+MT_gene <- rowData(se_g)$chrNum == "MT"
+Ribosome_gene <- rowData(se_g)$gene_type == "rRNA"
+
+# Getting the hemoglobin genes
+Hbbs <- c("Hba-x", "Hbb-bh1", "Hbb-y", "Hba-a1")
+# Get the Ens ID
+rData <- as.data.frame(rowData(se_g))
+Hb_ens <- rData %>%
+  dplyr::filter(gene_name %in% Hbbs)
+Hbb_gene <- rowData(se_g)$gene_id %in% Hb_ens$gene_id
+
+# Get the TF genes
+TF_gene <- rowData(se_g)$gene_name %in% tf_all2
+  
+# Get the cell surfarce markers
+CS_gene <- rowData(se_g)$gene_name %in% cs_dat3$symbol
+
+se_g <- 
+  calculateQCMetrics(se_g,
+                     feature_controls = 
+                       list(ERCC = ERCC_gene,
+                            MT= MT_gene,
+                            Ribosome = Ribosome_gene,
+                            Hbb = Hbb_gene,
+                            CS = CS_gene,
+                            TF = TF_gene)
+  )
+```
+
+
+
+```{r}
+cD_rob <- as.data.frame(colData(se_g))
+print(paste0("Total number of genes detected ", nrow(se_g)))
+print(paste0("Median number of genes detected in each cell ", median(cD_rob$total_features_by_counts_endogenous)))
+print(paste0("Mean number of genes detected in each cell ", mean(cD_rob$total_features_by_counts_endogenous)))
+print(paste0("Median number of reads in each cell ", median(cD_rob$TotalReads)))
+print(paste0("Median percentage of Mapped sequence ", median(cD_rob$Mapped_per)))
+```
+
+Some plots
+
+```{r}
+cD_1 <- cD %>%
+  dplyr::select(total_features_by_counts_endogenous, 
+                total_features_by_counts_CS,
+                total_features_by_counts_TF)
+cD_1$Study <- "This"
+
+cD_2 <- cD_rob %>%
+  dplyr::select(total_features_by_counts_endogenous, 
+                total_features_by_counts_CS,
+                total_features_by_counts_TF)
+cD_2$Study <- "Baron"
+
+# Combine
+cD_all <- rbind(cD_1, cD_2)
+colnames(cD_all) <- c("NumGene", "NumCS", "NumTF", "Study")
+cD_all$Study <- factor(cD_all$Study, levels = c("This", "Baron"))
+```
+
+
+Plot a few things
+
+```{r}
+mdat <- melt(cD_all)
+p1 <- 
+  ggplot(mdat, aes(x=Study, 
+                     y=value,
+                     fill=Study)) +
+  geom_boxplot() +
+  facet_wrap(~variable, scales = "free") +
+  theme_bw()
+
+p1
+
+pdf(file.path(outDir_C3, "Baron_comparison_gene.pdf"), height = 4, width = 7)
+p1
+dev.off()
+```
+
+### Dropout rate
+
+Plot the dropout rates as well. Limit to similar genes
+
+
+```{r}
+geneIntersect <- intersect(row.names(se), row.names(se_g))
+
+rD_1 <- as.data.frame(rowData(se)) %>%
+  dplyr::filter(gene_name  %in% geneIntersect) %>%
+  dplyr::select(pct_dropout_by_counts) %>%
+  dplyr::mutate(Study = "This")
+
+rD_2 <- as.data.frame(rowData(se_g)) %>%
+  dplyr::filter(gene_name  %in% geneIntersect) %>%
+  dplyr::select(pct_dropout_by_counts) %>%
+  dplyr::mutate(Study = "Baron")
+
+rD_all <- rbind(rD_1, rD_2)
+rD_all$Study <- factor(rD_all$Study, levels = c("This", "Baron"))
+
+p2 <- 
+  ggplot(rD_all, aes(x=Study, 
+                     y=pct_dropout_by_counts,
+                     fill=Study)) +
+  geom_boxplot() +
+  theme_bw()
+
+print(median(rD_1$pct_dropout_by_counts))
+print(median(rD_2$pct_dropout_by_counts))
+
+p2
+
+pdf(file.path(outDir_C3, "Baron_comparison_dropout.pdf"), height = 3, width = 4)
+p2
+dev.off()
+
+```
+
+### Resolution
+
+
+
+We plot the percentage of cells that are non zero in each population 
+
+
+For Gfi1 
+
+```{r}
+selGene <- c("Gfi1")
+
+
+# For the celSeq
+seCelSeq <- se_g
+
+pp <- seCelSeq[, seCelSeq$Population %in% c("E10_Gfi1_HE")]
+gg <- assay(pp, "logcounts")[selGene,]
+pp1 <- sum(gg > 0) / length(gg) * 100
+
+
+pp <- seCelSeq[, seCelSeq$Population %in% c("E10_EHT")]
+gg <- assay(pp, "logcounts")[selGene,]
+pp2 <- sum(gg > 0) / length(gg) * 100
+
+pp <- seCelSeq[, seCelSeq$Population %in% c("E10_IAHC")]
+gg <- assay(pp, "logcounts")[selGene,]
+pp3 <- sum(gg > 0) / length(gg) * 100
+
+
+# For the SmartSEq
+sceSelected <- se[, se$Population %in% c("AGM_E10.5_HE", "AGM_E10.5_EHT", "AGM_E10.5_IAHC")]
+
+
+
+pp <- sceSelected[, sceSelected$Population %in% c("AGM_E10.5_HE")]
+gg <- assay(pp, "logcounts")[selGene,]
+pp4 <- sum(gg > 0) / length(gg) * 100
+
+
+pp <- sceSelected[, sceSelected$Population %in% c("AGM_E10.5_EHT")]
+gg <- assay(pp, "logcounts")[selGene,]
+pp5 <- sum(gg > 0) / length(gg) * 100
+
+pp <- sceSelected[, sceSelected$Population %in% c("AGM_E10.5_IAHC")]
+gg <- assay(pp, "logcounts")[selGene,]
+pp6 <- sum(gg > 0) / length(gg) * 100
+
+# Make a dataframe
+df_perc <- data.frame(
+  Platform = c(rep("CelCeq", 2), rep("SmartSeq2", 2)),
+  Percentage = c(pp1, pp2, pp4, pp5),
+  Population = rep(c("FACS-HE", "FACS-EHT"))
+) %>%
+  dplyr::mutate(Population = factor(Population, levels = c("FACS-HE", "FACS-EHT")),
+                Platform = factor(Platform, levels=c("SmartSeq2", "CelCeq")))
+
+
+
+# Plot the percentage
+df_perc$Number <- paste0(round(df_perc$Percentage, 0), "%")
+pPerc <- 
+ggplot(df_perc, aes(x=Population, y=Percentage, fill=Population, alpha=Platform)) +
+  geom_bar(stat="identity", position=position_dodge()) +
+  scale_fill_manual(values=c("#FF9E4A","#A8786E", "#67BF5C")) +
+  scale_alpha_manual(values=c(1, 0.4)) +
+  theme_bw() +
+  #scale_colour_manual(values=c("grey20", "grey100")) +
+  theme(legend.position = "right",
+        panel.grid.major = element_line(linetype = "blank"), 
+        panel.grid.minor = element_line(linetype = "blank")) +
+  ylab("Percentage of cells with Gfi1 expression") +
+  geom_text(aes(label=Number), position=position_dodge(width=0.9), vjust=-0.25, show.legend = FALSE) +
+  NULL
+
+pPerc <- 
+ggplot(df_perc, aes(x=Population, y=Percentage, fill=Platform)) +
+  geom_bar(stat="identity", position=position_dodge()) +
+  #scale_fill_manual(values=c("#67BF5C")) +
+  #scale_alpha_manual(values=c(1, 0.4)) +
+  theme_bw() +
+  #scale_colour_manual(values=c("grey20", "grey100")) +
+  theme(legend.position = "right",
+        panel.grid.major = element_line(linetype = "blank"), 
+        panel.grid.minor = element_line(linetype = "blank")) +
+  ylab("Percentage of cells with Gfi1b expression") +
+  geom_text(aes(label=Number), position=position_dodge(width=0.9), vjust=-0.25, show.legend = FALSE) +
+  NULL
+
+
+
+pPerc
+
+pdf(file.path(outDir_C3, "PercentageDetection_Gfi1.pdf"), width = 4, height = 5)
+pPerc
+dev.off()
+```
+
+
+For Gfi1b 
+
+```{r}
+selGene <- c("Gfi1b")
+
+
+# For the celSeq
+seCelSeq <- se_g
+
+pp <- seCelSeq[, seCelSeq$Population %in% c("E10_Gfi1_HE")]
+gg <- assay(pp, "logcounts")[selGene,]
+pp1 <- sum(gg > 0) / length(gg) * 100
+
+
+pp <- seCelSeq[, seCelSeq$Population %in% c("E10_EHT")]
+gg <- assay(pp, "logcounts")[selGene,]
+pp2 <- sum(gg > 0) / length(gg) * 100
+
+pp <- seCelSeq[, seCelSeq$Population %in% c("E10_IAHC")]
+gg <- assay(pp, "logcounts")[selGene,]
+pp3 <- sum(gg > 0) / length(gg) * 100
+
+
+# For the SmartSEq
+sceSelected <- se[, se$Population %in% c("AGM_E10.5_HE", "AGM_E10.5_EHT", "AGM_E10.5_IAHC")]
+
+
+
+pp <- sceSelected[, sceSelected$Population %in% c("AGM_E10.5_HE")]
+gg <- assay(pp, "logcounts")[selGene,]
+pp4 <- sum(gg > 0) / length(gg) * 100
+
+
+pp <- sceSelected[, sceSelected$Population %in% c("AGM_E10.5_EHT")]
+gg <- assay(pp, "logcounts")[selGene,]
+pp5 <- sum(gg > 0) / length(gg) * 100
+
+pp <- sceSelected[, sceSelected$Population %in% c("AGM_E10.5_IAHC")]
+gg <- assay(pp, "logcounts")[selGene,]
+pp6 <- sum(gg > 0) / length(gg) * 100
+
+# Make a dataframe
+df_perc <- data.frame(
+  Platform = c(rep("CelCeq", 1), rep("SmartSeq2", 1)),
+  Percentage = c(pp3, pp6),
+  Population = rep(c("FACS-IAHC"))
+) %>%
+  dplyr::mutate(Population = factor(Population, levels = c("FACS-IAHC")),
+                Platform = factor(Platform, levels=c("SmartSeq2", "CelCeq")))
+
+
+
+# Plot the percentage
+df_perc$Number <- paste0(round(df_perc$Percentage, 0), "%")
+pPerc_2 <- 
+ggplot(df_perc, aes(x=Population, y=Percentage, fill=Population, alpha=Platform)) +
+  geom_bar(stat="identity", position=position_dodge()) +
+  scale_fill_manual(values=c("#67BF5C")) +
+  scale_alpha_manual(values=c(1, 0.4)) +
+  theme_bw() +
+  #scale_colour_manual(values=c("grey20", "grey100")) +
+  theme(legend.position = "right",
+        panel.grid.major = element_line(linetype = "blank"), 
+        panel.grid.minor = element_line(linetype = "blank")) +
+  ylab("Percentage of cells with Gfi1b expression") +
+  geom_text(aes(label=Number), position=position_dodge(width=0.9), vjust=-0.25, show.legend = FALSE) +
+  NULL
+
+
+pPerc_2 <- 
+ggplot(df_perc, aes(x=Population, y=Percentage, fill=Platform)) +
+  geom_bar(stat="identity", position=position_dodge()) +
+  #scale_fill_manual(values=c("#67BF5C")) +
+  #scale_alpha_manual(values=c(1, 0.4)) +
+  theme_bw() +
+  #scale_colour_manual(values=c("grey20", "grey100")) +
+  theme(legend.position = "right",
+        panel.grid.major = element_line(linetype = "blank"), 
+        panel.grid.minor = element_line(linetype = "blank")) +
+  ylab("Percentage of cells with Gfi1b expression") +
+  geom_text(aes(label=Number), position=position_dodge(width=0.9), vjust=-0.25, show.legend = FALSE) +
+  NULL
+pPerc_2
+
+pdf(file.path(outDir_C3, "PercentageDetection_Gfi1b.pdf"), width = 4, height = 5)
+pPerc_2
+dev.off()
+```
+
+
+
+
+
+## Technical effects
+
+As the cells have been sequenced in different batches, a batch-related bias is expected. Particularly GL32 was sequenced at high depth. 
+
+```{r}
+plotColData(se, x="SequencingRun", y="log10_total_counts")
+```
+
+The cell population is the largest contibutor
+
+
+```{r}
+plotExplanatoryVariables(se, 
+  variables = c("cell_cycle", "Population", "SequencingRun", 
+                "log10_total_counts", "log10_total_counts_ERCC", "TotalReads"))
+```
+
+
+We can remove the batch effect by calling `removeBatchEffect` in limma while considering the cell population
+
+Normalisation while considering the batch effect of sequencing runs
+
+```{r}
+assay(se, "corrected") <- removeBatchEffect(logcounts(se), 
+    design=model.matrix(~se$Population), batch=se$SequencingRun)
+assayNames(se)
+```
+
+
+## HVG batch
+
+We identify the highly variable genes in each of the sequencing run.  We based on the guide [here](https://github.com/MarioniLab/NaiveHESC2016/blob/master/analysis/overall_analysis.Rmd).
+
+```{r}
+sce <- multiBlockNorm(se, se$SequencingRun)
+var.out <- multiBlockVar(sce, block=sce$SequencingRun,
+                         trend.args=list(parametric=FALSE, 
+                                         use.spikes=FALSE,
+                                         loess.args=list(span=0.4)))
+row.names(var.out) <- row.names(sce)
+
+
+par(mfrow=c(ceiling(length(unique(se$SequencingRun))/2), 2), 
+      mar=c(4.1, 4.1, 2.1, 0.1))
+  collected <- list()
+  for (x in unique(se$SequencingRun)) {
+    current <- sce[,sce$SequencingRun==x]
+    if (ncol(current)<2L) { next }
+    cur.out <- var.out$per.block[[x]]
+    plot(cur.out$mean, cur.out$total, pch=16, cex=0.6, xlab="Mean log-expression", 
+         ylab="Variance of log-expression", main=x)
+    #points(cur.out$mean, cur.out$var, pch=16)
+    curve(metadata(cur.out)$trend(x), col="dodgerblue", lwd=2, add=TRUE)
+    collected[[x]] <- cur.out
+  }
+```
+
+We save the the variance to file
+
+
+```{r}
+write.table(file=file.path(outDir_C3, "var.tsv"), 
+    var.out[,setdiff(colnames(var.out), "per.block")], # don't save the DFs.
+    sep="\t", quote=FALSE, col.names = NA) 
+```
+
+The computed variance is used to identify highly variable genes, which are subsequently saved to file. 
+
+
+```{r}
+hvg.out_block <- var.out[which(var.out$FDR <= 0.05 & var.out$bio >= 0.5),-7]
+nrow(hvg.out_block) 
+hvg.out_block <- hvg.out_block[order(hvg.out_block$bio, decreasing=TRUE),]
+write.table(hvg.out_block,
+            file = file.path(outDir_C3, "hvg.out_block.txt"), 
+            sep="\t", quote=FALSE, col.names = NA) 
+head(hvg.out_block)
+```
+
+We look at top 10 of the HVG identified
+
+```{r}
+plotExpression(sce, rownames(hvg.out_block)[1:10], point_alpha=0.5, 
+    colour_by="Population", jitter="jitter") 
+```
+
+## HVG combined
+
+Here we try to identify the HVG all together from all the sequencing run
+
+
+```{r}
+var.fit <- scran::trendVar(se,
+                           assay.type="logcounts",
+                    method="loess", use.spikes=FALSE,
+                    block = se$SequencingRun,
+                    loess.args=list(span=0.25))
+var.out <- decomposeVar(se, var.fit)
+row.names(var.out) <- row.names(se)
+
+plot(var.out$mean, var.out$total, pch=16, cex=0.6, xlab="Mean log-expression",
+     ylab="Variance of log-expression")
+curve(var.fit$trend(x), col="dodgerblue", lwd=2, add=TRUE)
+```
+
+
+Get the HVG and plot them
+
+```{r}
+hvg.out <- var.out[which(var.out$FDR <= 0.05 & var.out$bio >= 0.5),]
+hvg.out <- hvg.out[order(hvg.out$bio, decreasing=TRUE),]
+
+
+write.table(hvg.out, 
+            file.path(outDir_C3, "HVG_combined.txt"), sep="\t", quote = FALSE, col.names=NA)
+nrow(hvg.out)
+
+
+plot(var.out$mean, var.out$total, pch=16, cex=0.6, xlab="Mean log-expression",
+     ylab="Variance of log-expression")
+cur.HVG <- row.names(se) %in% row.names(hvg.out)
+points(var.out$mean[cur.HVG], var.out$total[cur.HVG], col="red", pch=16)
+
+```
+
+
+How many genes are in common between the batch hvg and combined hvg 
+
+```{r}
+ii <- intersect(row.names(hvg.out), row.names(hvg.out_block))
+length(ii)
+```
+
+The question now is which one will we go for? For now we will go for the HVG identified in each sequencing run (block)
+
+```{r}
+hvg_sel <- hvg.out_block
+```
+
+
+## Dimensionality reduction based on the technical noise
+
+We remove the batch effect prior to performing dimensionality reduction.
+
+```{r}
+norm_exprs(sce) <- removeBatchEffect(exprs(sce), batch=sce$SequencingRun) 
+```
+
+We then estimate the number of PCs to retain based on our estimates of the technical noise.
+
+
+```{r}
+sce <- denoisePCA(sce, var.out, assay.type="norm_exprs")
+ncol(reducedDim(sce))
+
+se <- sce
+
+e_corr <- assay(se, "norm_exprs")
+e_log <- assay(se, "logcounts")
+```
+
+We also examine the variance explained by the first few PCs.
+
+```{r}
+pc.out <- attr(reducedDim(sce), "percentVar")
+plot(pc.out)
+```
+
+
+We save the PCs to file for future use.
+
+```{r}
+saveRDS(reducedDim(sce), file=file.path(outDir_C3, "pcs.rds"))
+```
+
+
+## Visualise in low dimension
+
+
+We perform dimensionality reduction using PCA, colouring by various attributes
+
+
+We draw the PCA based cosen expression values
+
+```{r pcaCustomNorm, fig.height=10, fig.width=10}
+eset_hvg <- e_corr[rownames(hvg_sel),]
+# Set up some colour
+# Colour for clustering
+col10 <- paletteer_d(palette = "ggsci::category10_d3", n = 10)
+# Colour for embryonic days
+#col2 <- c("#7fc97f", "#fdc086")
+col2 <- c("grey70", "grey50")
+# Generate metaData
+cD <- as.data.frame(colData(se))
+# Run PCA
+pca <- run_pca(eset_hvg)
+p1 <-
+  plot_pca(pca$PCs, explained = pca$explained,
+           metadata = cD, color = "Population", shape="Population") +
+  theme_bw() +
+  scale_colour_manual(name = "Population",
+                      #labels = c("E10.5_Endo", "E10.5_HE", "E10.5_EHT", "E10.5_IAHC",
+                      #           "E11.5_Endo", "E11.5_HE", "E11.5_EHT"),
+                      values=colp) +
+                      #values=c(colp[1:4], colp[1:3])) +
+  scale_shape_manual(name = "Population",
+                      #labels = c("E10.5_Endo", "E10.5_HE", "E10.5_EHT", "E10.5_IAHC",
+                      #           "E11.5_Endo", "E11.5_HE", "E11.5_EHT"),
+                      values=c(19,19,19,19,19,19,
+                               17,17,17)) 
+
+p2 <-
+  plot_pca(pca$PCs, explained = pca$explained,
+           metadata = cD, color = "cell_cycle") +
+  theme_bw() +
+  scale_colour_brewer(palette = "Pastel1") 
+
+p3 <-
+  plot_pca(pca$PCs, explained = pca$explained,
+           metadata = cD, color = "SequencingRun") +
+  theme_bw() +
+  scale_colour_manual(values=col10) 
+
+p4 <-
+  plot_pca(pca$PCs, explained = pca$explained,
+           metadata = cD, color = "eStage") +
+  theme_bw() +
+  scale_colour_manual(values=col2) 
+
+pdf(file.path(outDir_C3, "PCA_HVG_normEXP_custom.pdf"), width = 11, height = 8)
+p1 + p2 + p3 + p4 + plot_layout(ncol=2, heights = c(3,3))
+dev.off()
+p1 + p2 + p3 + p4 + plot_layout(ncol=2, heights = c(3,3))
+```
+ 
+We can also use the logCounts expression
+
+```{r pcaCustom, fig.height=10, fig.width=10}
+eset_hvg <- e_log[rownames(hvg_sel),]
+# Set up some colour
+# Colour for clustering
+col10 <- paletteer_d(palette = "ggsci::category10_d3", n = 10)
+# Colour for embryonic days
+col2 <- c("#7fc97f", "#fdc086")
+# Generate metaData
+cD <- as.data.frame(colData(se))
+# Run PCA
+pca <- run_pca(eset_hvg)
+p1 <-
+  plot_pca(pca$PCs, explained = pca$explained,
+           metadata = cD, color = "Population", shape="Population") +
+  theme_bw() +
+  scale_colour_manual(name = "Population",
+                      #labels = c("E10.5_Endo", "E10.5_HE", "E10.5_EHT", "E10.5_IAHC",
+                      #           "E11.5_Endo", "E11.5_HE", "E11.5_EHT"),
+                      values=colp) +
+                      #values=c(colp[1:4], colp[1:3])) +
+  scale_shape_manual(name = "Population",
+                      #labels = c("E10.5_Endo", "E10.5_HE", "E10.5_EHT", "E10.5_IAHC",
+                      #           "E11.5_Endo", "E11.5_HE", "E11.5_EHT"),
+                      values=c(19,19,19,19,19,19,
+                               17,17,17)) 
+
+p2 <-
+  plot_pca(pca$PCs, explained = pca$explained,
+           metadata = cD, color = "cell_cycle") +
+  theme_bw() +
+  scale_colour_brewer(palette = "Pastel1") 
+
+p3 <-
+  plot_pca(pca$PCs, explained = pca$explained,
+           metadata = cD, color = "SequencingRun") +
+  theme_bw() +
+  scale_colour_manual(values=col10) 
+
+p4 <-
+  plot_pca(pca$PCs, explained = pca$explained,
+           metadata = cD, color = "eStage") +
+  theme_bw() +
+  scale_colour_manual(values=col2) 
+
+pdf(file.path(outDir_C3, "PCA_HVG_logCounts_custom.pdf"), width = 11, height = 8)
+p1 + p2 + p3 + p4 + plot_layout(ncol=2, heights = c(3,3))
+dev.off()
+p1 + p2 + p3 + p4 + plot_layout(ncol=2, heights = c(3,3))
+```
+
+We can use scater to draw the PCA
+
+```{r pcaScater, fig.height=10, fig.width=10}
+pca1 <- plotPCA(sce, colour_by=rownames(hvg_sel)[1]) 
+pca2 <- plotPCA(sce, colour_by="Runx1") 
+pca3 <- plotPCA(sce, colour_by="SequencingRun") + scale_fill_manual(values=col10) 
+pca4 <- plotPCA(sce, colour_by="Population") + scale_fill_manual(values=colp)
+
+pdf(file.path(outDir_C3, "PCA_HVG_scater.pdf"), width = 11, height = 8)
+pca1 + pca3 + pca2 + pca4 + plot_layout(ncol=2, heights = c(3,3))
+dev.off()
+pca1 + pca3 + pca2 + pca4 + plot_layout(ncol=2, heights = c(3,3))
+```
+
+
+Another option is to visualise with UMAP. We check the effects of UMAP parameter. We run this only once so we will not run it again
+
+```{r DifferentUMAPpara, fig.cap="Exploring different UMAP parameters", fig.width=14, fig.height=10}
+# We run UMAP on the PCA values
+df_PCA <- reducedDim(sce)
+
+# Info for ploting colour
+pop <- se$Population
+SeqRun <- se$SequencingRun
+CC <- se$cell_cycle
+Stage <- gsub("AGM_", "", pop)
+Stage <- gsub("_.*", "", Stage)
+
+# UMAP parameter
+n_neig <- c(4, 8, 16, 32, 64, 128)
+min_di <- c(0.001, 0.01, 0.05, 0.1, 0.5, 0.99)
+ran_state <- as.integer(999)
+n_dim <- 2
+
+# Run the UMAP 
+min_di %>% 
+  map_df(~umap(as.matrix(df_PCA), min_dist = .x,
+               n_components = n_dim,
+               random_state = ran_state)$layout %>% 
+           as.data.frame() %>%
+           dplyr::rename(UMAP1 = V1, UMAP2=V2) %>%
+           dplyr::mutate(Population = pop, Distance = .x)) %>% 
+  ggplot(aes(UMAP1, UMAP2, color = Population)) + 
+  geom_point(size=1) +
+  theme_bw() +
+  scale_colour_manual(values=colp) +
+  facet_wrap(~Distance, scales = "free")
+
+
+# Run the UMAP
+n_neig %>% 
+  map_df(~umap(as.matrix(df_PCA), n_neighbors = .x,
+               #min_dist = 0.1,
+               n_components = n_dim,
+               random_state = ran_state)$layout %>% 
+           as.data.frame() %>%
+           dplyr::rename(UMAP1 = V1, UMAP2=V2) %>%
+           dplyr::mutate(Population = pop, Neighbor = .x)) %>% 
+  ggplot(aes(UMAP1, UMAP2, color = Population)) + 
+  geom_point(size=1) +
+  theme_bw() +
+  scale_colour_manual(values=colp) +
+  facet_wrap(~Neighbor, scales = "free")
+```
+
+Here we pick `n_neig=32` and  `min_dist=0.1`.  Run UMAP with the specified paramter
+
+
+Here we use the following paramter for UMAP visualisation.
+
+```{r}
+n_neig <- 32
+min_di <- 0.1
+ran_state <- as.integer(999)
+n_dim <- 2
+```
+
+Run the UMAP
+
+```{r}
+embedding <- umap(df_PCA,
+                  n_neighbors=n_neig,
+                  min_dist=min_di,
+                  random_state = ran_state,
+                  n_components = n_dim)
+```
+
+
+Plot the output
+
+
+```{r UMAP2D, fig.cap="2 Dimension UMAP", fig.width=11, fig.height=9}
+df_umap <- as.data.frame(embedding$layout) %>%
+  tibble::rownames_to_column(var="Cell") %>%
+  dplyr::rename(UMAP1 = V1, UMAP2=V2) %>%
+  dplyr::select(Cell, UMAP1:UMAP2) %>%
+  dplyr::mutate(Population = pop,
+                SeqRun = SeqRun,
+                CellCycle = CC,
+                Stage = Stage)
+
+df_umap_2d <- df_umap
+
+p1_2d <- df_umap %>%
+  ggplot(aes(UMAP1, UMAP2, color = Population, shape=Stage)) + 
+  geom_point(size=1) +
+  theme_bw() +
+  scale_colour_manual(values=colp) +
+  scale_shape_manual(values=c(16,17)) +
+  labs(caption = paste0("Parameters:", "n_neig=", n_neig, " min_dist=", min_di))
+
+p2_2d <- df_umap %>%
+  ggplot(aes(UMAP1, UMAP2, color = CellCycle,  shape=Stage)) + 
+  geom_point(size=1) +
+  theme_bw() +
+  scale_colour_brewer(palette = "Pastel1") +
+  scale_shape_manual(values=c(16,17)) +
+  labs(caption = paste0("Parameters:", "n_neig=", n_neig, " min_dist=", min_di))
+
+
+p3_2d <- df_umap %>%
+  ggplot(aes(UMAP1, UMAP2, color = SeqRun,  shape=Stage)) + 
+  geom_point(size=1) +
+  theme_bw() +
+  scale_colour_manual(values = col10) +
+  scale_shape_manual(values=c(16,17)) +
+  labs(caption = paste0("Parameters:", "n_neig=", n_neig, " min_dist=", min_di))
+
+pdf(file.path(outDir_C3, "UMAP_PCA.pdf"), width = 10, height = 8)
+p1_2d + p2_2d + p3_2d + plot_layout(ncol=2, heights = c(3,3))
+dev.off()
+```
+
+We can repeat the UMAP with the same parameter but run it on the HVG. We adjust some of the paramters
+
+```{r}
+eset_hvg <- e_corr[row.names(hvg_sel),]
+df_hvg <- t(eset_hvg)
+
+n_neig <- 16
+min_di <- 0.1
+ran_state <- as.integer(999)
+n_dim <- 2
+
+embedding <- umap(df_hvg,
+                  n_neighbors=n_neig,
+                  min_dist=min_di,
+                  random_state = ran_state,
+                  n_components = n_dim)
+
+df_umap_HVG <- 
+  as.data.frame(embedding$layout) %>%
+    tibble::rownames_to_column(var="Cell") %>%
+    dplyr::rename(UMAP1 = V1, UMAP2=V2) %>%
+    dplyr::select(Cell, UMAP1:UMAP2) %>%
+    dplyr::mutate(Population = pop,
+                  SeqRun = SeqRun,
+                  CellCycle = CC,
+                  Stage = Stage)
+
+RepeatUMAP(df_umap_HVG)
+```
+
+Draw example gene on UMAP
+
+```{r}
+colAV <- paletteer_d(palette = "dichromat::DarkRedtoBlue.12", n = 12)
+colScheme <- c(colAV[12], colAV[6], colAV[1])
+
+# Add UMAP coordinate to seObject
+mat_UMAP <- data.frame(UMAP1 = df_umap_HVG$UMAP1,
+                       UMAP2 = df_umap_HVG$UMAP2,
+                       row.names = df_umap_HVG$Cell)
+mat_UMAP <- as.matrix(mat_UMAP)
+se_UMAP <- sce
+reducedDim(se_UMAP, "UMAP") <- mat_UMAP
+print(ExpUMAP(se_UMAP, "Cdh5"))
+
+save(se_UMAP, file=file.path(outDir_C3, "se_UMAP.Rdata"))
+```
+
+
+Save some genes
+
+```{r}
+pdf(file.path(outDir_C3, "UMAP_exampleGenes.pdf"), 
+    height = 5, width = 6)
+# Venous gene
+print(ExpUMAP(se_UMAP, "Aplnr") +
+          geom_point(size=0.1) +
+          theme(axis.text  = element_blank(),
+                axis.title = element_blank(),
+                axis.ticks  = element_blank(),
+                legend.position = c(0.1, 0.8)))
+# Arteial genes
+print(ExpUMAP(se_UMAP, "Gja4") +
+          geom_point(size=0.1) +
+          theme(axis.text  = element_blank(),
+                axis.title = element_blank(),
+                axis.ticks  = element_blank(),
+                legend.position = c(0.1, 0.8)))
+# HE gene
+print(ExpUMAP(se_UMAP, "Vwf") +
+          geom_point(size=0.1) +
+          theme(axis.text  = element_blank(),
+                axis.title = element_blank(),
+                axis.ticks  = element_blank(),
+                legend.position = c(0.1, 0.8)))
+# EHT gene
+print(ExpUMAP(se_UMAP, "Spi1") +
+          geom_point(size=0.1) +
+          theme(axis.text  = element_blank(),
+                axis.title = element_blank(),
+                axis.ticks  = element_blank(),
+                legend.position = c(0.1, 0.8)))
+# IAHC gene
+print(ExpUMAP(se_UMAP, "Mpo") +
+          geom_point(size=0.1) +
+          theme(axis.text  = element_blank(),
+                axis.title = element_blank(),
+                axis.ticks  = element_blank(),
+                legend.position = c(0.1, 0.8)))
+print(ExpUMAP(se_UMAP, "Gfi1b") +
+          geom_point(size=0.1) +
+          theme(axis.text  = element_blank(),
+                axis.title = element_blank(),
+                axis.ticks  = element_blank(),
+                legend.position = c(0.1, 0.8)))
+dev.off()
+```
+
+
+
+## Find  Endo sub-Population
+
+
+We suspect that our Endothelial population contains further sub-population. We first have a look at some known markers of Arterial and Venous cells. We base our makers from these two publication [@delaPaz:2009gb;@McGarvey:2017fw]. We select some of the genes from these papers. The previous analysis can be found ehre file:///Users/zfadlullah/Dropbox%20(The%20University%20of%20Manchester)/zaki/PhD/sequencing_runs/2017/170210_scNextSeq/R/MarkDown/SingleCellExperiment/E10.5_explore.html. 
+
+
+```{r}
+ar_gn <- c("Gja5", "Bmx", "Vegfc", "Epas1", "Dll4")
+
+#vn_gn <- c("Nrp2", "Nr2f2","Aplnr", "Flt4", "Emcn")
+vn_gn <- c("Nrp2", "Nr2f2","Aplnr")
+
+selGene <- c(ar_gn, vn_gn)
+
+selGene_ar <- selGene
+
+# Make into data frame
+df_av <- data.frame(Gene = selGene,
+                    Type = c(rep("Arterial", length(ar_gn)), 
+                             rep("Venous", length(vn_gn))))
+```
+
+Extract the expression of these genes
+
+```{r}
+# Remove duplicated genes
+seEndo <- se[, se$Population %in% c("AGM_E10.5_Endo_Gfi", "AGM_E11.5_Endo")]
+#seEndo <- se_all[, se_all$Population %in% c("AGM_E10.5_Runx_pos")]
+dd <- rowData(seEndo)$gene_name[duplicated(rowData(seEndo)$gene_name)]
+dd <- duplicated(rowData(seEndo)$gene_name)
+seEndo <- seEndo[!dd, ]
+row.names(seEndo) <- rowData(seEndo)$gene_name
+
+# Extract the normalised expression
+chosen.exprs <- assay(seEndo, "logcounts")[selGene,]
+```
+
+
+We try another way to classify. We rescale the galue of each gene from 0 - 10.  [Example](https://stats.stackexchange.com/questions/25894/changing-the-scale-of-a-variable-to-0-100). 
+
+
+```{r}
+s_exp <- apply(chosen.exprs, 1, rescale, to = c(0, 10))
+s_exp <- as.data.frame(s_exp)
+s_exp$Cell <- row.names(s_exp)
+m_exp <- melt(s_exp)
+
+m_exp <- dplyr::left_join(m_exp, df_av, by=c("variable" = "Gene"))
+```
+
+Generate summary of the score
+
+```{r}
+df_sum <- m_exp %>%
+  dplyr::group_by(Cell, Type) %>%
+  dplyr::summarise(MeanScore = mean(value))
+```
+
+
+Try to plot
+
+```{r}
+d1 <- df_sum %>%
+  dplyr::filter(Type == "Arterial")
+
+d2 <- df_sum %>%
+  dplyr::filter(Type == "Venous")
+
+dall <- data.frame(Cell = d1$Cell,
+                   Ar_val = d1$MeanScore,
+                   Ve_val = d2$MeanScore)
+p_score <- 
+ggplot(dall, aes(x=Ar_val, y=Ve_val)) +
+  geom_point() +
+  #theme_bw() +
+  scale_y_continuous(breaks = c(0,2,4,6,8,10)) +
+  scale_x_continuous(breaks = c(0,2,4,6,8,10))
+```
+
+
+Another way to draw. We get the summary of standard error using this [function](http://www.cookbook-r.com/Graphs/Plotting_means_and_error_bars_(ggplot2)/)
+
+```{r}
+tgc <- summarySE(m_exp, measurevar="value", groupvars=c("Cell", "Type"))
+# Plot arterial
+# Order the cells based on arterial values
+d_a <- dplyr::arrange(dall, desc(Ar_val))
+d_a$Cell <- factor(d_a$Cell, levels = d_a$Cell)
+# Arrange the cells in the summary table by arterial value
+tgc_a <- tgc
+tgc_a$Cell <- factor(tgc_a$Cell, levels = d_a$Cell)
+# Plot the results
+pa <-
+ggplot(tgc_a, aes(x=Cell, y=value, colour=Type)) +
+  #geom_errorbar(aes(ymin=value-se, ymax=value+se), width=.1) +
+  geom_point() +
+  scale_y_continuous(breaks = c(0,2,4,6,8,10)) +
+  theme(axis.text.x= element_blank()) 
+
+# Plot the Venous
+d_v <- dplyr::arrange(dall, desc(Ve_val))
+d_v$Cell <- factor(d_v$Cell, levels = d_v$Cell)
+tgc_v <- tgc
+tgc_v$Cell <- factor(tgc_v$Cell, levels = d_v$Cell)
+pv <-
+ggplot(tgc_v, aes(x=Cell, y=value, colour=Type)) +
+  #geom_errorbar(aes(ymin=value-se, ymax=value+se), width=.1) +
+  geom_point() +
+  scale_y_continuous(breaks = c(0,2,4,6,8,10)) +
+  theme(axis.text.x= element_blank()) 
+```
+
+
+
+We now classify the cells. 
+    - Arterial : >5 arterial value & < 5 venous value
+    - Venous : >5 venous value & < 5 arterual value
+
+```{r}
+dall <- dall %>%
+  dplyr::mutate(Class1 = ifelse(Ar_val >= 5 & Ve_val <= 5, "Ar", "Others"),
+                Class2 = ifelse(Ve_val >= 5 & Ar_val <= 5, "Ve", "Others"),
+                Class = paste(Class1, Class2, sep="_"),
+                Class = gsub("Others_Others", "Others", Class),
+                Class = gsub("Others_Ve", "Ve", Class),
+                Class = gsub("Ar_Others", "Ar", Class))
+table(dall$Class)
+```
+
+
+Replot 
+
+
+```{r}
+col3 <- gg_color_hue(3)
+p_score2 <- 
+ggplot(dall, aes(x=Ar_val, y=Ve_val, colour=Class)) +
+  geom_point() +
+  #theme_bw() +
+  scale_y_continuous(breaks = c(0,2,4,6,8,10)) +
+  scale_x_continuous(breaks = c(0,2,4,6,8,10)) +
+  ylab("Venous score") +
+  xlab("Arterial score") +
+  scale_colour_manual(name = "Assigned class",
+                      labels = c("Arterial", "Not classified", "Venous"),
+                      values = col3) +
+  theme_bw()
+```
+
+
+Save all the plot to disk
+
+```{r ArVeScoring, fig.cap="Arterial Venous scoring", fig.width=10, fig.height=7}
+pdf(file.path(outDir_C3, "ArVe_score.pdf"), width = 10, height = 7)
+pa + pv + p_score + p_score2 + plot_layout(ncol=2, heights = c(3,3))
+dev.off()
+
+pa + pv + p_score + p_score2 + plot_layout(ncol=2, heights = c(3,3))
+```
+
+Now we can add this information to the se Object
+
+```{r}
+# Reorder the cells
+dall_re <- dall
+dall_re$Cell <- as.character(dall_re$Cell)
+dall_re <- dall_re[base::match(colnames(se), dall_re$Cell), ] %>%
+  dplyr::select(Cell, Ar_val, Ve_val, Class)
+
+cD <- as.data.frame(colData(se)) 
+cD <- cD %>%
+  dplyr::mutate(Cell = row.names(cD)) 
+cD <- dplyr::left_join(cD, dall_re) %>%
+  dplyr::mutate(subPop = as.character(Population)) %>%
+  dplyr::mutate(subPop = paste(subPop, Class, sep="_"),
+                subPop = gsub("_NA", "", subPop))
+
+# Replace NA
+cD$subPop[is.na(cD$subPop)] <- as.character(cD$Population)[is.na(cD$subPop)]
+
+
+se$subPop <- cD$subPop
+se$Ar_val <- cD$Ar_val
+se$Ve_val <- cD$Ve_val
+se$Class <- cD$Class
+table(se$Class)
+```
+
+Need to refactor the subPopulation
+
+```{r}
+pop <- se$subPop
+
+pop <- dplyr::recode_factor(pop, 
+                            # E10.5
+                            `AGM_E10.5_Endo_Gfi_Ve` = "AGM_E10.5_Endo_Ve",
+                            `AGM_E10.5_Endo_Gfi_Others` = "AGM_E10.5_Endo_Others",
+                            `AGM_E10.5_Endo_Gfi_Ar` = "AGM_E10.5_Endo_Ar",
+                            `AGM_E10.5_HE` = "AGM_E10.5_HE",
+                            `AGM_E10.5_EHT` = "AGM_E10.5_EHT",
+                            `AGM_E10.5_IAHC` = "AGM_E10.5_IAHC",
+                            
+                            # E11.5
+                            `AGM_E11.5_Endo_Ve` = "AGM_E11.5_Endo_Ve",
+                            `AGM_E11.5_Endo_Others` = "AGM_E11.5_Endo_Others",
+                            `AGM_E11.5_Endo_Ar` = "AGM_E11.5_Endo_Ar",
+                            `AGM_E11.5_HE` = "AGM_E11.5_HE",
+                            `AGM_E11.5_EHT` = "AGM_E11.5_EHT",
+                            `AGM_E11.5_IAHC` = "AGM_E11.5_IAHC",
+                            
+                            .ordered = TRUE)
+                            #`AGM_E11.5_IAHC` = "AGM_E11.5_IAHC")
+
+
+se$subPop <- pop
+```
+
+
+Now we check how many cells are in each Population
+
+```{r AvTable}
+kable(table(pop), caption = "Number of cells in each population") %>%
+  kable_styling("striped", full_width = F) %>%
+  scroll_box(width = "100%", height = "100%")
+```
+
+
+We can view the aretrial and venous cell in terms of thier representation on UMAP
+
+```{r UMAPArVe, fig.cap="Visualisation of arterial or venous score", fig.width=14, fig.height=7, eval=FALSE}
+cD_sub <- cD %>%
+  dplyr::select(Cell, Ar_val, Ve_val, subPop, Class) %>%
+  # Get the difference between arterial and venous value
+  dplyr::mutate(AvDiff = log(cD$Ar_val) - log(cD$Ve_val))
+# For the cells which were not assigned a class (arterial or venos class, we label them NonEndo)
+cD_sub$Class[is.na(cD_sub$Class)] <- "NonEndo"
+
+# Finally combine the data with the UMAP coordinates
+df_umap_HVG <- df_umap_HVG %>%
+  dplyr::left_join(cD_sub)
+
+
+# We plot he UMAP of the Aretrial and endo classification
+p5 <-
+  ggplot(df_umap_HVG, aes(UMAP1, UMAP2, color = Class, size=Class)) + 
+  geom_point() +
+  theme_bw() +
+    scale_colour_manual(name = "Assigned class",
+                      labels = c("Arterial", "Non Endo", "Not classified", "Venous"),
+                      values = c(col3[1], "grey70", col3[2:3])) +
+    scale_size_manual(values=c(1.5, 0.5, 1.5, 1.5),
+                    guide=FALSE)
+
+
+# Now we colour based on Arterial or Venous score
+colAV <- paletteer_d(palette = "dichromat::DarkRedtoBlue.12", n = 12)  
+colV <- colorRampPalette(c(colAV[6], colAV[1]))(nrow(cD))
+
+
+p6 <-
+  ggplot(df_umap_HVG, aes(UMAP1, UMAP2, color = Ve_val, size=Class)) + 
+  geom_point(aes(fill = Ve_val),alpha=1, shape=21, colour="black") +
+  theme_bw() +
+  #scale_fill_gradient2(low=colAV[6], mid=colAV[3], high=colAV[1], na.value = "white") +
+  scale_fill_gradientn(colours=c(colAV[1], colAV[3], colAV[6]), na.value = "white",
+                       values=c(1, .5, 0)) +
+  scale_size_manual(values=c(1.5, 0.5, 1.5, 1.5),
+                    guide=FALSE)
+
+
+p7 <-
+  ggplot(df_umap_HVG, aes(UMAP1, UMAP2, color = Ar_val, size=Class)) +
+  geom_point(aes(fill = Ar_val),alpha=1, shape=21, colour="black") +
+  theme_bw() +
+  #scale_fill_gradient2(low=colAV[7], mid=colAV[9], high=colAV[12], na.value = "white") 
+  scale_fill_gradientn(colours=c(colAV[12], colAV[9], colAV[7]), na.value = "white",
+                       values=c(1, .5, 0)) +
+  scale_size_manual(values=c(1.5, 0.5, 1.5, 1.5),
+                    guide=FALSE)
+
+pdf(file.path(outDir_C3, "UMAP_Ar_Ve.pdf"), width = 12, height = 8)
+p_score2 + p5 + p6 + p7 + plot_layout(ncol=2, heights = c(3,3))
+dev.off()
+
+p_score2 + p5 + p6 + p7  + plot_layout(ncol=2, heights = c(3,3))
+```
+
+
+## Independent clustering 
+
+### HVG
+
+Now we try to cluster based on HVG and dynamic Tree cut. We use the HVG to perfrom the clustering
+ 
+```{r,eval=TRUE}
+chosen <- row.names(hvg_sel[1:500,])
+chosen.exprs <- assay(se, "norm_exprs")[chosen,]
+my.dist <- dist(t(chosen.exprs))
+my.tree <- hclust(my.dist, method="ward.D2")
+my.dend <- as.dendrogram(my.tree)
+my.clusters <- unname(cutreeDynamic(my.tree, distM=as.matrix(my.dist), verbose=0, minClusterSize=40))
+my.clusters <- paste0("k_", my.clusters)
+unique(my.clusters)
+hvg_E11.5 <- chosen
+```
+ 
+Generate table and percentage of cells
+
+```{r,eval=TRUE}
+cluster_tab <- data.frame(Population = se$Population, 
+                          treeCut = my.clusters, Cell=colnames(se))
+cluster_tab$treeCut <- my.clusters
+tab <- xtabs(~ Population + treeCut,  cluster_tab)
+# Function to calculate the percentage of cell per cluster
+kCut <- ClusterPerc(tab)
+kable(kCut, caption = "Percentage of cells with Dynamic Tree Cut in each population") %>%
+  kable_styling("striped", full_width = F) %>%
+  scroll_box(width = "100%", height = "100%")
+
+kCut2 <- ClusterPerc2(tab)
+kable(kCut2, caption = "Percentage of cells with Dynamic Tree Cut in each cluster") %>%
+  kable_styling("striped", full_width = F) %>%
+  scroll_box(width = "100%", height = "100%")
+```
+
+
+We want to reformat the clustering a bit. We want the cluster to be as follows ;   
+
+  * C1 : Endo
+  * C2 : Endo Ar + E11.5 HE
+  * C3 : E10.5 HE + 11.5 HE 
+  * C4 : E10.5 HE only
+  * C5 : EHT
+  * C6 : IAHC
+
+
+
+```{r,eval=TRUE}
+tab_re <- as.data.frame(tab) %>%
+  dplyr::mutate(Type = gsub(".*E10.5_", "", Population),
+                Type = gsub(".*E11.5_", "", Type))
+# Only for the HE we want to retain the day
+tab_day <- gsub("AGM_", "", tab_re$Population)
+tab_day <- gsub("\\.5.*", "", tab_day)
+tab_re$Type[tab_re$Type == "HE"] <- 
+  paste(
+    tab_day[tab_re$Type == "HE"], 
+    tab_re$Type[tab_re$Type == "HE"], 
+    sep="_")
+
+tab_re <- tab_re %>%
+  dplyr::group_by(treeCut, Type) 
+
+tab_sum <- tab_re %>%
+  dplyr::summarise(CellNum = sum(Freq))
+
+dplyr::arrange(tab_sum, desc(CellNum)) %>% head(n=7)
+```
+
+
+So Cluster with highest number of Endo is k_1 (give it the minimum label:C1), and cluster with highest number of IAHC k_4 (give it the maximum label:C6)
+
+
+We rename them manually for now. 
+
+```{r,eval=TRUE}
+my.clusters <- 
+  dplyr::recode(my.clusters, 
+                k_1 = "C_1",
+                k_2 = "C_5",
+                k_3 = "C_3",
+                k_4 = "C_6",
+                k_5 = "C_2",
+                k_6 = "C_4")
+```
+
+
+Generate table after re-factoring the cluster
+
+```{r TreeCutTable, eval=TRUE}
+cluster_tab$treeCut <- my.clusters
+tab <- xtabs(~ Population + treeCut,  cluster_tab)
+kCut <- ClusterPerc2(tab)
+kable(kCut, caption = "Percentage of cells with Dynamic Tree Cut after refactor") %>%
+  kable_styling("striped", full_width = F) %>%
+  scroll_box(width = "100%", height = "100%")
+```
+
+
+Add the cluster to the seObject
+
+```{r,eval=TRUE}
+se$treeCut <- my.clusters
+```
+
+
+
+
+
+
+We compare and visualise the unsupervised clustering to the FACS sorted popualtion 
+
+```{r}
+df_cluster <- data.frame(
+  Cell = colnames(se),
+  Clusters = se$treeCut,
+  FACS = se$Population)
+```
+
+Draw a sankey diagram using `alluvial` package to visualise the cluster change
+
+```{r}
+# https://github.com/mbojan/alluvial
+df2 <- df_cluster %>%
+  group_by(Clusters, FACS) %>%
+  dplyr::summarize(counts = n()) %>%
+  ungroup() %>%
+  dplyr::arrange(desc(counts))
+
+
+# Vectors for colour
+col_allu <- colp[df2$FACS]
+
+
+simplePop <- recode_factor(df2$FACS,
+                           AGM_E10.5_Endo_Gfi = "E10.5: CDH5+",
+                           AGM_E11.5_Endo = "E11.5: CDH5+",
+                           
+                           AGM_E10.5_HE = "E10.5: CDH5+/GFI1+",
+                           AGM_E11.5_HE = "E11.5: CDH5+/GFI1+",
+                           
+                           AGM_E10.5_EHT = "E10.5: GFI1+/GFI1B-",
+                           AGM_E11.5_EHT = "E11.5: GFI1+/GFI1B-",                   
+                           
+                           AGM_E10.5_IAHC = "E10.5: GFI1+/GFI1B+",
+                           
+                           .ordered = TRUE)
+df2$FACS <- simplePop
+
+
+alluvial(
+  dplyr::select(df2, FACS, Clusters),
+  freq=df2$counts,
+  col = col_allu,
+  border="grey80",
+  alpha = 0.8,
+  blocks=TRUE
+) 
+
+
+pdf(file.path(outDir_C3, "Alluvial_FACS_Cluster.pdf"), width = 7, height = 5)
+alluvial(
+  dplyr::select(df2, FACS, Clusters),
+  freq=df2$counts,
+  col = col_allu,
+  border="grey80",
+  alpha = 0.8,
+  blocks=TRUE,
+  cex=0.5
+) 
+dev.off()
+```
+
+
+
+
+
+Draw the dendogram of the clustering and colour code based on the clusters.
+
+```{r}
+my.dend <- as.dendrogram(my.tree)
+#col8 <- paletteer_d(package = "ggsci", palette = "category10_d3", n = 8)
+# Readjust the colour
+#col8_re <- c(col8[1], col8[4], "#BC9129", col8[2], col8[6], col8[3])
+col8_re <- c("#003f5c","#737AB6","#955196","#dd5182","#ff6e54","#ffa600")
+
+# Taken from https://stackoverflow.com/questions/18802519/label-and-color-leaf-dendrogram#18803134
+
+
+
+# Re-ordering based on dynamic tree cut clusters
+# https://cran.r-project.org/web/packages/dendextend/vignettes/introduction.html#dynamictreecut
+clusters <- as.numeric(gsub("C_", "", my.clusters))
+clusters <- clusters[order.dendrogram(my.dend)]
+n_clusters <- max(clusters)
+
+# Setting up colours for the FACS population
+cFACS <- colp[se$Population]
+cFACS <- colp[se$Population[order.dendrogram(my.dend)]]
+
+# Reorder the colour of the clusters abit
+col8_reClus <- col8_re[unique(clusters)]
+dend2 <- my.dend %>% 
+         branches_attr_by_clusters(clusters, values = col8_reClus) %>%  # Colour branch based on dynamic tree colour
+         color_labels(col = cFACS) # Colour labels based on FACS population
+plot(dend2)
+# Adding colour bar for the FACS sorted population
+colored_bars(cFACS, dend2, sort_by_labels_order = FALSE, y_shift=10)
+
+
+# Setting the desired order as we want cluster 1 to be the most left
+df_orDend <- cluster_tab %>%
+  dplyr::arrange(treeCut) 
+dend3 <- dend2 %>% dendextend::rotate(as.character(df_orDend$Cell))
+# We get the labels of the dendogram so we can order the colours
+dend3_df <- data.frame(Cell = labels(dend3),
+                       Order = 1:length(labels(dend3)))
+# Now we get the FACS sorted populaton and merge them with the above df
+FACS_df <- data.frame(Cell = colnames(se),
+                      Population = se$Population) %>%
+  dplyr::right_join(dend3_df) %>%
+  dplyr::arrange(Order)
+# Now we reorder the colours
+cFACS_re <- colp[FACS_df$Population]
+
+# Finally plot the dendogram
+plot(dend3)
+colored_bars(cFACS_re, dend3, sort_by_labels_order = FALSE, y_shift=10) 
+
+# Save to PDF
+pdf(file.path(outDir_C3, "Dendogram_coloured.pdf"), height = 3, width = 9)
+plot(dend3)
+colored_bars(cFACS_re, dend3, sort_by_labels_order = FALSE, y_shift=10)
+dev.off()
+```
+
+
+
+For each of the cluster, we would like to generate a bar graph of the different population
+
+```{r}
+tab <- xtabs(~ Population + treeCut,  cluster_tab)
+# Get the percentage
+tab_perc <- round( t(t(tab) / colSums(tab) * 100))
+df_tab <- as.data.frame(tab_perc) %>%
+  dplyr::mutate(treeCut = gsub("C_", "Cluster ", treeCut))
+# Get the number of cells
+t_num<- as.vector(tab)
+t_num <- gsub("0", "", t_num)
+#t_num <- paste0("n=", t_num)
+#t_num <- gsub("n=0", "", t_num)
+
+# Each cluster plot seperately
+iUnique <- unique(df_tab$treeCut)
+pdf(file.path(outDir_C3, "ClusterPercentageEach.pdf"), height = 2, width = 2.5)
+for (i in seq_along(iUnique)){
+  df_tmp <- dplyr::filter(df_tab, treeCut == iUnique[i])
+
+
+# Get the number of cells
+t_num2 <- as.vector(tab[,i])
+t_num2 <- gsub("0", "", t_num2)
+t_num2 <- paste0("n=", t_num2)
+
+  
+  
+# Get the percentage of cells
+t_per <- as.vector(df_tmp$Freq)
+t_per <- paste0(t_per, "%")
+  
+  
+  
+  p_tmp <- 
+    ggplot(df_tmp, aes(x=Population, y=Freq, fill=Population)) +
+    geom_bar(stat="identity") +
+    facet_grid(~treeCut) +
+    #geom_text(aes(label=t_num), 
+    #          position=position_dodge(width=0.9), 
+    #          vjust=-0.25,
+    #          size=2, colour="grey50") +
+    scale_fill_manual(values=colp) +
+    ylab("Percentage of cell") +
+    theme_classic() +
+    theme(axis.text.x = element_blank(),
+          axis.title.x = element_blank(),
+          panel.grid.major = element_line(linetype = "blank"),
+          panel.grid.minor = element_line(linetype = "blank"),
+          strip.background = element_rect(fill=col8_re[i]),
+          strip.text.x = element_text(colour="white"),
+          legend.position="none") +
+    geom_text(aes(label=t_per), 
+            position=position_dodge(width=0.9), 
+            vjust=-0.25,
+            size=2, colour="grey50") +
+    geom_text(aes(label=t_num2), 
+            position=position_dodge(width=0.9), 
+            vjust=-2,
+            size=2, colour="grey50") +
+    scale_y_continuous(limits = c(0,80)) +
+
+  NULL
+  print(p_tmp)
+}
+dev.off()
+
+# If one plot 
+p_bar <- 
+ggplot(df_tab, aes(x=Population, y=Freq, fill=Population)) +
+  geom_bar(stat="identity") +
+  facet_grid(~treeCut) +
+  geom_text(aes(label=t_num), 
+            position=position_dodge(width=0.9), 
+            vjust=-0.25,
+            size=2, colour="grey50") +
+  scale_fill_manual(values=colp) +
+  ylab("Percentage of cell") +
+  theme_bw() +
+  theme(axis.text.x = element_blank(),
+        panel.grid.major = element_line(linetype = "blank"),
+        panel.grid.minor = element_line(linetype = "blank"),
+        legend.position = "bottom") +
+  NULL
+
+pdf(file.path(outDir_C3, "ClusterPercentage.pdf"), 
+    height = 3, width = 16)
+p_bar
+dev.off()
+```
+
+For each of the FACS population, we would like to generate a bar graph of the percentage in each cluster
+
+```{r}
+cluster_tab2 <- data.frame(Population = se$subPop, 
+                          treeCut = my.clusters, Cell=colnames(se))
+cluster_tab2 <- cluster_tab2 %>%
+  dplyr::filter(!Population %in% c(
+    "AGM_E10.5_Endo_Others", "AGM_E11.5_Endo_Others"))
+# Merge the endo cells
+cluster_tab2$Population <- 
+  gsub("AGM_E10.5_Endo_Ve", "Endo_Ve", cluster_tab2$Population)
+cluster_tab2$Population <- 
+  gsub("AGM_E11.5_Endo_Ve", "Endo_Ve", cluster_tab2$Population)
+cluster_tab2$Population <- 
+  gsub("AGM_E10.5_Endo_Ar", "Endo_Ar", cluster_tab2$Population)
+cluster_tab2$Population <- 
+  gsub("AGM_E11.5_Endo_Ar", "Endo_Ar", cluster_tab2$Population)
+
+```
+
+Set new colour scheme
+
+```{r}
+ann_list <- list(Population = 
+                   c(#"AGM_E10.5_Endo_Ve" = "#729ECE",
+                     "Endo_Ve" = "#96CDCD",
+                     #"AGM_E10.5_Endo_Others" = "grey50",
+                     #"AGM_E10.5_Endo_Ar" = "#00D5FF",
+                     "Endo_Ar" = "royalblue1",
+                     "AGM_E10.5_HE" = "#fe9929",
+                     "AGM_E10.5_EHT" = "#A8786E",
+                     "AGM_E10.5_IAHC" = "#67BF5C",
+                     
+                     #"AGM_E11.5_Endo_Ve" = "paleturquoise1",
+                     #"AGM_E11.5_Endo_Others" = "grey50",
+                     #"AGM_E11.5_Endo_Ar" = "#00D5FF",
+                     #"AGM_E11.5_Endo_Ar" = "royalblue1",
+                     "AGM_E11.5_HE" = "#D62728",
+                     "AGM_E11.5_EHT" = "#848484",
+                     "AGM_E11.5_IAHC" = "#7EF771"))
+subCol <- as.character(ann_list$Population)
+```
+
+
+```{r}
+tab <- xtabs(~ Population + treeCut,  cluster_tab2)
+#tab <- tab[-2,]
+#tab <- tab[-7,]
+# Get the percentage
+tab_perc <- round( tab / rowSums(tab) * 100)
+df_tab <- as.data.frame(tab_perc) %>%
+  dplyr::mutate(treeCut = gsub("C_", "Cluster ", treeCut))
+df_tab$Population <- factor(df_tab$Population,
+                            levels = 
+                              c("Endo_Ve", "Endo_Ar",
+                                "AGM_E10.5_HE", "AGM_E10.5_EHT",
+                                "AGM_E10.5_IAHC",
+                                "AGM_E11.5_HE", "AGM_E11.5_EHT",
+                                "AGM_E11.5_IAHC"))
+#df_tab <- df_tab %>%
+#  dplyr::filter(!Population %in% c(
+#    "AGM_E10.5_Endo_Others", "AGM_E11.5_Endo_Others"))
+# Get the number of cells
+t_num <- as.character(tab_perc)
+t_num <- paste0(t_num, "%")
+t_num <- gsub("^0%$", "", t_num)
+#t_num <- paste0("n=", t_num)
+#t_num <- gsub("n=0", "", t_num)
+```
+
+Plot each cluster seperately
+
+```{r,eval=FALSE}
+# Each cluster plot seperately
+iUnique <- unique(df_tab$treeCut)
+pdf(file.path(outDir_C3, "ClusterPercentageEach_population.pdf"), height = 2, width = 2.5)
+for (i in seq_along(iUnique)){
+  df_tmp <- dplyr::filter(df_tab, treeCut == iUnique[i])
+  p_tmp <- 
+    ggplot(df_tmp, aes(x=Population, y=Freq, fill=Population)) +
+    geom_bar(stat="identity") +
+    facet_grid(~treeCut) +
+    #geom_text(aes(label=t_num), 
+    #          position=position_dodge(width=0.9), 
+    #          vjust=-0.25,
+    #          size=2, colour="grey50") +
+    scale_fill_manual(values=colp) +
+    ylab("Percentage of cell") +
+    theme_classic() +
+    theme(axis.text.x = element_blank(),
+          axis.title.x = element_blank(),
+          panel.grid.major = element_line(linetype = "blank"),
+          panel.grid.minor = element_line(linetype = "blank"),
+          strip.background = element_rect(fill=col8_re[i]),
+          strip.text.x = element_text(colour="white"),
+          legend.position="none") +
+  NULL
+  print(p_tmp)
+}
+dev.off()
+```
+
+Repeat the above in one plot
+
+```{r}
+# If one plot 
+p_bar <- 
+ggplot(df_tab, aes(x=Population, y=Freq, fill=Population)) +
+  geom_bar(stat="identity") +
+  scale_y_continuous(breaks = c(0,20,40,60,80,100),
+                     limits = c(0,140)) +
+  facet_grid(~treeCut) +
+    geom_rect(aes(
+      xmin = 0.5,
+      xmax = 2.5,
+      ymin = 0,
+      ymax = Inf),
+      alpha=0.01, fill="#7a5d7e") +
+      geom_rect(aes(
+      xmin = 5.5,
+      xmax = 8.5,
+      ymin = 0,
+      ymax = Inf),
+      alpha=0.01, fill="#7a5d7e") +
+  #geom_vline(xintercept = c(2.5,5.5), colour="grey50",alpha=0.5) +
+  geom_text(aes(label=t_num), 
+            position=position_dodge(width=0.9), 
+            vjust=-0.25,
+            size=2, colour="grey50") +
+  scale_fill_manual(values=subCol) +
+  ylab("Percentage of cell") +
+  theme_bw() +
+  theme(axis.text.x = element_blank(),
+        panel.grid.major = element_line(linetype = "blank"),
+        panel.grid.minor = element_line(linetype = "blank"),
+        legend.position = "bottom") +
+  NULL
+
+pdf(file.path(outDir_C3, "ClusterPercentage_population.pdf"), 
+    height = 4, width = 18)
+p_bar
+dev.off()
+```
+
+If we use the main population. Figure for thesis. For each of the FACS population, we would like to generate a bar graph of the percentage in each cluster
+
+```{r}
+cluster_tab2 <- data.frame(Population = se$Population, 
+                          treeCut = my.clusters, Cell=colnames(se))
+
+```
+
+Set new colour scheme
+
+```{r}
+ann_list <- list(Population = 
+                   c(#"AGM_E10.5_Endo_Ve" = "#729ECE",
+                     "AGM_E10.5_Endo_Gfi" = "#729ECE",
+                     #"AGM_E10.5_Endo_Others" = "grey50",
+                     #"AGM_E10.5_Endo_Ar" = "#00D5FF",
+                     
+                     "AGM_E10.5_HE" = "#fe9929",
+                     "AGM_E10.5_EHT" = "#A8786E",
+                     "AGM_E10.5_IAHC" = "#67BF5C",
+                     
+                     #"AGM_E11.5_Endo_Ve" = "paleturquoise1",
+                     #"AGM_E11.5_Endo_Others" = "grey50",
+                     #"AGM_E11.5_Endo_Ar" = "#00D5FF",
+                     #"AGM_E11.5_Endo_Ar" = "royalblue1",
+                     "AGM_E11.5_Endo" = "#00D5FF",
+                     "AGM_E11.5_HE" = "#D62728",
+                     "AGM_E11.5_EHT" = "#848484",
+                     "AGM_E11.5_IAHC" = "#7EF771"))
+subCol <- as.character(ann_list$Population)
+```
+
+
+```{r}
+tab <- xtabs(~ Population + treeCut,  cluster_tab2)
+#tab <- tab[-2,]
+#tab <- tab[-7,]
+# Get the percentage
+tab_perc <- round( tab / rowSums(tab) * 100)
+df_tab <- as.data.frame(tab_perc) %>%
+  dplyr::mutate(treeCut = gsub("C_", "Cluster ", treeCut))
+df_tab$Population <- factor(df_tab$Population,
+                            levels = 
+                              c("AGM_E10.5_Endo_Gfi",
+                                "AGM_E10.5_HE", "AGM_E10.5_EHT",
+                                "AGM_E10.5_IAHC",
+                                "AGM_E11.5_Endo",
+                                "AGM_E11.5_HE", "AGM_E11.5_EHT",
+                                "AGM_E11.5_IAHC"))
+#df_tab <- df_tab %>%
+#  dplyr::filter(!Population %in% c(
+#    "AGM_E10.5_Endo_Others", "AGM_E11.5_Endo_Others"))
+# Get the number of cells
+t_num <- as.character(tab_perc)
+t_num <- paste0(t_num, "%")
+t_num <- gsub("^0%$", "", t_num)
+#t_num <- paste0("n=", t_num)
+#t_num <- gsub("n=0", "", t_num)
+# Plot
+p_bar <- 
+ggplot(df_tab, aes(x=Population, y=Freq, fill=Population)) +
+  geom_bar(stat="identity") +
+  scale_y_continuous(breaks = c(0,20,40,60,80,100),
+                     limits = c(0,140)) +
+  facet_grid(~treeCut) +
+    geom_rect(aes(
+      xmin = 0.5,
+      xmax = 4.5,
+      ymin = 0,
+      ymax = Inf),
+      alpha=0.01, fill="#7a5d7e") +
+      geom_rect(aes(
+      xmin = 4.5,
+      xmax = 8.5,
+      ymin = 0,
+      ymax = Inf),
+      alpha=0.02, fill="#7a5d7e") +
+  #geom_vline(xintercept = c(2.5,5.5), colour="grey50",alpha=0.5) +
+  geom_text(aes(label=t_num), 
+            position=position_dodge(width=0.9), 
+            vjust=-0.25,
+            size=2, colour="grey50") +
+  scale_fill_manual(values=subCol) +
+  ylab("Percentage of cell") +
+  theme_bw() +
+  theme(axis.text.x = element_blank(),
+        panel.grid.major = element_line(linetype = "blank"),
+        panel.grid.minor = element_line(linetype = "blank"),
+        legend.position = "bottom") +
+  NULL
+
+pdf(file.path(outDir_C3, "ClusterPercentage_MainPopulation.pdf"), 
+    height = 6, width = 10)
+p_bar
+dev.off()
+```
+
+
+Check the percentage of E10.5 and E11.5 in each cluster
+
+```{r}
+cluster_tab2 <- data.frame(Stage = se$Population, 
+                          treeCut = my.clusters, Cell=colnames(se)) %>%
+  dplyr::mutate(Stage = gsub(".*_E10.5_.*", "E10.5", Stage),
+                Stage = gsub(".*_E11.5_.*", "E11.5", Stage))
+
+tab <- xtabs(~ Stage + treeCut,  cluster_tab2)
+tab_perc <- round( t(t(tab) / colSums(tab) * 100))
+```
+
+
+
+A way to name each FACS sorted population
+
+```{r, eval=FALSE}
+p_label <- 
+ggplot(df_tab, aes(x=Population, y=Freq, fill=Population)) +
+  geom_bar(stat="identity") +
+  facet_grid(~treeCut) +
+  scale_fill_manual(values=colp,
+                    name = "FACS population",
+                    labels=c(
+expression("E10.5: "[EC]*" (CDH5"^+{}*"/GFI1"^-{}*"/GFI1B"^-{}*"/cKIT"^-{}*"/CD41"^-{}*"/CD45"^-{}*")"),
+expression("E10.5: "[HE]*" (CDH5"^+{}*"/GFI1"^+{}*"/GFI1B"^-{}*"/cKIT"^-{}*"/CD41"^-{}*"/CD45"^-{}*")"),
+expression("E10.5: "[EHT]*" (CDH5"^+{}*"/GFI1"^+{}*"/GFI1B"^-{}*"/cKIT"^+{}*"/CD41"^-{}*"/CD45"^-{}*")"),
+expression("E10.5: "[IAHC]*" (CDH5"^+{}*"/GFI1"^+{}*"/GFI1B"^+{}*"/cKIT"^+{}*"/CD41"^-{}*"/CD45"^-{}*")"),
+# E11.5
+expression("E11.5: "[EC]*" (CDH5"^+{}*"/GFI1"^-{}*"/GFI1B"^-{}*"/cKIT"^-{}*"/CD41"^-{}*"/CD45"^-{}*")"),
+expression("E11.5: "[HE]*" (CDH5"^+{}*"/GFI1"^+{}*"/GFI1B"^-{}*"/cKIT"^-{}*"/CD41"^-{}*"/CD45"^-{}*")"),
+expression("E11.5: "[EHT]*" (CDH5"^+{}*"/GFI1"^+{}*"/GFI1B"^-{}*"/cKIT"^+{}*"/CD41"^-{}*"/CD45"^-{}*")")
+                             )) +
+  ylab("Percentage of cell") +
+  theme_bw() +
+  theme(axis.text.x = element_blank(),
+        panel.grid.major = element_line(linetype = "blank"),
+        panel.grid.minor = element_line(linetype = "blank"),
+        legend.position = "left") +
+  NULL
+
+pdf(file.path(outDir_C3, "ClusterPercentageNamed.pdf"), height = 10, width = 16) 
+p_label
+dev.off()
+```
+
+And naming the clusters
+
+```{r, eval=FALSE}
+p_labelClus <- 
+ggplot(df_tab, aes(x=treeCut, y=Freq, fill=treeCut)) +
+  geom_bar(stat="identity") +
+  facet_grid(~Population) +
+  scale_fill_manual(values=col8_re,
+                    name = "Assigned cluster") +
+  ylab("Percentage of cell") +
+  theme_bw() +
+  theme(axis.text.x = element_blank(),
+        panel.grid.major = element_line(linetype = "blank"),
+        panel.grid.minor = element_line(linetype = "blank"),
+        legend.position = "left") +
+  NULL
+
+pdf(file.path(outDir_C3, "ClusterPercentageNamed_cluster.pdf"), height = 8, width = 16)
+p_labelClus
+dev.off()
+```
+
+
+
+We plot the cluster on the UMAP plot
+
+Plot the resuts
+
+```{r UMAPcutTree, fig.cap="Clustering with DynamicTreeCut", fig.width=14, fig.height=7, eval=FALSE}
+cluster_tab_sub <- dplyr::select(cluster_tab, Cell, treeCut)
+
+df_umap_HVG <- df_umap_HVG %>%
+  dplyr::left_join(cluster_tab_sub)
+
+p_tree <- 
+  ggplot(df_umap_HVG, aes(UMAP1, UMAP2, color = treeCut)) + 
+  geom_point(size=2.5, shape=17) +
+  theme_bw() +
+  theme(legend.position = "none",
+        panel.grid.major = element_line(linetype = "blank"), 
+        panel.grid.minor = element_line(linetype = "blank")) +
+  scale_colour_manual(values = col8_re) +
+  labs(caption = paste0("Parameters:", "n_neig=", n_neig, " min_dist=", min_di))
+
+# We also make the population plot nicer
+p_pop <- 
+  ggplot(df_umap_HVG, aes(UMAP1, UMAP2, 
+                          #shape = Population,
+                          color = Population)) + 
+  geom_point(size=5) +
+  theme_bw() +
+  theme(legend.position = "none",
+        panel.grid.major = element_line(linetype = "blank"), 
+        panel.grid.minor = element_line(linetype = "blank")) +
+  scale_colour_manual(name = "Population",
+                      #labels = c("E10.5_Endo", "E10.5_HE", "E10.5_EHT", "E10.5_IAHC",
+                      #           "E11.5_Endo", "E11.5_HE", "E11.5_EHT"),
+                      values=colp) +
+                      #values=c(colp[1:4], colp[1:3])) +
+  scale_shape_manual(name = "Population") +
+                      #labels = c("E10.5_Endo", "E10.5_HE", "E10.5_EHT", "E10.5_IAHC",
+                      #           "E11.5_Endo", "E11.5_HE", "E11.5_EHT"),
+                      #values=c(19,19,19,19,
+                      #         17,17,17)) +
+  labs(caption = paste0("Parameters:", "n_neig=", n_neig, " min_dist=", min_di))
+
+
+# Colour by sequecning run
+p_run <- 
+  ggplot(df_umap_HVG, aes(UMAP1, UMAP2, 
+                          color = SeqRun)) + 
+  geom_point(size=2) +
+  theme_bw() +
+  theme(panel.grid.major = element_line(linetype = "blank"), 
+        panel.grid.minor = element_line(linetype = "blank"))
+
+
+pdf(file.path(outDir_C3, "UMAP_treeCut.pdf"), width = 12, height = 5)
+p_tree + p_pop + plot_layout(ncol=2, heights = c(3))
+dev.off()
+
+p_pop + p_pop + p_run + plot_layout(ncol=2, heights = c(3,3))
+```
+
+
+## Drawing heatmap of common genes
+
+We want to visualise some comon genes in terms of heatmap representation. We use a set of known genes. Read the gene list into R.
+
+```{r}
+gene_df <- readxl::read_excel(file.path(dataDir, "Others/Genes_edit.xlsx"))
+gene_df <- as.data.frame(gene_df)
+gene_x <- gene_df
+gene_x$Gene <- gene_x$Gene
+# Make the first letter of the gene capital
+row.names(gene_x) <- mapply(simpleCap, gene_x$Gene)
+gene_x <- dplyr::select(gene_x, Class)
+```
+
+Some processing to draw heatmap
+
+```{r}
+colGene <- paletteer_d(palette = "ggthemes::wsj_dem_rep", n = 2)
+
+# Remove Endo others
+se_g <- se[,!se$subPop %in% c("AGM_E10.5_Endo_Others", "AGM_E11.5_Endo_Others")]
+
+# Extract gene expression
+EXP <-  assay(se_g, "logcounts")
+selGene <- row.names(EXP)[row.names(EXP) %in% row.names(gene_x)]
+EXP <- EXP[selGene,]
+
+
+# Annotations for heatmap
+# Colour for heatmap
+mycolor2 <- as.vector(paletteer_c(palette = "viridis::cividis", n = 255))
+# Columns (Population colour)
+ann_col <- data.frame(Cell = colnames(se),
+                      Cluster = se$treeCut,
+                      Stage = se$eStage,
+                      Population = se$subPop,
+                      CellCycle = se$cell_cycle)
+
+ann_col$CellCycle <- gsub("S", "G2M", ann_col$CellCycle)
+ann_col$CellCycle <- gsub("G2M", "G2M/S", ann_col$CellCycle)
+
+row.names(ann_col) <- ann_col$Cell
+ann_col <- dplyr::select(ann_col, Cluster, Stage, Population)
+
+ann_list <- list(Cluster = 
+                   c("C_1" = col8_re[1],
+                     "C_2" = col8_re[2],
+                     "C_3" = col8_re[3],
+                     "C_4" = col8_re[4],
+                     "C_5" = col8_re[5],
+                     "C_6" = col8_re[6]),
+                 CellCycle =
+                   c("G1" = "red3",
+                     "G2M/S" = "green3"),
+                 Population = 
+                   c(#"AGM_E10.5_Endo_Ve" = "#729ECE",
+                     "AGM_E10.5_Endo_Ve" = "paleturquoise1",
+                     "AGM_E10.5_Endo_Others" = "grey50",
+                     #"AGM_E10.5_Endo_Ar" = "#00D5FF",
+                     "AGM_E10.5_Endo_Ar" = "royalblue1",
+                     "AGM_E10.5_HE" = "#fe9929",
+                     "AGM_E10.5_EHT" = "#A8786E",
+                     "AGM_E10.5_IAHC" = "#67BF5C",
+                     
+                     "AGM_E11.5_Endo_Ve" = "#729ECE",
+                     "AGM_E11.5_Endo_Others" = "grey50",
+                     "AGM_E11.5_Endo_Ar" = "#00D5FF",
+                     "AGM_E11.5_HE" = "#FFC600",
+                     "AGM_E11.5_EHT" = "#848484",
+                     "AGM_E11.5_IAHC" = "#7EF771"))
+
+# A simpler version of annotation
+ann_col <- data.frame(Cell = colnames(se),
+                      Cluster = se$treeCut,
+                      Stage = se$eStage,
+                      Population = se$subPop,
+                      CellCycle = se$cell_cycle)
+
+ann_col$CellCycle <- gsub("S", "G2M", ann_col$CellCycle)
+ann_col$CellCycle <- gsub("G2M", "G2M/S", ann_col$CellCycle)
+
+
+ann_col <- ann_col %>%
+  dplyr::mutate(Population = gsub(".*E11.5_", "", Population),
+                Population = gsub(".*E10.5_", "", Population))
+
+rePop <- ann_col$Population
+rePop <- dplyr::recode(rePop, 
+                       'Endo_Ve' = "CDH5+ (venous)",
+                       'Endo_Others' = "CDH5+ (others)",
+                       'Endo_Ar' = "CDH5+ (arterial)",
+                       'HE' = "CDH5+/GFI1+",
+                       'EHT' = "GFI1+/GFI1B-",
+                       'IAHC' = "GFI1+/GFI1B+")
+
+ann_col$Population <- rePop
+
+row.names(ann_col) <- ann_col$Cell
+ann_col <- dplyr::select(ann_col, Cluster, CellCycle, Stage, Population)
+
+ann_list <- list(Cluster = 
+                   c("C_1" = col8_re[1],
+                     "C_2" = col8_re[2],
+                     "C_3" = col8_re[3],
+                     "C_4" = col8_re[4],
+                     "C_5" = col8_re[5],
+                     "C_6" = col8_re[6]),
+                 CellCycle =
+                   c("G1" = "red3",
+                     "G2M/S" = "green3"),
+                 Population = 
+                   c("CDH5+ (venous)" = "paleturquoise3",
+                     "CDH5+ (arterial)" = "royalblue1",
+                     "CDH5+/GFI1+" = "#fe9929",
+                     "GFI1+/GFI1B-" = "#A8786E",
+                     "GFI1+/GFI1B+" = "#67BF5C"),
+                 Stage = 
+                   c("E10.5" = col2[1],
+                     "E11.5" = col2[2]),
+                 Class = 
+                   c("Endothelial" = "#006a8e",
+                     "Hemato" =  "#b1283a"))
+
+
+# A way to normalise the data
+mat2 = t(apply(EXP, 1, function(x) {
+    q10 = quantile(x, 0.1)
+    q90 = quantile(x, 0.9)
+    x[x < q10] = q10
+    x[x > q90] = q90
+    scale(x)
+}))
+colnames(mat2) <- colnames(EXP)
+# Some NA because of the normalisation, so we remove them
+x <- mat2[,1]
+y <- x[is.na(x)]
+mat22 <- mat2[!row.names(mat2) %in% names(y),]
+
+
+# For one cluster
+#mat_sub <- mat22[, se_g$SC3  == "C_1"]
+#h_sub <- hmap(mat_sub, method="OLO_complete",col=mycolor2, key=FALSE,labRow = FALSE, labCol = #FALSE)
+#gene_order <- h_sub$rowInd
+#cell_order <- h_sub$colInd
+#mat_sub_re <- mat_sub[, cell_order]
+
+# Repeat for each cluster
+clus_all <- levels(as.factor(se_g$treeCut))
+
+CellOr <- vector()
+
+for (i in seq_along(clus_all)){
+  
+  CLUS <- clus_all[i]
+  
+  mat_sub <- mat22[, se_g$treeCut  == CLUS]
+
+pdf(file.path(outDir_C3, "tmp.pdf"), width = 5, height = 3)
+  h_sub <- seriation::hmap(mat_sub, method="OLO_complete",col=mycolor2, key=FALSE,labRow = FALSE, labCol = FALSE)
+dev.off()
+
+  gene_order <- h_sub$rowInd
+  cell_order <- h_sub$colInd
+  
+  cell_name <- colnames(mat_sub)[cell_order]
+
+  CellOr <- c(CellOr, cell_name)
+}
+
+
+# We reorder the cells a bit
+# First we want to order by the cluster
+# Second by the Estage
+# Third by Population
+cD <- as.data.frame(colData(se))
+df_or <- cD %>%
+  tibble::rownames_to_column(var = "Cell") %>%
+  dplyr::filter(Cell %in% CellOr)
+
+df_or <- df_or[match(CellOr, df_or$Cell), ] %>%
+  dplyr::arrange(treeCut, eStage, subPop)
+
+# Find lenth of each cluster (how many cells in each cluster)
+l_clus <- as.vector(table(df_or$treeCut))
+# Get the cummulative sum
+l_clus <- cumsum(l_clus)
+
+
+# Colour of the heatmap
+#mycolor <- rev(colorRampPalette(brewer.pal(11, "RdBu"))(256))
+mycolor2 <- as.vector(paletteer_c(palette = "viridis::cividis", n = 255))
+#mycolor2 <- viridis(n=255, option="magma")
+
+# Now draw the heatmap
+#mat22_re <- mat22[,CellOr]
+mat22_re <- mat22[,df_or$Cell]
+# A different colour
+#mycol <- rev(viridis(n=255, option="viridis"))
+
+pdf(file.path(outDir_C3, "Heatmap_CustomGenes.pdf"), width = 11, height = 4.5)
+pheatmap(mat22_re,
+         cluster_rows = TRUE, 
+         #clustering_distance_rows="binary",
+         gaps_col = l_clus,
+         cluster_cols = FALSE,
+         col=mycolor2,
+         key=TRUE, keysize = 1.5, 
+         #cexRow=1, cexCol=1, 
+         density.info = "none",
+         trace="none",
+         #cutree_rows = 2, 
+         annotation_row = gene_x,
+         annotation_col = ann_col,
+         annotation_colors = ann_list,
+         symkey=FALSE, scale="none",
+         #breaks=pairs.breaks,
+         #cellheight = 10,
+         show_colnames =F,
+         show_rownames = T,
+         fontsize_row = 5,
+         width = 6,
+         height = 5)
+dev.off()
+```
+
+## Drawing heatmap of marker genes
+
+We can find the marker genes of each population. Plot the top 10 upregulated marker. 
+
+```{r}
+markers <- findMarkers(se, se$treeCut, block=se$SequencingRun,
+                       direction = "up")
+
+marker.set1 <- markers[["C_1"]] %>%
+  as.data.frame() %>%
+  tibble::rownames_to_column(var = "Gene") %>%
+  dplyr::select(Gene, starts_with("logFC.")) %>%
+  melt() %>%
+  dplyr::group_by(Gene) %>%
+  dplyr::summarise(Mean = mean(value)) %>%
+  dplyr::top_n(10, Mean)
+
+marker.set2 <- markers[["C_2"]] %>%
+  as.data.frame() %>%
+  tibble::rownames_to_column(var = "Gene") %>%
+  dplyr::select(Gene, starts_with("logFC.")) %>%
+  melt() %>%
+  dplyr::group_by(Gene) %>%
+  dplyr::summarise(Mean = mean(value)) %>%
+  dplyr::top_n(10, Mean)
+
+marker.set3 <- markers[["C_3"]] %>%
+  as.data.frame() %>%
+  tibble::rownames_to_column(var = "Gene") %>%
+  dplyr::select(Gene, starts_with("logFC.")) %>%
+  melt() %>%
+  dplyr::group_by(Gene) %>%
+  dplyr::summarise(Mean = mean(value)) %>%
+  dplyr::top_n(10, Mean)
+
+marker.set4 <- markers[["C_4"]] %>%
+  as.data.frame() %>%
+  tibble::rownames_to_column(var = "Gene") %>%
+  dplyr::select(Gene, starts_with("logFC.")) %>%
+  melt() %>%
+  dplyr::group_by(Gene) %>%
+  dplyr::summarise(Mean = mean(value)) %>%
+  dplyr::top_n(10, Mean)
+
+
+marker.set5 <- markers[["C_5"]] %>%
+  as.data.frame() %>%
+  tibble::rownames_to_column(var = "Gene") %>%
+  dplyr::select(Gene, starts_with("logFC.")) %>%
+  melt() %>%
+  dplyr::group_by(Gene) %>%
+  dplyr::summarise(Mean = mean(value)) %>%
+  dplyr::top_n(10, Mean)
+
+
+marker.set6 <- markers[["C_6"]] %>%
+  as.data.frame() %>%
+  tibble::rownames_to_column(var = "Gene") %>%
+  dplyr::select(Gene, starts_with("logFC.")) %>%
+  melt() %>%
+  dplyr::group_by(Gene) %>%
+  dplyr::summarise(Mean = mean(value)) %>%
+  dplyr::top_n(10, Mean)
+
+marker.setTop <- rbind(marker.set1, marker.set2, marker.set3,
+                       marker.set4, marker.set5, marker.set6)
+```
+
+Draw heatmap
+
+```{r}
+EXP <-  assay(se_g, "logcounts")
+selGene <- row.names(EXP)[row.names(EXP) %in% marker.setTop$Gene]
+EXP <- EXP[selGene,]
+
+
+# A way to normalise the data
+mat2 = t(apply(EXP, 1, function(x) {
+    q10 = quantile(x, 0.1)
+    q90 = quantile(x, 0.9)
+    x[x < q10] = q10
+    x[x > q90] = q90
+    scale(x)
+}))
+colnames(mat2) <- colnames(EXP)
+# Some NA because of the normalisation, so we remove them
+x <- mat2[,1]
+y <- x[is.na(x)]
+mat22 <- mat2[!row.names(mat2) %in% names(y),]
+
+
+# For one cluster
+#mat_sub <- mat22[, se_g$SC3  == "C_1"]
+#h_sub <- hmap(mat_sub, method="OLO_complete",col=mycolor2, key=FALSE,labRow = FALSE, labCol = #FALSE)
+#gene_order <- h_sub$rowInd
+#cell_order <- h_sub$colInd
+#mat_sub_re <- mat_sub[, cell_order]
+
+# Repeat for each cluster
+clus_all <- levels(as.factor(se_g$treeCut))
+
+CellOr <- vector()
+
+for (i in seq_along(clus_all)){
+  
+  CLUS <- clus_all[i]
+  
+  mat_sub <- mat22[, se_g$treeCut  == CLUS]
+
+pdf(file.path(outDir_C3, "tmp.pdf"), width = 5, height = 3)
+  h_sub <- hmap(mat_sub, method="OLO_complete",col=mycolor2, key=FALSE,labRow = FALSE, labCol = FALSE)
+dev.off()
+
+  gene_order <- h_sub$rowInd
+  cell_order <- h_sub$colInd
+  
+  cell_name <- colnames(mat_sub)[cell_order]
+
+  CellOr <- c(CellOr, cell_name)
+}
+
+
+# We reorder the cells a bit
+# First we want to order by the cluster
+# Second by the Estage
+# Third by Population
+cD <- as.data.frame(colData(se))
+df_or <- cD %>%
+  tibble::rownames_to_column(var = "Cell") %>%
+  dplyr::filter(Cell %in% CellOr)
+
+df_or <- df_or[match(CellOr, df_or$Cell), ] %>%
+  dplyr::arrange(treeCut, eStage, subPop)
+
+# Find lenth of each cluster (how many cells in each cluster)
+l_clus <- as.vector(table(df_or$treeCut))
+# Get the cummulative sum
+l_clus <- cumsum(l_clus)
+
+
+# Colour of the heatmap
+#mycolor <- rev(colorRampPalette(brewer.pal(11, "RdBu"))(256))
+#mycolor2 <- viridis(n=255, option="magma")
+
+# Now draw the heatmap
+#mat22_re <- mat22[,CellOr]
+mat22_re <- mat22[,df_or$Cell]
+# A different colour
+#mycol <- rev(viridis(n=255, option="viridis"))
+
+pdf(file.path(outDir_C3, "Heatmap_MarkerGenes.pdf"), width = 11, height = 4.5)
+pheatmap(mat22_re,
+         cluster_rows = TRUE, 
+         #clustering_distance_rows="binary",
+         gaps_col = l_clus,
+         cluster_cols = FALSE,
+         col=mycolor2,
+         key=TRUE, keysize = 1.5, 
+         #cexRow=1, cexCol=1, 
+         density.info = "none",
+         trace="none",
+         #cutree_rows = 2, 
+         annotation_row = gene_x,
+         annotation_col = ann_col,
+         annotation_colors = ann_list,
+         symkey=FALSE, scale="none",
+         #breaks=pairs.breaks,
+         #cellheight = 10,
+         show_colnames =F,
+         show_rownames = T,
+         fontsize_row = 5,
+         width = 6,
+         height = 5)
+dev.off()
+```
+
+
+Draw specific genes mentioned in text
+
+```{r}
+geneToPlot <- c(
+  "Runx1",
+  "Adgrg1",
+  "Myb",
+    "Kit"
+)
+# Define the colours
+col_viol <- col8_re[1:6]
+
+expInt <- assay(se, "logcounts")[geneToPlot,]
+m <- as.data.frame(expInt)
+m$gene <- row.names(m)
+m <- melt(m)
+m$gene <- factor(m$gene, levels=geneToPlot)
+
+cD <- as.data.frame(colData(se))
+df_or <- cD %>%
+  tibble::rownames_to_column(var = "Cell")
+
+
+cD_sub <- df_or %>%
+  dplyr::select(Cell, treeCut)# %>%
+#dplyr::filter(cell_cycle %in% "G1")
+m <- m %>%
+  dplyr::left_join(cD_sub, by = c("variable" = "Cell"))
+# Plot
+p_viol_gene <- 
+  m %>%
+  ggplot(aes(x = treeCut, y = value, fill = treeCut)) +
+  geom_violin(alpha = 0.5, scale = "width", position = position_dodge(width = 0.9)) +
+  geom_boxplot(alpha = 0.5, width = 0.2, position = position_dodge(width = 0.9)) +
+  facet_grid(gene ~ .,  switch="both") +
+  scale_fill_manual(values=col_viol) +
+  theme_bw() +
+  theme(legend.position = "none",
+        panel.grid.major = element_line(linetype = "blank"), 
+        panel.grid.minor = element_line(linetype = "blank"),
+        axis.text.x = element_text(angle = 45, hjust = 1)) +
+  scale_y_continuous(limits = c(0,18),
+                     breaks = c(0,5,10,15)) +
+  xlab("") +
+  NULL
+
+
+p_viol_gene2 <- 
+  m %>%
+  ggplot(aes(x = treeCut, y = value, colour = treeCut)) +
+  geom_violin(fill=NA, scale="width") +
+    geom_quasirandom(groupOnX=TRUE, size = 0.8, alpha = 0.5, width = 0.4) +
+    stat_summary(fun.y = mean, fun.ymin = mean, fun.ymax = mean,
+                 geom = "crossbar", width = 0.3, alpha = 0.8, colour="black") +
+
+  facet_grid(gene ~ .) +
+  scale_colour_manual(values=col_viol) +
+  theme_bw() +
+  theme(legend.position = "none",
+        panel.grid.major = element_line(linetype = "blank"), 
+        panel.grid.minor = element_line(linetype = "blank"),
+        axis.text.x = element_text(angle = 45, hjust = 1)) +
+  scale_y_continuous(limits = c(0,12),
+                     breaks = c(0,5,10)) +
+  xlab("") +
+  NULL
+
+```
+
+
+
+## Cell cycle
+
+
+
+Check the number of cells in each cell cycle stage
+
+```{r TabCellCycle}
+cD <- as.data.frame(colData(se))
+tab <- xtabs(~ Population + cell_cycle, cD)
+tab_perc <- round( tab / rowSums(tab) * 100)
+
+t1 <- as.vector(tab)
+t2 <- paste0(as.vector(tab_perc), "%")
+
+tall <- paste0(t1, " (", t2, ")")
+
+tm <- matrix(tall, 
+             ncol=length(colnames(tab)))
+
+t_df <- as.data.frame(tm)
+colnames(t_df) <- colnames(tab)
+
+t_df1 <- data.frame(Population = row.names(tab))
+t_cc <- cbind(t_df1, t_df)
+
+knitr::kable(t_cc,
+             caption="Percentage of cells in each cell cycle stage") %>%
+  scroll_box(width = "100%", height = "100%")
+```
+
+
+Generate some p-values
+
+
+```{r}
+gg1 <- cD %>%
+  dplyr::select(Population, cell_cycle, G1, G2M) %>%
+  dplyr::filter(Population == "AGM_E10.5_HE")
+
+gg2 <- cD %>%
+  dplyr::select(Population, cell_cycle, G1, G2M) %>%
+  dplyr::filter(Population == "AGM_E10.5_HE", cell_cycle == "G2M")
+
+gg3 <- cD %>%
+  dplyr::select(Population, cell_cycle, G1, G2M) %>%
+  dplyr::filter(Population == "AGM_E11.5_HE")
+
+gg4 <- cD %>%
+  dplyr::select(Population, cell_cycle, G1, G2M) %>%
+  dplyr::filter(Population == "AGM_E11.5_HE", cell_cycle == "G2M")
+
+t.test(gg1$G2M, gg3$G2M)
+
+```
+
+
+Attempt to draw the G1 & G2M plot 
+
+```{r, eval=FALSE}
+ggplot(gg1, aes(x=G1, y=G2M)) + 
+  #geom_raster(aes(fill = density)) 
+  #geom_contour(colour = "white")
+  #stat_density2d() 
+  #scale_fill_continuous(low="green",high="red") 
+  #stat_density_2d(aes(fill = stat(level)), geom = "polygon")
+  #geom_density_2d(aes(fill = stat(level))) 
+  #geom_bin2d(bins=10) 
+  stat_density2d(aes(fill=..level..,alpha=..level..),geom='polygon',colour='black')
+  
+df <- data.frame(x=rnorm(10000),y=rnorm(10000))
+k <- with(df,MASS:::kde2d(x,y))
+filled.contour(k)
+
+ggplot(df,aes(x=x,y=y))+geom_density2d()
+
+
+ggplot(gg1,aes(x=G1,y=G2M))+
+  stat_density2d(aes(alpha=..level..), geom="polygon") +
+  scale_alpha_continuous(limits=c(0,0.2),breaks=seq(0,0.2,by=0.025))+
+  geom_point(colour="red",alpha=0.02)+
+  theme_bw()
+
+
+
+
+col_1 <- colorRampPalette(c("#80FFFF", "#EFFFFF", "#FF80FF"))(n = nrow(gg1))
+
+ggplot(gg1,aes(x=G1,y=G2M))+
+  stat_density2d(aes(fill=..level..), geom="polygon") +
+  scale_fill_gradientn(colours= col_1,
+                       limits=c(0,1.5),
+                       breaks=seq(0,1.5,by=0.1)) +
+                      # values = 0.5) +
+  #scale_fill_continuous(limits=c(0,1.5),
+  #                      breaks=seq(0,1.5,by=0.1),
+  #                      type = "viridis")+
+  geom_point(colour="red",alpha=0.02)+
+  theme_bw() + 
+  theme(panel.background = element_rect(fill = "#9FFFFF"),
+        panel.grid.major = element_line(linetype = "blank"), 
+        panel.grid.minor = element_line(linetype = "blank"))
+
+
+
+k <- with(gg1,MASS:::kde2d(G1,G2M))
+max(k$z)
+#k$z[k$z > 1.5] <- 1.5
+filled.contour(k)
+
+
+
+
+k <- with(gg3,MASS:::kde2d(G1,G2M))
+max(k$z)
+k$z[k$z > 1.5] <- 1.511762
+filled.contour(k)
+
+
+
+ggplot(gg1, aes(x=G1, y=G2M)) + 
+  geom_bin2d(bins=20) 
+```
+
+The plot that showed the data we want the best
+
+```{r}
+cc_p1 <- 
+ggplot(gg1, aes(x=G1, y=G2M)) + 
+  stat_density_2d(aes(fill = ..density..), geom = "raster", contour = FALSE) +
+  scale_fill_distiller(palette= "Spectral", direction=1) +
+  scale_x_continuous(expand = c(0, 0)) +
+  scale_y_continuous(expand = c(0, 0)) +
+  theme_bw() +
+  theme(
+    legend.position='none'
+  ) 
+
+cc_p2 <- 
+ggplot(gg3, aes(x=G1, y=G2M)) + 
+  stat_density_2d(aes(fill = ..density..), geom = "raster", contour = FALSE) +
+  scale_fill_distiller(palette= "Spectral", direction=1) +
+  scale_x_continuous(expand = c(0, 0)) +
+  scale_y_continuous(expand = c(0, 0)) +
+  theme_bw() +
+  theme(
+    legend.position='none'
+  ) 
+
+  
+  
+  
+# Zoom into the E11.5 G1 and G2M plot
+cc_p3 <- 
+ggplot(gg3, aes(x=G1, y=G2M)) + 
+  scale_x_continuous(limits = c(0.98, 1),
+                     expand = c(0, 0))+
+  scale_y_continuous(limits = c(0, 0.01),
+                     expand = c(0, 0))+
+  stat_density_2d(aes(fill = ..density..), geom = "raster", contour = FALSE) +
+  scale_fill_distiller(palette= "Spectral", direction=1) +
+  theme_bw() +
+  theme(
+    legend.position='none'
+  ) 
+
+pdf(file.path(outDir_C3, "CellCycle_plot.pdf"), height = 8, width = 11)
+cc_p1 + cc_p2 + cc_p3 + plot_layout(nrow=2, heights = c(3,3))
+dev.off()
+
+cc_p1 + cc_p2 + cc_p3 + plot_layout(nrow=2, heights = c(3,3))
+
+```
+
+
+## EdgeR
+
+
+We look at the difference between E10.5 HE and E11.5 HE. We use `EdgeR` to get the DE. We limit to comparisons of protein coding genes
+
+```{r}
+sde <- se [, se$Population %in% c("AGM_E10.5_HE", "AGM_E11.5_HE")]
+# Remove cluster 3
+#sde <- sde[, !sde$treeCut %in% c("C_3")]
+# Remove ERCC genes
+#sde <- sde[-grep("ERCC", rownames(sde)), ]
+# Only get the protein coding genes
+rD <- as.data.frame(rowData(sde))
+sde <- sde[rD$gene_type == "protein_coding", ]
+
+
+sde <- calculateQCMetrics(sde)
+
+fac_clus <- factor(sde$Population , 
+                 levels = c(
+                   "AGM_E10.5_HE", "AGM_E11.5_HE"))
+sde$Pop <- fac_clus
+```
+
+
+We use function to calculate dropout
+
+```{r}
+p_list <- unique(sde$Pop)
+p_list <- levels(p_list)
+
+
+dpt_list <- list()
+
+for (i in seq_along(p_list)){
+  x <- dropOut(sde, p_list[i])
+  dpt_list[[i]] <- x
+}
+```
+
+We make it into a data.frame
+```{r}
+dpt_df <- as.data.frame(do.call(cbind, dpt_list))
+colnames(dpt_df) <- paste0("pct_drop_", p_list)
+dpt_df$UniqGeneID <- row.names(sde)
+```
+
+We combine this information with the se information
+```{r}
+rr <- as.data.frame(rowData(sde)) %>%
+  tibble::rownames_to_column(var = "UniqGeneID") %>%
+  dplyr::inner_join(dpt_df)
+```
+
+
+We want to filter genes with an overall 80% dropout. But if the gene is expressed more than 70% in one of the population, we will keep it.
+
+
+```{r}
+rr_sub <- rr %>% 
+  dplyr::filter(pct_dropout_by_counts <= 80 |
+                  pct_drop_AGM_E10.5_HE <= 70 |
+                  pct_drop_AGM_E11.5_HE <= 70)
+```
+
+Now we remove the lowly expressed genes
+
+```{r}
+cts <- assay(sde, "counts")
+# We filter genes with more than 75% dropouts.
+cts_sub <- cts[rownames(cts) %in% rr_sub$UniqGeneID, ]
+cts_subOri <- cts_sub
+print(paste0("Before filtering, number of Genes :", (nrow(cts))))
+print(paste0("After filtering, number of Genes :", (nrow(cts_sub))))
+```
+
+
+DE without intercept and batch corrected by the sequencing run
+
+```{r TabDEE11.5}
+# --- Without intercept ---- #
+# Set up the EdgeR object
+group <- fac_clus
+cts <- assay(sde, "counts")
+cD <- as.data.frame(colData(sde))
+cD$group <- group
+
+dge <- DGEList(counts = cts_sub, group =group)
+dge <- calcNormFactors(dge)
+
+# Do the DE
+design <- model.matrix(~0 + group + SequencingRun, cD)
+vm <- voom(dge, design = design, plot = TRUE)
+fit <- lmFit(vm, design)
+contrast.matrix <- makeContrasts(groupAGM_E11.5_HE-groupAGM_E10.5_HE, levels=design)
+fit2 <- contrasts.fit(fit, contrast.matrix)
+fit2 <- eBayes(fit2)
+# We extract the DE genes in each comparison.
+dge_g1 <- 
+  topTable(fit2, n = Inf, adjust.method = "BH", coef=1) %>%
+  tibble::rownames_to_column(var = "UniqGeneID") %>%
+  dplyr::mutate(isTF = ifelse(UniqGeneID %in% tf_all2, "TF", "notTF"))
+
+
+LimmaVoom_cor <- dge_g1 %>%
+  dplyr::mutate(LogpValue = -log10(adj.P.Val))
+
+ggplot(LimmaVoom_cor, aes(x=logFC, y=LogpValue)) +
+  geom_point()
+
+
+knitr::kable(head(LimmaVoom_cor), caption = "Differentially expressed genes between E10.5 and E11.5 HE")
+
+write.table(LimmaVoom_cor,
+  file.path(outDir_C3, "DEG_E10.5_vs_E11.5.txt"), quote=F, sep="\t", row.names = F)
+
+# Svae in a different name
+DE_HE_E10.5_vs_E11.5 <- LimmaVoom_cor
+```
+
+
+Find out how many genes are differently expressed
+
+```{r}
+deSub <- 
+  LimmaVoom_cor %>%
+  dplyr::filter(logFC >=1.5 | logFC <=-1.5) %>%
+  dplyr::filter(adj.P.Val <= 0.1) %>%
+  dplyr::arrange(desc(logFC))
+
+nrow(deSub)
+
+
+write.table(deSub,
+  file.path(outDir_C3, "DEG_E10.5_vs_E11.5_filtered.txt"), quote=F, sep="\t", row.names = F)
+```
+
+We put this into panther gene ontology http://geneontology.org/ and read the results into R
+
+```{r,eval=FALSE}
+pan_df <- read.delim(file.path(outDir, "PathwaysAnalysis/E10.5_Gfi1HE_vs_E11.5_Gfi1HE/PantherDB_analysis_copy.txt"))
+colnames(pan_df) <- c("GO_term", "REF", "upload1", "upload1_expected",
+                      "upload1_over_under", "upload_FC", "uplad_Pval")
+```
+
+Filter a few things
+
+```{r,eval=FALSE}
+pan_df_f <- pan_df %>%
+  dplyr::filter(uplad_Pval <= 0.01) %>%
+  dplyr::filter(upload_FC > 1) %>%
+  dplyr::filter(upload1 > 10) %>%
+  dplyr::arrange(desc(upload_FC)) %>%
+  dplyr::top_n(15, upload_FC) %>%
+  dplyr::mutate(logPval = -log10(uplad_Pval)) %>%
+  dplyr::arrange(desc(logPval)) %>%
+  dplyr::top_n(10, logPval) %>%
+  dplyr::mutate(GO_term = factor(GO_term,
+                                 levels=rev(GO_term)))
+
+```
+
+Plot
+
+```{r,eval=FALSE}
+p_enri <- 
+ggplot(pan_df_f, aes(y=logPval, x=GO_term)) +
+  geom_bar(fill="#D62728", size=5, stat="identity") +
+  #scale_x_continuous(limits=c(0,7)) +
+  theme_bw() +
+  theme(panel.grid.major = element_line(linetype = "blank"),
+        panel.grid.minor = element_line(linetype = "blank")) +
+  coord_flip()
+p_enri
+```
+
+
+Save plot
+
+```{r,eval=FALSE}
+pdf(file.path(outDir_C3, "Panther_pathway_E10.5_vs_E11.5.pdf"),
+    height=7, width = 8)
+p_enri
+dev.off()
+```
+
+
+### Cell cycle E10.5 & E11.5
+
+
+Draw the percentage of cells in the population to visualise the significant of cell cycle status. Focus on E10.5 HE and E11.5 HE
+
+```{r cellCyclePerc, fig.cap="Percentage of cells in each stage"}
+cD <- as.data.frame(colData(se))
+tab <- xtabs(~ Population + cell_cycle, cD)
+tab_perc <- round( tab / rowSums(tab) * 100)
+
+
+perc_df <- as.data.frame(tab_perc) %>%
+  dplyr::filter(Population %in% c("AGM_E10.5_HE", "AGM_E11.5_HE"))
+
+
+p_perc <-
+ggplot(perc_df, aes(x=cell_cycle, y=Freq, fill=Population)) +
+  geom_bar(stat="identity", position=position_dodge()) +
+  theme_bw() +
+  #scale_fill_manual(values=c(col2[1], col2[2])) +
+  scale_fill_manual(values=c("#fe9929", "#D62728"),
+                    labels = c("E10.5: CDH5+/GFI+", "E11.5: CDH5+/GFI+")) +
+  ylab("Percentage of cells") +
+  xlab("Predicted cell cycle stage") + 
+  theme(panel.grid.major = element_line(linetype = "blank"),
+          panel.grid.minor = element_line(linetype = "blank"),
+          strip.background = element_rect(fill=col8_re[i]),
+          strip.text.x = element_text(colour="white")) +
+  NULL
+
+pdf(file.path(outDir_C3, "Cell_cyclePercentage.pdf"), width = 5, height = 5)
+p_perc
+dev.off()
+
+p_perc
+```
+
+
+
+Draw the same graph but for clusters
+
+
+```{r}
+cD <- as.data.frame(colData(se))
+tab <- xtabs(~ treeCut + cell_cycle, cD)
+tab_perc <- round( tab / rowSums(tab) * 100)
+
+t1 <- as.vector(tab)
+t2 <- paste0(as.vector(tab_perc), "%")
+
+tall <- paste0(t1, " (", t2, ")")
+
+tm <- matrix(tall, 
+             ncol=length(colnames(tab)))
+
+t_df <- as.data.frame(tm)
+colnames(t_df) <- colnames(tab)
+
+t_df1 <- data.frame(Cluster = row.names(tab))
+t_cc <- cbind(t_df1, t_df)
+
+knitr::kable(t_cc,
+             caption="Percentage of cells in each cell cycle stage") %>%
+  scroll_box(width = "100%", height = "100%")
+```
+
+```{r,eval=FALSE}
+perc_df <- as.data.frame(tab_perc) 
+
+
+p_perc <-
+  ggplot(perc_df, aes(x=cell_cycle, y=Freq, fill=treeCut)) +
+  geom_bar(stat="identity", position=position_dodge()) +
+  theme_bw() +
+  scale_fill_manual(values=c(col8_re[2], col8_re[3], col8_re[4], col8_re[5])) +
+  ylab("Percentage of cells") +
+  xlab("Predicted cell cycle stage") + 
+  NULL
+
+pdf(file.path(outDir_C3, "Cell_cyclePercentage_Cluster.pdf"), width = 5, height = 5)
+p_perc
+dev.off()
+
+p_perc
+
+```
+
+
+
+Read table of cell cycle genes. We get the genes from a publication (Need to check which publication)
+
+```{r}
+cc_df <- read.delim(file.path(dataDir, "Others/CellCycleGene.txt"), stringsAsFactors = FALSE)
+cc_g <- unique(c(cc_df$G1, cc_df$G2))
+# Remove duplicated genes
+sde_g <- sde
+dd <- rowData(sde_g)$gene_name[duplicated(rowData(sde_g)$gene_name)]
+dd <- duplicated(rowData(sde_g)$gene_name)
+sde_g <- sde_g[!dd, ]
+row.names(sde_g) <- rowData(sde_g)$gene_name
+
+
+G1_gene <- cc_df$G1
+G1_gene <- intersect(G1_gene, row.names(sde_g))
+chosen.exprs <- assay(sde_g, "logcounts")[G1_gene,]
+chosen.exprs <- apply(chosen.exprs, 1, rescale, to = c(0, 10))
+m_exp <- melt(chosen.exprs)
+m_exp$Type <- "G1"
+G1_exp <- m_exp
+
+G2_gene <- cc_df$G2
+G2_gene <- intersect(G2_gene, row.names(sde_g))
+chosen.exprs <- assay(sde_g, "logcounts")[G2_gene,]
+chosen.exprs <- apply(chosen.exprs, 1, rescale, to = c(0, 10))
+m_exp <- melt(chosen.exprs)
+m_exp$Type <- "G2"
+
+G_exp <- rbind(G1_exp, m_exp)
+
+
+df_sum <- G_exp %>%
+  dplyr::group_by(Var1, Type) %>%
+  dplyr::summarise(MeanScore = mean(value))
+
+```
+
+Try to plot
+
+```{r cellCycleScore, fig.cap="Cell cycle quantification of HE at E10.5 and E11.5"}
+d1 <- df_sum %>%
+  dplyr::filter(Type == "G1")
+
+d2 <- df_sum %>%
+  dplyr::filter(Type == "G2")
+
+dall <- data.frame(Cell = d1$Var1,
+                   G1_new = d1$MeanScore,
+                   G2 = d2$MeanScore)
+
+
+# Combine with annotation
+cD <- as.data.frame(colData(sde_g))
+cD$Cell <- row.names(cD)  
+cD <- cD %>%
+  dplyr::select(G1, G2M, Population, Cell)
+
+
+dall_new <- dplyr::inner_join(dall, cD)
+
+
+p_score <- 
+ggplot(dall_new, aes(x=G1_new, y=G2, colour = Population)) +
+  geom_point() +
+  theme_bw() +
+  scale_colour_manual(values=c(col2[1], col2[2])) +
+  NULL
+  #scale_y_continuous(breaks = c(0,2,4,6,8,10)) +
+  #scale_x_continuous(breaks = c(0,2,4,6,8,10))
+
+p_score
+```
+
+
+### Pathway enrichment
+
+
+We try not to use `clusterProfiler` https://bioconductor.org/packages/release/bioc/vignettes/clusterProfiler/inst/doc/clusterProfiler.html. We first look at the GO (Gene Ontology).
+
+```{r,eval=FALSE}
+# Need to change gene name to only the first letter capitalised
+deSub_up <- DE_HE_E10.5_vs_E11.5 %>%
+    dplyr::filter(logFC >=2) %>%
+  dplyr::filter(adj.P.Val <= 0.05)
+gN <- tolower(deSub_up$gene_name)
+gN <- as.character(mapply(simpleCap, gN))
+
+ego_up <- enrichGO(gene         = gN,
+                OrgDb         = org.Mm.eg.db,
+                keyType       = 'SYMBOL',
+                ont           = "BP",
+                pAdjustMethod = "BH",
+                pvalueCutoff  = 0.1,
+                qvalueCutoff  = 0.1)
+pp1 <- clusterProfiler::dotplot(ego_up, showCategory=20)
+
+
+write.table(ego_up, file.path(outDir_C3, "GO_BP_upRegulated.txt"), quote=F, sep="\t", col.names = NA)
+
+# Repeat for down regulated genes
+deSub_dwn <- LimmaForPathway %>%
+  dplyr::filter(logFC <= -2)
+gN <- tolower(deSub_dwn$gene_name)
+gN <- as.character(mapply(simpleCap, gN))
+
+ego_dwn <- enrichGO(gene     = gN,
+                OrgDb         = org.Mm.eg.db,
+                keyType       = 'SYMBOL',
+                ont           = "BP",
+                pAdjustMethod = "BH",
+                pvalueCutoff  = 0.01,
+                qvalueCutoff  = 0.05)
+
+pp2 <- clusterProfiler::dotplot(ego_dwn, showCategory=20)
+
+pdf(file.path(outDir_C3, "EnrichmentPlot.pdf"),height = 8, width = 11)
+pp1
+pp2
+dev.off()
+#
+
+write.table(ego_dwn, file.path(outDir_C3, "GO_BP_DwnRegulated.txt"), quote=F, sep="\t", col.names = NA)
+```
+
+
+## Arterial identity
+
+We want to compare the arterial profile from E10.5 and E11.5 HE. We select the cell population of interest
+
+```{r}
+seSel <- se[, se$subPop %in% c("AGM_E10.5_HE", "AGM_E11.5_HE", 
+                               "AGM_E10.5_Endo_Ve", "AGM_E10.5_Endo_Ar",
+                               "AGM_E11.5_Endo_Ve", "AGM_E11.5_Endo_Ar"                                                              )]
+seSel$subPopBk <- seSel$subPop
+# Rename the population
+subPop2 <- dplyr::recode(seSel$subPop,
+                        "AGM_E10.5_Endo_Ve" = "Venous Endothelial",
+                        "AGM_E11.5_Endo_Ve" = "Venous Endothelial",
+                        "AGM_E10.5_Endo_Ar" = "Arterial Endothelial",
+                        "AGM_E11.5_Endo_Ar" = "Arterial Endothelial")
+
+seSel$subPop <- subPop2
+```
+
+
+
+Now calculate the arterial score of the cells in this population. Similar to the way we did above
+
+```{r}
+ar_gn <- c("Gja5", "Bmx", "Vegfc", "Epas1", "Dll4")
+
+#vn_gn <- c("Nrp2", "Nr2f2","Aplnr", "Flt4", "Emcn")
+vn_gn <- c("Nrp2", "Nr2f2","Aplnr")
+selGene_ar <- c(ar_gn, vn_gn)
+
+# Make into data frame
+df_av <- data.frame(Gene = selGene_ar,
+                    Type = c(rep("Arterial", length(ar_gn)), 
+                             rep("Venous", length(vn_gn))))
+
+# Collapse to gene name
+dd <- rowData(seSel)$gene_name[duplicated(rowData(seSel)$gene_name)]
+dd <- duplicated(rowData(seSel)$gene_name)
+seSel <- seSel[!dd, ]
+row.names(seSel) <- rowData(seSel)$gene_name
+
+
+cD_sel <- as.data.frame(colData(seSel)) %>%
+  tibble::rownames_to_column(var = "Cell") %>%
+  dplyr::select(Cell, Population, treeCut, subPop, subPopBk)
+  
+
+chosen.exprs <- assay(seSel, "logcounts")[selGene_ar,]
+
+s_exp <- apply(chosen.exprs, 1, rescale, to = c(0, 10))
+s_exp <- as.data.frame(s_exp)
+s_exp$Cell <- row.names(s_exp)
+m_exp <- melt(s_exp)
+
+m_exp <- dplyr::left_join(m_exp, df_av, by=c("variable" = "Gene")) 
+
+
+df_sum <- m_exp %>%
+  dplyr::group_by(Cell, Type) %>%
+  dplyr::summarise(MeanScore = mean(value))
+
+d1 <- df_sum %>%
+  dplyr::filter(Type == "Arterial")
+d2 <- df_sum %>%
+  dplyr::filter(Type == "Venous")
+
+dall <- data.frame(Cell = d1$Cell,
+                   Ar_val = d1$MeanScore,
+                   Ve_val = d2$MeanScore) %>%
+  dplyr::left_join(cD_sel)
+
+
+#p_score <- 
+  ggplot(dall, aes(x=Ar_val, y=Ve_val, colour=subPop)) +
+  geom_point() +
+  theme_bw() +
+  scale_colour_manual(values=c("paleturquoise3", "royalblue1",
+                               "#fe9929", "#D62728")) +
+  scale_y_continuous(breaks = c(0,2,4,6,8,10)) +
+  scale_x_continuous(breaks = c(0,2,4,6,8,10))
+
+
+```
+
+Some ways to visualise the arterial identity score. First through boxplot
+
+```{r}
+p_box <-
+ggplot(dall, aes(x=subPop, y=Ar_val, colour=subPop)) +
+  geom_boxplot() +
+  geom_quasirandom() +
+    theme_bw() +
+    scale_y_continuous(breaks = c(0,2,4,6,8,10),
+                       limits = c(0,12)) +
+  #scale_colour_manual(values = c("#00D5FF", "#729ECE",
+  #                               col2[1], col2[2]),
+  #                    name = "Population") +
+  scale_colour_manual(values=c("paleturquoise3", "royalblue1",
+    "#fe9929", "#D62728"),
+                    labels = c("CDH5+ (venous)", "CDH5+ (arterial)",
+                      "E10.5: CDH5+/GFI+", "E11.5: CDH5+/GFI+"),
+                    name = "Population") +
+  ylab("Arterial identity score") +
+  theme(axis.text.x = element_blank(),
+        axis.title.x = element_blank()) +
+    theme(panel.grid.major = element_line(linetype = "blank"),
+          panel.grid.minor = element_line(linetype = "blank"),
+          #strip.background = element_rect(fill=col8_re[i]),
+          strip.text.x = element_text(colour="white")) +
+    NULL
+p_box
+
+# And secondly through joy plot
+#bandwidth <- 0.486
+p_joy <-
+ggplot(dall, aes(x=Ar_val, y=subPop, fill=subPop)) +
+  geom_density_ridges(color = "white") +
+                      #scale = 1, 
+                      #rel_min_height = 0.01,
+                      #bandwidth = bandwidth) +
+  theme_ridges(grid = TRUE, center = TRUE) +
+  scale_fill_manual(values = c("#00D5FF", "#729ECE",
+                                 col2[1], col2[2]),
+                    name = "Population") +
+  #scale_x_continuous(expand = c(0, 0)) +
+  #scale_y_discrete(expand = c(0, .2, 0, 2.6)) +
+  xlab("Arterial identity score") +
+  theme(axis.title.y = element_blank())
+p_joy
+
+
+pdf(file.path(outDir_C3, "Arterial_IdentityScore_boxplot.pdf"),height = 4, width = 7)
+p_box
+dev.off()
+
+pdf(file.path(outDir_C3, "Arterial_IdentityScore_joyplot.pdf"),height = 4, width = 8)
+p_joy
+dev.off()
+```
+
+Plot the levels of Sox17 & Sox 7
+
+
+```{r}
+g.exp <-  assay(seSel, "logcounts")["Sox17",] %>%
+  melt() %>%
+  tibble::rownames_to_column(var = "Cell")
+
+dall2 <- dall %>%
+  dplyr::left_join(g.exp)
+
+p_box2 <-
+  ggplot(dall2, aes(x=subPop, y=value, colour=subPop)) +
+  geom_boxplot() +
+  geom_quasirandom() +
+  theme_bw() +
+  scale_y_continuous(breaks = c(0,2,4,6,8,10),
+                     limits = c(0,14)) +
+  #scale_colour_manual(values = c("#00D5FF", "#729ECE",
+  #                               col2[1], col2[2]),
+  #                    name = "Population") +
+  scale_colour_manual(values=c("paleturquoise3", "royalblue1",
+                               "#fe9929", "#D62728"),
+                      labels = c("CDH5+ (venous)", "CDH5+ (arterial)",
+                                 "E10.5: CDH5+/GFI+", "E11.5: CDH5+/GFI+"),
+                     name = "Population") +
+  ylab("Expression Sox17") +
+  theme(axis.text.x = element_blank(),
+        axis.title.x = element_blank()) +
+  theme(panel.grid.major = element_line(linetype = "blank"),
+        panel.grid.minor = element_line(linetype = "blank"),
+        #strip.background = element_rect(fill=col8_re[i]),
+        strip.text.x = element_text(colour="white"),
+        legend.position = "none") +
+  geom_signif(
+    test = "t.test",
+    colour="black",
+    y_position = c(13,13.5,14),
+    comparisons = 
+      list(c("Arterial Endothelial", "AGM_E10.5_HE"),
+           c("AGM_E10.5_HE", "AGM_E11.5_HE"),
+           c("Arterial Endothelial", "AGM_E11.5_HE")),
+              map_signif_level = TRUE, textsize=2) +
+  NULL
+  
+p_box2 <- p_E11.5(dall2, "Sox17")
+
+
+g.exp <-  assay(seSel, "logcounts")["Sox7",] %>%
+  melt() %>%
+  tibble::rownames_to_column(var = "Cell")
+
+dall2 <- dall %>%
+  dplyr::left_join(g.exp)
+
+p_box3 <- p_E11.5(dall2, "Sox7")
+p_box3
+
+
+g.exp <-  assay(seSel, "logcounts")["Fbln5",] %>%
+  melt() %>%
+  tibble::rownames_to_column(var = "Cell")
+
+dall2 <- dall %>%
+  dplyr::left_join(g.exp)
+
+p_box4 <-p_E11.5(dall2, "Fbln5")
+
+p_box4
+
+g.exp <-  assay(seSel, "logcounts")["Aplnr",] %>%
+  melt() %>%
+  tibble::rownames_to_column(var = "Cell")
+
+dall2 <- dall %>%
+  dplyr::left_join(g.exp)
+
+p_box5 <- p_E11.5(dall2, "Aplnr")
+
+
+g.exp <-  assay(seSel, "logcounts")["Notch1",] %>%
+  melt() %>%
+  tibble::rownames_to_column(var = "Cell")
+
+dall2 <- dall %>%
+  dplyr::left_join(g.exp)
+
+p_box6 <- p_E11.5(dall2, "Notch1")
+
+
+g.exp <-  assay(seSel, "logcounts")["Jag1",] %>%
+  melt() %>%
+  tibble::rownames_to_column(var = "Cell")
+
+dall2 <- dall %>%
+  dplyr::left_join(g.exp)
+
+p_box7 <- p_E11.5(dall2, "Jag1")
+
+
+
+
+pdf(file.path(outDir_C3, "Sox_boxplot_v3.pdf"),height = 9, width = 8)
+p_box5 + p_box4 + p_box6 + p_box7 + p_box2 + p_box3 + plot_layout(ncol=2)
+dev.off()
+
+```
+
+
+Check the p-value 
+
+```{r}
+gg1 <- dall %>%
+  dplyr::filter(Population == "AGM_E10.5_HE")
+    
+gg2 <- dall %>%
+  dplyr::filter(Population == "AGM_E11.5_HE")
+
+
+gg3 <- dall %>%
+  dplyr::filter(subPop == "Arterial Endothelial")
+    
+t.test(gg1$Ar_val, gg2$Ar_val)
+
+    
+t.test(gg1$Ar_val, gg3$Ar_val)
+t.test(gg2$Ar_val, gg3$Ar_val)
+```
+
+
+## Save image
+
+
+We save some important data for future analysis
+
+```{r}
+save(se, df_col, file = file.path(outDir_C3, "seFilter.Robject"))
+```
+
+Save the single cell experiment to be used for shiny
+
+```{r}
+# Re-name the FACS population
+newpop <- se_UMAP$Population
+newPop <- recode_factor(newpop,
+                    'AGM_E10.5_Endo_Gfi' = 'E10.5_Fcs-Endo',
+                    'AGM_E10.5_HE' = 'E10.5_Fcs-HE-Gfi1',
+                    'AGM_E10.5_EHT' = 'E10.5_Fcs-EHT',
+                    'AGM_E10.5_IAHC' = 'E10.5_Fcs-IAHC',
+                    
+                    
+                    'AGM_E11.5_Endo' = 'E11.5_Fcs-Endo',
+                    'AGM_E11.5_HE' = 'E11.5_Fcs-HE-Gfi',
+                    'AGM_E11.5_EHT' = 'E11.5_Fcs-EHT',
+                    'AGM_E11.5_IAHC' = 'E11.5_Fcs-IAHC',
+                    
+                    
+                    .ordered = TRUE)
+
+se_UMAP$Population <- newPop
+
+# Store the insilico cluster
+se_UMAP$InsCluster <- se$treeCut
+
+se_tmp <- se_UMAP
+
+# Minumum metadata
+cD_tmp <- colData(se_tmp) 
+cD_tmpSub <- as.data.frame(cD_tmp) %>%
+  dplyr::select(Population, InsCluster, eStage)
+rownames(cD_tmpSub) <- rownames(cD_tmp)
+
+# Minimum row Data
+rD_tmp <- rowData(se_tmp) 
+rD_tmpSub <- as.data.frame(rD_tmp) %>%
+  dplyr::select(gene_id, gene_name, gene_type)
+
+
+
+se_shiny <- SingleCellExperiment(
+  assay=list(counts= assay(se_tmp, "counts"),
+             logcounts= assay(se_tmp, "logcounts")),
+  colData = cD_tmpSub,
+  rowData = rD_tmpSub
+)
+
+# Add UMAP coordinates
+reducedDim(se_shiny, "UMAP") <- reducedDim(se_tmp, "UMAP")
+
+
+saveRDS(se_shiny, 
+        file=file.path(outDir_C3, "se_Shiny.RDS"))
+
+```
+
+
+
+## Save output
+
+```{r}
+se_Chapter3 <- se
+save.image(file.path(outDir_C3, "Chapter_03.Rdat"))
+#load(file.path(outDir_C3, "Chapter_03.Rdat"))
+```
+
+
+## Session Info
+
+```{r}
+sessionInfo()
+```
+

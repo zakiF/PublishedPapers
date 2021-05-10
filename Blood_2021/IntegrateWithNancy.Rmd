@@ -1,0 +1,904 @@
+---
+title: "Integrate with Nancy"
+author: "Zaki"
+date: "14/01/2021"
+output: html_document
+---
+
+# Library
+
+```{r, warning=FALSE, message=FALSE}
+library(ggplot2)
+library(scater)
+library(scran)
+library(dplyr)
+library(dynamicTreeCut)
+library(paletteer)
+library(Matrix)
+library(patchwork)
+library(Seurat)
+library(class)
+library(gghighlight)
+library(scales)
+
+pal.10 <- paletteer_d("ggthemes::Tableau 10")
+pal <- paletteer_d("ggthemes::Tableau 20")
+
+clus_col = 
+  c("#4E79A7", "#00FFE8", "#A0CBE8",
+    "#E15759", "#FF9D9A", #"#FF13DB",
+    "#F28E2B","#7C3425", 
+    "#59A14F","#A2A2A2","#EDED46")
+
+```
+
+Directory set up
+
+```{r}
+#workDir <- here()
+workDir <- "/Users/zfadlullah/Dropbox (The University of Manchester)/zaki/PhD/sequencing_runs/2019/191001_MZ_009"
+dataDir <- file.path(workDir, "data")
+outDir <- file.path(workDir, "output")
+dir.create(outDir)
+outDir_cur <- file.path(outDir, "Chapter_11_Integratenancy")
+dir.create(outDir_cur)
+set.seed(100)
+
+source(file.path(workDir, "functions.R"))
+```
+
+
+
+# Porcess
+
+Load AGM data
+
+```{r}
+outDir_04 <- file.path(outDir, "Chapter_04_E10.5")
+# This is the single cell object
+load(file=file.path(outDir_04, "se.block_f.Rdata"))
+# Load the HVG genes
+outTMPanalaysis <- "~/Dropbox (The University of Manchester)/zaki/PhD/sequencing_runs/2019/190902_MZ_007/"
+chosen <- read.csv(file.path(outTMPanalaysis, "HVG_chosen.csv"))
+```
+
+## AGM
+
+
+
+
+# Nancy data
+
+We process Nancy's data from GEO
+
+
+```{r,eval=TRUE}
+dat <- readMM("~/Downloads/GSE137116_gene_by_cell_count_matrix.txt")
+
+g.anno <-read.csv("~/Downloads/GSE137116_gene_annotation.csv")
+c.anno <- read.csv("~/Downloads//GSE137116_cell_annotation.csv")
+
+colnames(dat) <- c.anno$X
+rownames(dat) <- g.anno$id
+
+
+
+seNancyOri <- 
+  SingleCellExperiment(
+  assays = list(counts = dat),
+  colData = c.anno,
+  rowData = g.anno)
+  
+
+
+new.row.names <- uniquifyFeatureNames(
+    rowData(seNancyOri)$id,
+    rowData(seNancyOri)$symbol
+)
+rownames(seNancyOri) <- new.row.names
+head(rownames(seNancyOri), 20)
+
+# Filter to expressing genes
+ave.counts <- rowMeans(counts(seNancyOri))
+cutOFFval <- 0.001
+keep <- ave.counts >= cutOFFval
+print(paste0("Before filtering Gene Numbers (including the 0 expression ones): ", dim(rowData(seNancyOri))[1]))
+print(paste0('After filtering Gene Numbers: ',sum(keep)))
+# Check hist
+hist(log10(ave.counts), breaks=200, main="", col="grey80",
+     xlab=expression(Log[10]~"average count"), cex.lab=1.3, cex.axis=1.1)
+abline(v=log10(cutOFFval), col="blue", lwd=2, lty=2)
+
+seNancy <- seNancyOri[keep, ]
+
+# 
+
+# Limit to same genes
+x <- row.names(seNancy)
+y <- row.names(se.block_f)
+int <- intersect(x,y)
+
+# Remove NA from the population tab
+se.Nancy.sub <- seNancy[,!is.na(seNancy$Cell_type_refined) ]
+#se.Nancy.sub <- seNancyOri[,!is.na(seNancyOri$Cell_type_refined) ]
+
+
+# Keep E10.5 data only
+dataInt <- as.character(unique( c.anno$Combined_Dataset[grep("E10.5", c.anno$Combined_Dataset)]))
+scATAC_loc <- grep("scATAC", dataInt)
+dataInt <- dataInt[-scATAC_loc]
+se.Nancy.sub <- se.Nancy.sub[,se.Nancy.sub$Combined_Dataset %in% dataInt]
+
+
+# Remove unrelated population
+popInterest <- 
+  c("Conflux endo [AE]", "Endo (Wnt_high) [AE]", "Endo (Wnt_high) [VE]", "Endo (Wnt_low) [AE]",
+    "Endo (Wnt_low) [VE]", "HE", "IAC", "Pre-HE [AE]","Endo (other)", "Mesenchymal and other contaminant cell type")
+#popNOTint <- c("Endo (low quality)", "Endo (Lyve1+)", "Erythroid progenitor")
+
+se.Nancy.sub <- se.Nancy.sub[,se.Nancy.sub$Cell_type_refined %in% popInterest]
+#se.Nancy.sub <- se.Nancy.sub[,!se.Nancy.sub$Cell_type_refined %in% popNOTint]
+
+
+
+# Make the AGM data and NancyData the same gene set
+se.Nancy.sub <- se.Nancy.sub[int,]
+se.AGM.sub <- se.block_f[int,]
+
+
+#Save the objects as Seurat
+seuAGM <- 
+    Seurat::CreateSeuratObject(counts = assay(se.AGM.sub, "counts"), 
+                     project = "AGM", 
+                     meta.data = as.data.frame(colData(se.AGM.sub)),
+                     min.cells = 0, min.features = 200)
+
+seuAGM <- NormalizeData(
+  object = seuAGM, 
+  normalization.method = "LogNormalize", 
+  scale.factor = 10000
+)
+seuAGM <- 
+  FindVariableFeatures(object = seuAGM, 
+                       selection.method = "vst", nfeatures = 2000)
+seuAGM <- ScaleData(object = seuAGM)
+
+
+seuNancy <- 
+    Seurat::CreateSeuratObject(counts = assay(se.Nancy.sub, "counts"), 
+                     project = "Nancy", 
+                     meta.data = as.data.frame(colData(se.Nancy.sub)),
+                     min.cells = 0, min.features = 200)
+
+seuNancy <- NormalizeData(
+  object = seuNancy, 
+  normalization.method = "LogNormalize", 
+  scale.factor = 10000
+)
+seuNancy <- 
+  FindVariableFeatures(object = seuNancy, 
+                       selection.method = "vst", nfeatures = 2000)
+seuNancy <- ScaleData(object = seuNancy)
+
+lvlnancy <- c("Endo (other)", 
+                   "Endo (Wnt_low) [VE]", 
+                   "Endo (Wnt_high) [VE]", 
+                   "Endo (Wnt_low) [AE]",
+                   "Endo (Wnt_high) [AE]", 
+                   "Conflux endo [AE]",
+                   "Pre-HE [AE]",
+                   "HE", "IAC", 
+                   "Mesenchymal and other contaminant cell type")
+
+seuNancy$Cell_type_refined <- 
+  factor(seuNancy$Cell_type_refined, 
+         levels= c("Endo (other)", 
+                   "Endo (Wnt_low) [VE]", 
+                   "Endo (Wnt_high) [VE]", 
+                   "Endo (Wnt_low) [AE]",
+                   "Endo (Wnt_high) [AE]", 
+                   "Conflux endo [AE]",
+                   "Pre-HE [AE]",
+                   "HE", "IAC", 
+                   "Mesenchymal and other contaminant cell type"))
+
+
+
+
+
+#save(seuAGM, seuNancy, file="~/Desktop/SeuObjects.Rdata")
+```
+
+Staibility of Nancys data (rub in R version 4)
+
+```{r, eval=FALSE}
+#seNancy <- seNancyOri[keep, ]
+
+
+# Remove NA from the population tab
+se.Nancy.sub <- seNancy[,!is.na(seNancy$Cell_type_refined) ]
+#se.Nancy.sub <- seNancyOri[,!is.na(seNancyOri$Cell_type_refined) ]
+
+
+# Keep E10.5 data only
+dataInt <- as.character(unique( c.anno$Combined_Dataset[grep("E10.5", c.anno$Combined_Dataset)]))
+scATAC_loc <- grep("scATAC", dataInt)
+dataInt <- dataInt[-scATAC_loc]
+se.Nancy.sub <- se.Nancy.sub[,se.Nancy.sub$Combined_Dataset %in% dataInt]
+
+
+# Remove unrelated population
+popInterest <- 
+  c("Conflux endo [AE]", "Endo (Wnt_high) [AE]", "Endo (Wnt_high) [VE]", "Endo (Wnt_low) [AE]",
+    "Endo (Wnt_low) [VE]", "HE", "IAC", "Pre-HE [AE]","Endo (other)", "Mesenchymal and other contaminant cell type")
+#popNOTint <- c("Endo (low quality)", "Endo (Lyve1+)", "Erythroid progenitor")
+
+se.Nancy.sub <- se.Nancy.sub[,se.Nancy.sub$Cell_type_refined %in% popInterest]
+
+lvlnancy <- c("Endo (other)", 
+                   "Endo (Wnt_low) [VE]", 
+                   "Endo (Wnt_high) [VE]", 
+                   "Endo (Wnt_low) [AE]",
+                   "Endo (Wnt_high) [AE]", 
+                   "Conflux endo [AE]",
+                   "Pre-HE [AE]",
+                   "HE", "IAC", 
+                   "Mesenchymal and other contaminant cell type")
+
+
+se.Nancy.sub$Cell_type_refined <- factor(se.Nancy.sub$Cell_type_refined,
+                                         levels=lvlnancy)
+
+#  Normalise
+se.Nancy.sub <- logNormCounts(se.Nancy.sub)
+
+library(bluster)
+
+# Find top HVG
+#dec.se2 <- modelGeneVar(se_Chapter3, 
+#                        assay.type= "logcounts")
+#fit.se2 <- metadata(dec.se2)
+
+# Use the top 500 genes to do clustering
+#hvg.var <- getTopHVGs(dec.se2, prop=0.1)
+
+# Run silhuette
+# Version 2 (using PCA)
+set.seed(1000)
+sce <- runPCA(se.Nancy.sub, ncomponents=20, exprs_values = "logcounts")
+#sce <- runPCA(se_Chapter3, ncomponents=20, subset_row=hvg.var, exprs_values = "logcounts")
+clusters <- se.Nancy.sub$Cell_type_refined
+mat1 <- reducedDim(sce, "PCA")
+
+
+
+# Calculate width
+sil.approx <- approxSilhouette(mat1, clusters=clusters)
+
+# Plot
+sil.data <- as.data.frame(sil.approx)
+sil.data$closest <- factor(ifelse(sil.data$width > 0, clusters, sil.data$other))
+sil.data$cluster <- factor(clusters)
+sil.data_Nancy <- sil.data
+
+p3 <-
+ggplot(sil.data, aes(x=cluster, y=width, colour=closest)) + 
+  #scale_colour_manual(values=cluster_col_v2$Col) +
+  ggbeeswarm::geom_quasirandom(method="smiley") +
+  geom_boxplot(colour="black", fill=NA) +
+  theme_bw()
+
+save(sil.data_Nancy, file="~/Desktop/Sil.approx_Nancy.Rdata")
+
+```
+
+
+## PCA
+
+We try to overlay data onto the PCA space
+
+> First, we performed PCA on our data using shared genes with the public data, then used the top 10 PCs to compute a UMAP using the umapfunction from the uwot package. Using the PCA loading matrix, we projected public data onto the same PCA space, then predicted UMAP embedding using umap_transformfunction with the previously computed UMAP model. For each projected cell, we mapped it to cell types annotated in this study by 3-nearest-neighbor classification. 
+
+```{r}
+# Using the HVGs from the AGM dataset that intersecrt with genes present in Nancy data
+var.f <- as.character(chosen$X)
+var.f <- VariableFeatures(object = seuNancy)
+int <- row.names(seuNancy) %in%  var.f
+# Calculate PCA
+exp.sub <- GetAssayData(object = seuNancy)[int,]
+#exp.sub <- assay(se.Nancy.sub, "logcounts")[int,]
+exp.sub <- t(exp.sub)
+pca <- prcomp(exp.sub,scale=TRUE)
+numPCA <- 1:10
+pca.sub <- as.data.frame(pca$x)[,numPCA]
+# Parameters
+n_neig <- 10
+min_di <- 0.1
+n_dim <- 2
+
+set.seed(123)
+umap.mat <- uwot::umap(pca.sub,ret_model = TRUE,
+                       n_neighbors=n_neig,
+                        min_dist=min_di)
+umap.df <- as.data.frame(umap.mat$embedding)
+colnames(umap.df) <- c("V1", "V2")
+
+umap.df <- umap.df %>%
+  dplyr::mutate(CellType = seuNancy$Cell_type_refined,
+                CellCycle = seuNancy$Cell_cycle_phase,
+                DataSet = seuNancy$Combined_Dataset,
+                Cell=colnames(seuNancy))
+
+#save(seuNancy, pca, umap.mat, umap.df, file=file.path(outDir_cur, "Nancy_lowDim.Rdata"))
+#save(pca, umap.mat, umap.df, file=file.path(outDir_cur, "Nancy_lowDim.Rdata"))
+```
+
+We have a quick look at nancy data
+
+```{r}
+ggplot(umap.df, aes(x=V1, y=V2,colour=CellType)) +
+    geom_point() +
+  #facet_wrap(~CellType) +
+  NULL
+```
+
+### Project AGM data
+
+Now we have the PCA and UMAP from Nancy data, we try to map the AGM gene expression on it. We follow this guide https://stats.stackexchange.com/questions/2592/how-to-project-a-new-vector-onto-pca-space
+
+```{r}
+# Calculate PCA
+#exp.sub <- t(GetAssayData(object = su.Nancy, slot = "scale.data"))
+exp.sub.agm <- GetAssayData(object = seuAGM)[colnames(exp.sub),]
+exp.sub.agm <- t(exp.sub.agm)
+identical(colnames(exp.sub.agm), colnames(exp.sub))
+
+pca.agm <- prcomp(exp.sub.agm,scale=TRUE)
+pca.sub.agm <- as.data.frame(pca.agm$x)[,numPCA]
+
+# --- # 
+# This is not really ncessary, we just want to look at the UMAP of the AGM data
+set.seed(123)
+umap.mat.agm <- uwot::umap(pca.sub.agm,ret_model = TRUE,
+                       n_neighbors=n_neig,
+                        min_dist=min_di)
+umap.df.agm <- as.data.frame(umap.mat.agm$embedding)
+colnames(umap.df.agm) <- c("V1", "V2")
+
+umap.df.agm <- umap.df.agm %>%
+  dplyr::mutate(CellType = seuAGM$Population,
+                Cluster = seuAGM$finalCluster)
+
+```
+
+
+
+
+If we want to project PCA and predict the UMAP embedding
+
+
+```{r}
+# project new data onto the PCA space
+#newdata.pca <- scale(pca.agm$x, pca$center, pca$scale) %*% pca$rotation
+newdata.pca <- predict(pca, newdata=exp.sub.agm)
+
+# predicted UMAP embedding
+umap.pred <- uwot::umap_transform(newdata.pca[,numPCA], umap.mat)
+umap.pred.df <- as.data.frame(umap.pred)
+colnames(umap.pred.df) <- c("V1", "V2")
+
+umap.pred.df <- umap.pred.df %>%
+  dplyr::mutate(CellType = seuAGM$finalCluster,
+                CellCycle = "none",
+                DataSet = seuAGM$Population,
+                Cell=colnames(seuAGM))
+```
+
+
+### Visualising results
+
+Try to combine
+
+```{r}
+umap.all.df <- rbind(umap.df, umap.pred.df) %>%
+  dplyr::mutate(
+    Source = c(rep("Nancy", nrow(umap.df)),
+               rep("Georges", nrow(umap.pred.df))))
+
+# Rename the long Mesencymal cluster
+lvlnancy2 <- c("Endo (other)", 
+                   "Endo (Wnt_low) [VE]", 
+                   "Endo (Wnt_high) [VE]", 
+                   "Endo (Wnt_low) [AE]",
+                   "Endo (Wnt_high) [AE]", 
+                   "Conflux endo [AE]",
+                   "Pre-HE [AE]",
+                   "HE", "IAC", 
+                   "Mesenchymal")
+lvlAGM <- paste0("C", 1:10)
+
+umap.all.df <- umap.all.df %>%
+  dplyr::mutate(CellType = gsub("Mesenchymal and other contaminant cell type",
+                                "Mesenchymal", CellType),
+                CellType = gsub("C0", "C", CellType),
+                CellType = factor(CellType, levels=c(lvlnancy2, lvlAGM)))
+
+save(umap.all.df, file=file.path(outDir_cur, file="Umap_int.Rdata"))
+#load(file=file.path(outDir_cur, file="Umap_int.Rdata"))
+```
+
+
+Save after with gghighlights but save as PNG
+
+```{r}
+pTheme <-   theme_bw() +
+  theme(axis.text = element_blank(),
+          axis.title = element_blank(),
+          panel.grid.major = element_line(linetype = "blank"),
+          panel.grid.minor = element_line(linetype = "blank"),
+        axis.ticks = element_blank()) 
+
+p1 <-
+  ggplot(umap.all.df, aes(x=V1, y=V2, colour=Source)) +
+    geom_point() +
+  gghighlight()
+
+p1.1 <- 
+  ggplot(umap.all.df, aes(x=V1, y=V2, colour=CellType)) +
+    geom_point() +
+  gghighlight() +
+  theme(legend.position = "right") +
+  scale_colour_manual(values=c(pal.10[1:9], "grey30", clus_col[1:8], "grey30", clus_col[10])) +
+  theme_bw()
+
+p1.2 <- 
+  ggplot(umap.all.df, aes(x=V1, y=V2, colour=CellType)) +
+    geom_point() +
+  gghighlight() +
+  facet_wrap(~Source) +
+  theme(legend.position = "right") +
+  scale_colour_manual(values=c(pal.10[1:9], "grey30", clus_col[1:8], "grey30", clus_col[10])) +
+  pTheme
+
+p1.3 <- 
+  ggplot(umap.all.df, aes(x=V1, y=V2, colour=CellType)) +
+    geom_point() +
+  gghighlight() +
+  facet_wrap(~CellType) +
+  theme(legend.position = "right") +
+  scale_colour_manual(values=c(pal.10[1:9], "grey30", clus_col[1:8], "grey30", clus_col[10])) +
+  pTheme
+
+
+  
+p_list <- list()
+p_list[[1]] <- p1
+p_list[[2]] <- p1.1
+p_list[[3]] <- p1.2
+p_list[[4]] <- p1.3
+
+
+
+# Make a loop for each plot
+for (i in seq_along(p_list)){
+  png(file.path(outDir_cur, 
+                paste0("Plot_", i, ".png")), width = 1500, height=1000)
+  print(p_list[[i]])
+  dev.off()
+}
+
+
+
+png(file.path(outDir_cur, "Combined_UMAP.png"), width = 1500, height=1000)
+p1.3
+dev.off()
+
+pdf(file.path(outDir_cur, "Combined_UMAP.pdf"), width = 15, height=10)
+p1.3
+dev.off()
+```
+
+
+
+## Knn prediction
+
+Now we try to predict what our cluster falls into based on Nancy's data. We use k-nearest neighbours to do this
+
+```{r}
+train_umap <- umap.all.df %>%
+  dplyr::filter(Source == "Nancy")
+train_umap1 <- train_umap %>%
+  dplyr::select(V1, V2)
+  
+
+test_umap <- umap.all.df %>%
+  dplyr::filter(Source == "Georges")
+test_umap1 <- test_umap %>%
+  dplyr::select(V1,V2)
+
+# Get the outocome from Nancy data
+NancyCluster <- as.character(train_umap$CellType)
+NancyCluster <- factor(NancyCluster, lvlnancy2)
+# Predict the outcome
+set.seed(123)
+knn_pred = class::knn(train_umap1, test_umap1, NancyCluster, k = 10, prob = FALSE)
+write.csv(table(knn_pred, umap.df.agm$Cluster), file.path(outDir_cur, "knn_NancyAGM.csv"))
+```
+
+We can plot the relative frequency
+
+```{r}
+df_knn <- data.frame(
+  Population = factor(as.character(test_umap$CellType),levels = lvlAGM),
+  knnClus = factor(knn_pred, levels=rev(c(lvlnancy2)))) %>%
+  dplyr::mutate(Cell = 1:nrow(test_umap))
+```
+
+Calculate the percentage per cluster
+
+```{r}
+tab <- xtabs(~  knnClus + Population,  df_knn)
+
+# The perentage of cells
+tab_perc <- round( t(t(tab) / colSums(tab) * 100),1)
+df_tab <- as.data.frame(tab_perc) %>%
+  dplyr::group_by(knnClus) %>%
+  dplyr::mutate(Perc = paste0(Freq, "%"),
+                Perc = gsub("^0%", "", Perc))
+
+# Get number of cells
+df_tab2 <- as.data.frame(tab) %>%
+  dplyr::group_by(knnClus) %>%
+  dplyr::mutate(Num = paste0("n=", Freq),
+                Num = gsub("n=0", "", Num))
+
+p_clust <- 
+ggplot(df_tab, aes(x=Population, y=knnClus, fill =Freq))+
+ geom_tile(color = "grey50") +
+ scale_fill_gradient2(low = "white", high = "red", 
+   midpoint = 2, limit = c(0,100), space = "Lab", 
+    name="Percentage") +
+  theme_minimal()+ # minimal theme
+ theme(axis.text.x = element_text(angle = 45, vjust = 1, size = 20, hjust = 1),
+       axis.text.y = element_text(size = 20)) +
+  geom_text(aes(x=Population, y=knnClus, label = Perc), color = "black", size = 5) +
+  geom_text(data=df_tab2, aes(x=Population, y=knnClus, label = Num), color = "black", size = 4.5,
+            vjust=3) +
+ #coord_fixed() +
+  ylab("") +
+  xlab("") +
+  NULL
+
+pdf(file.path(outDir_cur, "knn_prediction.pdf"), height=16, width = 12)
+p_clust
+dev.off()
+```
+
+
+# Num of genes detected
+
+
+We want to compare the number of genes detected in each of the cells. Because of the differnt genome reference, we get a common gene used.
+
+```{r}
+# Load our original single cell object (before removing lowly expressed genes)
+DirInfo <- file.path(outDir, "Chapter_02_Filtering")
+load(file.path(DirInfo, "seCombined_Cellfilter_CC.Robject"))
+
+# To enable a user-friendly analysis, it is convenient to exchange the ENSEMBL IDs with the name of the genes. 
+new.row.names <- uniquifyFeatureNames(
+    rowData(se_all)$gene_id,
+    rowData(se_all)$gene_name
+)
+rownames(se_all) <- new.row.names
+
+
+# Intersect the genes
+int2 <- intersect(row.names(se_all), row.names(seNancyOri))
+
+#Subset to the common genes and the cells we used for PCA
+seNancy_allGene <- seNancyOri[int2,train_umap$Cell]
+seAGM_allGene <- se_all[int2, test_umap$Cell]
+
+# Check if the order of the cell is identical
+identical(colnames(seNancy_allGene), train_umap$Cell)
+identical(colnames(seAGM_allGene), test_umap$Cell)
+```
+
+Lets calculate the number of genes detected
+```{r}
+agm_qc <- as.data.frame(perCellQCMetrics(seAGM_allGene)) %>%
+  dplyr::mutate(Cluster = df_knn$knnClus, # Add the inferred clusters
+                Data = "AGM")
+nancy_qc <- as.data.frame(perCellQCMetrics(seNancy_allGene)) %>%
+  dplyr::mutate(Cluster = seNancy_allGene$Cell_type_refined,
+                Data = "Nancy")
+
+df_qc <- rbind(agm_qc, nancy_qc) %>%
+  dplyr::mutate(Cluster = factor(Cluster, level=lvlnancy))
+
+df_qc_grp <- df_qc %>%
+  dplyr::group_by(Cluster, Data) %>%
+  dplyr::summarise(MED = median(detected)) 
+
+# Calculate fold enrichment
+d1 <- df_qc_grp %>%
+  dplyr::filter(Data == "AGM")
+d2 <- df_qc_grp %>%
+  dplyr::filter(Data == "Nancy")
+d_fold <- round(d1$MED / d2$MED, 1)
+
+# Annotation for plot
+df_label <- data.frame(
+  Cluster = 1:length(unique(df_qc_grp$Cluster)),
+  detected = 9500,
+  Value = paste0(d_fold, "x"),
+  Data = "AGM"
+)
+```
+
+
+Now we plot
+
+```{r}
+p1 <- 
+  ggplot(df_qc, aes(x=Cluster, 
+                     y=detected,
+                     fill=Data)) +
+  geom_boxplot() +
+  # Add text indicating fold enrichment
+  geom_text(data = df_label,
+            aes(x=Cluster, 
+                y=detected,
+                label = Value), 
+            color = "black", size = 6) +
+  scale_y_continuous(label=comma, breaks=c(2000,4000,6000,8000,10000)) +
+  theme_bw() +
+  theme(panel.grid.minor = element_line(linetype = "blank"),
+        legend.position = "none") +
+  NULL
+
+pdf(file.path(outDir_cur, "NumOfGene.pdf"),width = 8, height = 4)
+p1
+dev.off()
+```
+
+
+## CDH5 and CD31
+
+We want to see if cells sorted from CD31 and CDH5 clustered differently 
+
+```{r}
+umap.all.df_full <- umap.all.df %>%
+  dplyr::left_join(c.anno, by=c("Cell" = "X"))
+
+
+mes_only <- umap.all.df_full %>% dplyr::filter(CellType == "Mesenchymal") %>%
+  dplyr::filter(V2 > 5)
+
+
+png(file.path(outDir_cur, "Mes_by_embryoSort.png"), width = 1500, height=1000)
+ggplot(mes_only, aes(x=V1, y=V2, colour=Dataset)) +
+  geom_point() +
+  gghighlight(use_direct_label = FALSE) +
+  facet_wrap(~Dataset) +
+  theme(legend.position = "right") +
+  #scale_colour_manual(values=c(pal.10[1:9], "grey30", clus_col[1:8], "grey30", clus_col[10])) +
+  pTheme
+dev.off()
+
+png(file.path(outDir_cur, "Mes_by_embryoSort_byGroup.png"), width = 1500, height=1000)
+ggplot(umap.all.df_full, aes(x=V1, y=V2, colour=Dataset)) +
+  geom_point() +
+  gghighlight(use_direct_label = FALSE) +
+  facet_wrap(~Dataset) +
+  theme(legend.position = "right") +
+  #scale_colour_manual(values=c(pal.10[1:9], "grey30", clus_col[1:8], "grey30", clus_col[10])) +
+  pTheme
+dev.off()
+
+
+# Find the percentage of cells in the mes group
+mes_only <- mes_only %>%
+  dplyr::mutate(MES_group = if_else(V1 <=-7.5, "C10", "C9")) 
+
+tt <- table(mes_only$Dataset, mes_only$MES_group)
+more0 <- tt[,1] > 0
+tt <- tt[more0,]
+ttPerc <- ClusterPerc(tt)
+
+```
+
+```{r}
+
+# Or percentage of everything
+toRemove <- umap.all.df %>%
+  # Remove contminanting mesencyme
+  dplyr::filter(CellType == "Mesenchymal" & V2 < 5) 
+
+group_all <- umap.all.df %>%
+  dplyr::filter(!Cell %in% toRemove$Cell) %>%
+  dplyr::mutate(
+    Group = 
+      case_when(CellType == "Mesenchymal" & V2 > 5 & V1 <= -7.5 ~ "C10",
+                CellType == "Mesenchymal" & V2 > 5 & V1 > -7.5 ~ "C09",
+                TRUE ~ "NonMes") 
+    ) %>%
+  dplyr::left_join(c.anno, by=c("Cell" = "X"))
+
+tt <- table(group_all$Dataset, group_all$Group)
+more0 <- tt[,1] > 0
+tt <- tt[more0,]
+ttPerc <- ClusterPerc(tt)
+```
+  
+
+Lets show the expression of the 'SMA' and 'other' mesenchyme. This is just based on Nancy's data
+
+```{r}
+umap.df2 <- umap.df
+
+g <- "Acta2"
+goi <- c("Mcam", "Acta2", "Pdgfra", "Ptn")
+umap.df2$Gene <- seuNancy[["RNA"]]@data[g,]
+
+umap.df2 <- umap.df2 %>%
+  dplyr::arrange(desc(-Gene))
+
+
+# Store UMAP dim
+umap.df.cor <- as.matrix(umap.df[,1:2])
+colnames(umap.df.cor) <- c("UMAP_1", "UMAP_2")
+row.names(umap.df.cor) <- umap.df$Cell
+seuNancy[["umap"]] <- CreateDimReducObject(embeddings = umap.df.cor, key = "UMAP_", assay = DefaultAssay(seuNancy))
+
+#head(Embeddings(seuNancy, reduction = "umap")[, 1:5])
+
+# test
+#goi <- row.names(seuNancy)[int]
+#seuNancy <- RunPCA(seuNancy, features = goi)
+#seuNancy <- RunUMAP(seuNancy, dims = 1:10)
+
+#colorset <- c('gray', brewer.pal(n = 9, "RdYlBu"))
+#ggplot(umap.df2, aes(x=V1, y=V2, colour = Gene)) +
+#    geom_point(size=1.5, alpha=0.8) +
+#  scale_fill_gradient()
+
+umap.df2_sub <- umap.df2 %>%
+  dplyr::filter(V2 > 7.2) %>%
+  dplyr::mutate(MES_group = if_else(V1 <=-7.5, "C10", "C9"))
+
+
+ggplot(umap.df2_sub, aes(x=V1, y=V2)) +
+  geom_point(aes(colour=MES_group))
+
+# Violin
+ggplot(umap.df2_sub, aes(x=MES_group, y=Gene, colour=MES_group)) +
+    #geom_boxplot() +
+    geom_violin(fill=NA, scale="width") +
+    #geom_quasirandom(groupOnX=TRUE, size = 0.8, alpha = 0.5, width = 0.4) +
+    #stat_summary(fun.y = mean, fun.ymin = mean, fun.ymax = mean,
+    #             geom = "crossbar", width = 0.3, alpha = 0.8, colour="black") +
+    #scale_colour_manual(values=pal) +
+    theme_bw() +
+    theme(legend.position = "none",
+          panel.grid.major = element_line(linetype = "blank"), 
+          panel.grid.minor = element_line(linetype = "blank"),
+          axis.text.x = element_text(angle = 45, hjust = 1)) +
+    labs(#x = paste0("Group: ", CellType), 
+         y = "Normalised Expression", 
+         title = paste0("Expression of ", g))
+  
+  
+# bar
+# First generate table to summarise expression in each cluster  
+exp_avg_tbl <- umap.df2_sub %>%
+    dplyr::mutate(exp_norm = (Gene)) %>%
+    group_by(MES_group) %>%
+    dplyr::summarize(
+      num_cells = n(),
+      avg_exp_norm = mean(exp_norm),
+      avg_exp_log = mean(Gene),
+      std_dev_norm = sd(exp_norm),
+      std_dev_log = sd(Gene)
+    ) %>%
+    dplyr::mutate(
+      std_err_norm = std_dev_norm / sqrt(num_cells),
+      std_err_log = std_dev_log / sqrt(num_cells)
+    )
+  
+  # Then do the plotting
+pBarGene <-
+    ggplot(exp_avg_tbl, aes(x = MES_group, y = avg_exp_norm)) +
+    geom_col(aes(fill = MES_group), size = 0.5, width = 0.5) +
+    geom_errorbar(
+      aes(ymin = avg_exp_norm - std_err_norm, ymax = avg_exp_norm + std_err_norm),
+      width = 0.1, size = 0.5) +
+    #scale_fill_manual(values = pal) +
+    theme_bw() +
+    theme(
+      legend.position = "none",
+      strip.background = element_blank(),
+      strip.placement = "outside",
+      panel.spacing.x = unit(0.1, "lines"),
+      axis.text.x = element_text(angle = 45, hjust = 1)
+    ) +
+    labs(#x = paste0("Group: ", meta.to.plot), 
+         y = "Mean logNormalised Expression") +
+  ggtitle(g)
+  
+
+
+
+# Seurat plot  
+seuNancy_sub <- seuNancy[,umap.df$V2 > 7.2]
+FeaturePlot(seuNancy_sub, features = goi, pt.size = 1, reduction="umap")
+
+# Barplot of everything
+m <- seuNancy_sub[["RNA"]]@data[goi,]
+m <- as.data.frame(m)
+m$gene <- row.names(m)
+colnames(m) <- colnames(seuNancy_sub)
+m <- melt(m)
+colnames(m)[1] <- "gene"
+
+m <- m %>%
+  dplyr::left_join(umap.df2_sub, by = c("variable" = "Cell"))
+
+# First generate table to summarise expression in each cluster  
+exp_avg_tbl <- m %>%
+    dplyr::mutate(exp_norm = (value)) %>%
+    group_by(MES_group, gene) %>%
+    dplyr::summarize(
+      num_cells = n(),
+      avg_exp_norm = mean(exp_norm),
+      avg_exp_log = mean(value),
+      std_dev_norm = sd(exp_norm),
+      std_dev_log = sd(value)
+    ) %>%
+    dplyr::mutate(
+      std_err_norm = std_dev_norm / sqrt(num_cells),
+      std_err_log = std_dev_log / sqrt(num_cells)
+    )
+  
+  # Then do the plotting
+pBarGene <-
+    ggplot(exp_avg_tbl, aes(x = MES_group, y = avg_exp_norm)) +
+    geom_col(aes(fill = MES_group), size = 0.5, width = 0.5) +
+    geom_errorbar(
+      aes(ymin = avg_exp_norm - std_err_norm, ymax = avg_exp_norm + std_err_norm),
+      width = 0.1, size = 0.5) +
+    #scale_fill_manual(values = pal) +
+    theme_bw() +
+    theme(
+      legend.position = "none",
+      strip.background = element_blank(),
+      strip.placement = "outside",
+      panel.spacing.x = unit(0.1, "lines"),
+      axis.text.x = element_text(angle = 45, hjust = 1)
+    ) +
+    labs(#x = paste0("Group: ", meta.to.plot), 
+         y = "Mean logNormalised Expression") +
+  facet_wrap(.~gene, scales = "free_y") +
+  NULL
+
+pBarGene
+
+# Get stats
+ggplot(m, aes(x = MES_group, y = value)) +
+  geom_boxplot() +
+  geom_signif(
+    test = "t.test",
+    colour="black",
+    #y_position = c(15,17),
+    comparisons = 
+      list(c("C9", "C10")),
+    map_signif_level = TRUE, textsize=2) +
+  facet_wrap(.~gene, scales = "free_y") +
+  NULL
+
+
+```
+
+
+
