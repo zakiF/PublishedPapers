@@ -1,13 +1,3 @@
----
-title: "README"
-author: "Zaki Fadlullah"
-date: "06 June 2016"
-output: html_document
----
-
-## Documenting the workflow and codes
-
-This repositorie contains the workflow and codes for the various high throuput sequencing project conducted in the Stem Cell Biology and Stem Cell Haematopoiesis group. 
-
+This repository contains the workflow and codes part of manuscripts publication
 
 
