@@ -1,0 +1,831 @@
+---
+title: "Parsing XML"
+date: "2022-11-28"
+output: 
+  html_document:
+    toc: true
+    toc_float:
+      collapsed: true
+    toc_depth: 3
+    number_sections: true
+    theme: lumen
+---
+
+# Background
+
+We want to mine clinicaltrials.gov[https://clinicaltrials.gov/] and extract serious adverse events after adminstration of immunotherapy drugs. The entire set of clinical trials data can be downloaded at https://clinicaltrials.gov/ct2/resources/download. Navigate to the section *Downloading All Study Record Content for Analysis*. 
+
+# Objectives
+
+1. Familiarize with XML package
+    + Analyse 1 XML file 
+2. Apply the workflow to all XML file downloaded
+3. Save the DF
+  
+
+# Pre-processing 
+
+## Loading packages
+
+```{r, message=FALSE, warning=FALSE}
+library(here)
+library(tidyverse)
+library(XML)
+library(xml2)
+library(methods) #install.packages("methods")
+library(stringr)
+```
+
+
+## Directories
+
+```{r}
+wd <- list()
+wd$main <- here()
+wd$data <- file.path(wd$main, "data")
+wd$dataP <- file.path(wd$data, "processed")
+wd$output <- file.path(wd$main, "output")
+wd$script <- file.path(wd$main, "scripts")
+```
+
+
+Create directories
+
+```{r}
+if (!file.exists(wd$output )) {
+  dir.create(wd$output )
+} else {
+  print("Directory already exists")
+}
+```
+
+Load functions
+
+```{r}
+source(file.path(wd$script, "functions.R"))
+```
+
+Drugs we are interested to query are listed in `functions.R`
+
+
+# Objective 1
+
+Here we try to read only 1 XML file. Mainly to set-up the scripts and see if we can extract the required info
+
+
+```{r}
+# Some example files
+f1 <- file.path(wd$data, "clin_trials/AllPublicXML/NCT0383xxxx/NCT03834623.xml") # Example with results column (used to set up script)
+#f1 <- file.path(wd$data, "clin_trials/AllPublicXML/NCT0002xxxx/NCT00025181.xml") # No results gives error in function, use as exaple to de-bug
+#f1 <- file.path(wd$data, "clin_trials/AllPublicXML/NCT0230xxxx/NCT02301039.xml")
+#f1 <- file.path(wd$data, "clin_trials/AllPublicXML/NCT0006xxxx/NCT00060372.xml") # This study have no results column
+#f1 <- file.path(wd$data, "clin_trials/AllPublicXML/NCT0135xxxx/NCT01354431.xml") # This study has 3 arms
+#f1 <- file.path(wd$data, "clin_trials/AllPublicXML/NCT0158xxxx/NCT01585987.xml") #  Two cohort but 3 serious events?
+#f1 <- file.path(wd$data, "clin_trials/AllPublicXML/NCT0147xxxx/NCT01472081.xml") #  Study with 5 arms
+
+# --- Some uncessfull or sub=optimal attempt --- $
+#  those as the "data nodes", ignoring the others.
+# f = system.file("exampleData", "tides.xml", package = "XML")
+# doc = xmlParse(f1)
+#d1 <- xmlToDataFrame(nodes = xmlChildren(xmlRoot(doc)[["clinical_results"]]))
+
+#xml_data <- xmlToList(doc)
+
+#location <- as.list(xml_data[["arm_group"]][["sponsors"]])
+#rr <- as.list(xml_data[["clinical_results"]])
+
+# Try to read nested xml [https://medium.com/geekculture/reading-xml-files-in-r-3122c3a2a8d9]
+
+# study_data <- read_xml(f1) %>% as_list()
+# study_data_sub <- study_data$clinical_study$clinical_results$reported_events
+# study_tb = tibble::as_tibble(study_data) %>% tidyr::unnest_longer('clinical_study')
+```
+
+
+We found  an approach that is currently working. The script below extacts some information from the XML, but does not include the number of serious adverse event. 
+
+```{r}
+# Read the xml file
+df <- read_xml(f1)
+
+# ------------------ #
+# Extracting study ID (clinical trials gov study ID)
+# ------------------ #
+xml_study_id <- 
+  xml_text(
+    xml_find_all(df, 
+                 xpath = "//nct_id"))
+
+# ------------------ #
+# Extracting study status (has the study been completed)
+# ------------------ #
+xml_study_status <- 
+  xml_text(
+    xml_find_all(df, 
+                 xpath = "//overall_status"))
+
+# ------------------ #
+# Extracting if the study reported the results (some studies don't report the results)
+# ------------------ #
+xml_result_status <- 
+  xml_text(
+    xml_find_all(df, 
+                 xpath = "//clinical_results"))
+
+
+# ------------------ #
+# Extracting condition (cancer type)
+# ------------------ #
+xml_cond <- 
+  xml_text(
+    xml_find_all(df, 
+                 xpath = "//condition"))
+
+# ------------------ #
+# Extracting drug given in each arm of the study (intervention type)
+# ------------------ #
+xml_intervention <- 
+  xml_text(
+    xml_find_all(df, 
+                 xpath = "//intervention_name"))
+
+# ------------------ #
+# Extracting the study arm (how many variations to the study, different dose / drugs)
+# ------------------ #
+# Number of arm
+xml_arm <- 
+  xml_text(
+    xml_find_all(df, 
+                 xpath = "//number_of_arms"))
+
+# Title / name of arm
+xml_arm_name <- 
+  xml_text(
+    xml_find_all(df, 
+                 xpath = "//arm_group/arm_group_label"))
+
+# Name of group based on clinical results
+xml_clin_group <- 
+  xml_text(
+    xml_find_all(df, 
+                 xpath = "//clinical_results/participant_flow/group_list/group/title"))
+
+
+# ------------------ #
+# Extracting titles (irAE category)
+# ------------------ #
+# Extract the Main text
+ser_event_title <- 
+  xml_text(
+    xml_find_all(df, 
+                 xpath = "//reported_events/serious_events/category_list/category/title"))
+
+# Extract the Sub title text
+ser_event_subTitle <- 
+  xml_text(
+    xml_find_all(df, 
+                 xpath = "//reported_events/serious_events/category_list/category/event_list/event/sub_title"))
+
+
+```
+
+
+Summarize the data as a data frame
+
+```{r}
+# Df 1 - Study info 
+df_study_info <- data.frame(
+  study_id = xml_study_id,
+  study_status = xml_study_status,
+  intervention = paste(xml_intervention, collapse = "_"),  
+  condition = xml_cond,
+  arm_num = xml_arm,
+  arm_title = xml_arm_name,
+  clin_group = xml_clin_group)
+```
+
+
+
+The next part of quering the XML file is to extract the number of serious adverse event. This is a bit more tricky to extract
+
+```{r}
+# ------------------ #
+# Extracting number of cases with severe irAE 
+# ------------------ #
+
+# ------- DID NOT WORK ---------- #
+
+# Approach 1
+## Building a manual list and extracting info
+#study_data <- read_xml(f1) %>% as_list()
+#£study_data_sub <- study_data$clinical_study$clinical_results$reported_events$serious_events$category_list # Serious events columns
+
+# If we take one serious event as an example
+#tm_list_2 <- study_data_sub[1] # subset to one category 
+#tm_list_3 <- tm_list_2$category$event_list$event # This is where the number is
+
+# https://community.rstudio.com/t/extracting-from-nested-list/17016/2
+#extract_col <- function(l, col) {
+#  unlist(attributes(l)[col])
+#}
+
+#tm_list_3 %>% map_df(extract_col, "group_id") # Gives the group info
+#tm_list_3 %>% map_df(extract_col, "subjects_affected") # Number of patients with the serious effects
+#tm_list_3 %>% map_df(extract_col, "subjects_at_risk") # Number of patients in the study
+
+# Approach 2 [NOT WORKING]
+## Using a xml_find function to extract interested column
+#ser_event_list <- 
+#  xml_find_all(df, xpath = "//reported_events/serious_events/category_list/category") %>%
+#  as_list() 
+
+
+# Script not working below, we cant extract the interested attributes. So stick with approach one
+#extract_col <- function(l, col) {
+#  unlist(attributes(l$event_list$event$counts)[col])
+#}
+#ser_event_list[1] %>% map_df(extract_col, "group_id")
+
+# ------- DID NOT WORK ---------- #
+
+
+# ----- Current workflow ------ #
+
+# Find the path which has the irAE event numbers
+dat_path <- df %>% xml_find_all( '//counts') %>% xml_path # 42 lines
+# Limit to serious effects
+dat_path <- dat_path[grep("serious_events", dat_path) ]
+
+#length(dat_path)
+#head(dat_path)
+
+# Now for one of the path found, extract the attributes
+ser_event_num <- 
+  xml_attrs(
+    xml_find_all(df, 
+                 xpath = "//reported_events/serious_events/category_list/category[12]/event_list/event/counts[1]"))
+# ser_event_num # the output is a list of values
+
+# Un-list the results
+un_event <- unlist(ser_event_num)
+group_id <- un_event["group_id"]
+num_case <- un_event["subjects_affected"]
+tot_case <- un_event["subjects_at_risk"]
+
+
+# Now for all of the path found, extract the attributes using a loop
+
+group_id <- vector()
+num_case <- vector()
+tot_case <- vector()
+
+
+for (i in seq_along(dat_path)){
+  ser_event_num <- 
+    xml_attrs(xml_find_all(df, xpath = dat_path[i]))
+  
+  un_event <- unlist(ser_event_num)
+  
+  group_id[i] <- un_event["group_id"]
+  num_case[i] <- un_event["subjects_affected"]
+  tot_case[i] <- un_event["subjects_at_risk"]
+
+}
+
+df_out <- data.frame(
+  group_id = group_id,
+  num_case = num_case,
+  tot_case = tot_case)
+
+
+# Some studies list fewer arm than results (eg - NCT01585987.xml), in cases like this we get the max arm as defined by the study 
+max_arm <- length(xml_arm_name)
+# As arm is listed as E1, E2 E3 ....etc, we generate Ex according to max arm number
+e_arm <- paste0("E", 1:max_arm)
+# Filter event to only these category
+df_out <- df_out %>%
+  dplyr::filter(group_id %in% e_arm)
+
+
+
+# ----- Current workflow ------ #
+```
+
+
+Once we have the  1) Study information 2) Number of serious adverse event,  we compile it into data frame
+
+```{r}
+# Df 1 - Study info 
+
+
+# Df 2- serious event numbers
+inf_fac <- max_arm # Some studies have multiple arms, resulting in each irAE listed multiple times. Find the number of arms
+
+df_ser_number <- df_out %>%
+  dplyr::mutate(study_id = xml_study_id,
+                arm_title = rep(xml_arm_name, times=length(ser_event_subTitle)),
+                serEvent = rep(ser_event_subTitle, each=inf_fac))
+  
+```
+
+# Objective 2
+
+Lets try to run this all in all studies in a folder. 
+
+```{r}
+list_files <- 
+  #list.files(file.path(wd$data, "NCT_test/"),
+  list.files(file.path(wd$data, "clin_trials/AllPublicXML/"),
+  recursive = TRUE,
+  pattern = ".xml",
+  full.names = TRUE)
+```
+
+
+Some bash processing to reduce file number
+
+Some studies have no result , so we use bash to identify which studies did not report their results. We  remove the study with no results. 
+
+```{base, eval=FALSE}
+cd /Users/zakiwilmot/Library/CloudStorage/Box-Box/Projects/ZW_005_irAE_database/analysis/data/clin_trials/AllPublicXML
+grep("Results have not yet been posted", * > ../no_resutls.txt)
+```
+
+We also use bash to find any studies with these drugs
+
+```{base, eval=FALSE}
+# Takes soo long - Find a way to do this in R -- TO DO 
+grep -E -i -r \
+    "Ipilimumab|Yervoy|BMS-734016|MDX-010|MDX-101| \
+    Nivolumab|Opdivo|ONO-4538|BMS-936558|MDX1106| \
+    Pembrolizumab|Keytruda|MK-3475|lambrolizumab| \
+    Atezolizumab|Tecentriq|MPDL3280A|RG7446| \
+    Durvalumab|Imfinzi|MEDI4736|MEDI-4736| \
+    Avelumab|Bavencio|MSB0010718C| \
+    Cemiplimab|Libtayo|REGN-2810|REGN2810|cemiplimab-rwl| \
+    Relatlimab|BMS-986016|relatlimab-rmbw| \
+    Dostarlimab|Jemperli|TSR-042|WBP-285|dostarlimab-gxly| \
+    Tremelimumab|Imjudo|tremelimumab-actl|ticilimumab|CP-675" \
+    * > ../immuno_results.txt
+
+```
+
+
+Exclude processing files with no results. Read in the list of file with no results (based on our bash result above)
+
+```{r}
+no_res <- read.delim(file.path(wd$data, "processed/no_results.txt"), header = FALSE) %>%
+  dplyr::mutate(fileName = gsub("\\.xml.*", "", V1),
+                fileName = gsub(".*\\/NCT", "NCT", fileName))
+
+# https://stackoverflow.com/questions/7597559/grep-using-a-character-vector-with-multiple-patterns
+list_file_bn <- basename(list_files) 
+list_file_bn <- gsub("\\.xml", "", list_file_bn)
+
+# Df is easier
+
+df_list <- data.frame(
+  full_path = list_files,
+  baseName = list_file_bn)
+
+df_list_sub <- df_list %>% dplyr::filter(!baseName %in% no_res$fileName)
+```
+
+Read the result of files with the immuno drugs
+
+```{r}
+df_imu <- read.delim(file.path(wd$data, "processed/immuno_results.txt"), header = FALSE) %>%
+  dplyr::mutate(fileName = gsub("\\.xml.*", "", V1),
+                fileName = gsub(".*\\/NCT", "NCT", fileName))
+
+imu <- unique(df_imu$fileName)
+
+df_list_sub <- df_list_sub %>% dplyr::filter(baseName %in% imu)
+```
+
+
+The filtered list of files that we are interested in
+
+```{r}
+list_files_sub <- df_list_sub$full_path
+```
+
+
+## First pass 
+
+> SKIP for now as we used bash to find files that has immuno 
+
+In the first pass we want to read all the files and find studies with immuno drugs
+
+```{r,eval=FALSE}
+
+list_1 <- list()
+
+# Run the workflow
+for (i in seq_along(list_files_sub)){
+  
+  # Read file
+  df <- read_xml(list_files_sub[i])
+  
+# ------------------ #
+# Extracting study ID (clinical trials gov study ID)
+# ------------------ #
+xml_study_id <- 
+  xml_text(
+    xml_find_all(df, 
+                 xpath = "//nct_id"))
+
+#print(xml_study_id)
+# ------------------ #
+# Extracting study status (has the study been completed)
+# ------------------ #
+xml_study_status <- 
+  xml_text(
+    xml_find_all(df, 
+                 xpath = "//overall_status"))
+
+# ------------------ #
+# Extracting if the study reported the results (some studies don't report the results)
+# ------------------ #
+xml_result_status <- 
+  xml_text(
+    xml_find_all(df, 
+                 xpath = "//clinical_results"))
+
+
+# ------------------ #
+# Extracting condition (cancer type)
+# ------------------ #
+xml_cond <- 
+  xml_text(
+    xml_find_all(df, 
+                 xpath = "//condition"))
+
+# ------------------ #
+# Extracting drug given in each arm of the study (intervention type)
+# ------------------ #
+xml_intervention <- 
+  xml_text(
+    xml_find_all(df, 
+                 xpath = "//intervention_name"))
+
+# ------------------ #
+# Extracting the study arm (how many variations to the study, different dose / drugs)
+# ------------------ #
+# Number of arm
+xml_arm <- 
+  xml_text(
+    xml_find_all(df, 
+                 xpath = "//number_of_arms"))
+
+# Title / name of arm
+xml_arm_name <- 
+  xml_text(
+    xml_find_all(df, 
+                 xpath = "//arm_group/arm_group_label"))
+
+# Name of group based on clinical results
+xml_clin_group <- 
+  xml_text(
+    xml_find_all(df, 
+                 xpath = "//clinical_results/participant_flow/group_list/group/title"))
+
+# Extract the reported event arm
+ser_event_armTitle <- 
+  xml_text(
+    xml_find_all(df, 
+                 xpath = "//reported_events/group_list/group/title"))
+
+# ----------------------------- #
+# --- Generating main DF ---- #
+# ----------------------------- #
+
+# Return required info, as some columns may be empty, we use the if_else function
+# Df 1 - Study info 
+df_study_info <- data.frame(
+  
+  study_id = 
+    if_else(length(xml_study_id) >=1, 
+            xml_study_id,"none",missing = NULL),
+  study_status = 
+    if_else(length(xml_study_status) >=1, 
+            xml_study_status,"none",missing = NULL),
+  #result_status =
+  #  if_else(length(xml_result_status) >=1, 
+  #          paste(xml_result_status, collapse = "_"),"none", missing = NULL),
+  intervention = 
+    if_else(length(xml_intervention) >=1, 
+            paste(xml_intervention, collapse = "_"),"none", missing = NULL),
+  condition = 
+    if_else(length(xml_cond) >=1, 
+            paste(xml_cond, collapse = "_"),"none", missing = NULL),
+  arm_num = 
+    if_else(length(xml_arm) >=1, 
+            paste(xml_arm, collapse = "_"),"none", missing = NULL),
+  arm_title = 
+    if_else(length(xml_arm_name) >=1, 
+            paste(xml_arm_name, collapse = "_"),"none", missing = NULL),
+  clin_group =
+        if_else(length(xml_clin_group) >=1, 
+            paste(xml_clin_group, collapse = "_"),"none", missing = NULL),
+  repEvent_title =
+        if_else(length(ser_event_armTitle) >=1, 
+            paste(ser_event_armTitle, collapse = "_"),"none", missing = NULL)
+  )
+
+list_1[[i]] <- df_study_info
+}
+
+```
+
+Once we extracted the data, we compile everything into one big DF so we search for immuno drugs
+
+```{r, eval=FALSE}
+df_study_info <- do.call(rbind, list_1)
+tt <- df_study_info[1:100,]
+```
+
+We simply search all the files in the data frame for any of the below immunotheraphy drugs
+
+```{r,eval=FALSE}
+# Does not work for some reason, need to debug
+df_study_info_sub <-  df_study_info %>% 
+  filter_all(any_vars(str_detect(., 
+  "(?i)Ipilimumab|Yervoy|BMS-734016|MDX-010|MDX-101|
+  Nivolumab|Opdivo|ONO-4538|BMS-936558|MDX1106|
+  Pembrolizumab|Keytruda|MK-3475|lambrolizumab|
+  Atezolizumab|Tecentriq|MPDL3280A|RG7446
+  Durvalumab|Imfinzi|MEDI4736|MEDI-4736|
+  Avelumab|Bavencio|MSB0010718C|
+  Cemiplimab|Libtayo|REGN-2810|REGN2810|cemiplimab-rwl|
+  Relatlimab|BMS-986016|relatlimab-rmbw|
+  Dostarlimab|Jemperli|TSR-042|WBP-285|dostarlimab-gxly")))
+
+# Also only select COMPLETED study
+df_study_info_sub <- df_study_info_sub %>%
+  dplyr::filter(study_status == "Completed")
+
+```
+
+
+
+## Second pass 
+
+
+Write a loop / function to process the files as we did in objective 1. 
+
+```{r}
+
+list_1 <- list()
+list_2 <- list()
+
+# Run the workflow
+for (i in seq_along(list_files_sub)){
+  
+  # Read file
+  df <- read_xml(list_files_sub[i])
+  
+  # Tried to add a line to skip if the files does not have serious_events, cant seem to wget this to work
+  #if(length(xml_find_all(df, xpath = "//reported_events/serious_events")) >=1 )  {
+  
+
+# ------------------ #
+# Extracting study ID (clinical trials gov study ID)
+# ------------------ #
+xml_study_id <- 
+  xml_text(
+    xml_find_all(df, 
+                 xpath = "//nct_id"))
+
+#print(xml_study_id)
+# ------------------ #
+# Extracting study status (has the study been completed)
+# ------------------ #
+xml_study_status <- 
+  xml_text(
+    xml_find_all(df, 
+                 xpath = "//overall_status"))
+
+# ------------------ #
+# Extracting if the study reported the results (some studies don't report the results)
+# ------------------ #
+xml_result_status <- 
+  xml_text(
+    xml_find_all(df, 
+                 xpath = "//clinical_results"))
+
+
+# ------------------ #
+# Extracting condition (cancer type)
+# ------------------ #
+xml_cond <- 
+  xml_text(
+    xml_find_all(df, 
+                 xpath = "//condition"))
+
+# ------------------ #
+# Extracting drug given in each arm of the study (intervention type)
+# ------------------ #
+xml_intervention <- 
+  xml_text(
+    xml_find_all(df, 
+                 xpath = "//intervention_name"))
+
+# ------------------ #
+# Extracting the study arm (how many variations to the study, different dose / drugs)
+# ------------------ #
+# Number of arm
+xml_arm <- 
+  xml_text(
+    xml_find_all(df, 
+                 xpath = "//number_of_arms"))
+
+# Title / name of arm
+xml_arm_name <- 
+  xml_text(
+    xml_find_all(df, 
+                 xpath = "//arm_group/arm_group_label"))
+
+# Name of group based on clinical results
+xml_clin_group <- 
+  xml_text(
+    xml_find_all(df, 
+                 xpath = "//clinical_results/participant_flow/group_list/group/title"))
+xml_clin_group <- xml_clin_group[!str_detect(xml_clin_group, "Not Enrolled")] # NCT01295827 listed the arm of patients not entorlled but did not list adverse effect, causing error
+#xml_clin_group <- case_when(xml_clin_group == "Arm S: SUN + NIV2" ~ "Arm S: SUN + NIV",
+#                            xml_clin_group == "Arm S: SUN + NIV5" ~ "Arm S: SUN + NIV",
+#                            TRUE ~ xml_clin_group) # NCT01472081 combined the results of two arm
+xml_clin_group <- unique(xml_clin_group) 
+
+# ------------------ #
+# Extracting serious events results
+# ------------------ #
+# Extract the Main text
+ser_event_title <- 
+  xml_text(
+    xml_find_all(df, 
+                 xpath = "//reported_events/serious_events/category_list/category/title"))
+
+# Extract the Sub title text
+ser_event_subTitle <- 
+  xml_text(
+    xml_find_all(df, 
+                 xpath = "//reported_events/serious_events/category_list/category/event_list/event/sub_title"))
+
+tmp_id <- c(xml_study_id,  ser_event_subTitle)
+
+# NCT01497808 did not list one category of serious adverse event, need to manually add
+if(identical(tmp_id, NCT01497808_ser_event_subTitle) == "TRUE"){
+  ser_event_subTitle <-  NCT01497808_new
+}
+else{
+  ser_event_subTitle <- ser_event_subTitle
+}
+
+
+
+
+# Extract the reported event arm
+ser_event_armTitle <- 
+  xml_text(
+    xml_find_all(df, 
+                 xpath = "//reported_events/group_list/group/title"))
+
+# ------------------ #
+# Extracting number of cases with severe irAE 
+# ------------------ #
+# Find the path which has the irAE event numbers
+dat_path <- df %>% xml_find_all( '//counts') %>% xml_path # 42 lines
+# Limit to serious effects
+dat_path <- dat_path[grep("serious_events", dat_path) ]
+
+# For all of the path found, extract the attributes using a loop
+group_id <- vector()
+num_case <- vector()
+tot_case <- vector()
+
+
+for (x in seq_along(dat_path)){
+  ser_event_num <- 
+    xml_attrs(xml_find_all(df, xpath = dat_path[x]))
+  
+  un_event <- unlist(ser_event_num)
+  
+  group_id[x] <- un_event["group_id"]
+  num_case[x] <- un_event["subjects_affected"]
+  tot_case[x] <- un_event["subjects_at_risk"]
+
+}
+#}
+
+df_out <- data.frame(
+  group_id = group_id,
+  num_case = num_case,
+  tot_case = tot_case)
+
+# ----------------------------- #
+# --- Generating main DF ---- #
+# ----------------------------- #
+
+# Return required info, as some columns may be empty, we use the if_else function
+# Df 1 - Study info 
+df_study_info <- data.frame(
+  
+  study_id = 
+    if_else(length(xml_study_id) >=1, 
+            xml_study_id,"none",missing = NULL),
+  study_status = 
+    if_else(length(xml_study_status) >=1, 
+            xml_study_status,"none",missing = NULL),
+  #result_status =
+  #  if_else(length(xml_result_status) >=1, 
+  #          paste(xml_result_status, collapse = "_"),"none", missing = NULL),
+  intervention = 
+    if_else(length(xml_intervention) >=1, 
+            paste(xml_intervention, collapse = "_"),"none", missing = NULL),
+  condition = 
+    if_else(length(xml_cond) >=1, 
+            paste(xml_cond, collapse = "_"),"none", missing = NULL),
+  arm_num = 
+    if_else(length(xml_arm) >=1, 
+            paste(xml_arm, collapse = "_"),"none", missing = NULL),
+  arm_title = 
+    if_else(length(xml_arm_name) >=1, 
+            paste(xml_arm_name, collapse = "_"),"none", missing = NULL),
+  clin_group =
+        if_else(length(xml_clin_group) >=1, 
+            paste(xml_clin_group, collapse = "_"),"none", missing = NULL),
+  repEvent_title =
+        if_else(length(ser_event_armTitle) >=1, 
+            paste(ser_event_armTitle, collapse = "_"),"none", missing = NULL)
+  )
+
+
+# Df 2- serious event numbers
+# Some studies list fewer arm than results (eg - NCT01585987.xml), in cases like this we get the max arm as defined by the study 
+max_arm <- length(ser_event_armTitle)
+#max_arm <- length(xml_clin_group)
+# As arm is listed as E1, E2 E3 ....etc, we generate Ex according to max arm number
+e_arm <- paste0("E", 1:max_arm)
+# Filter event to only these category
+df_out <- df_out %>%
+  dplyr::filter(group_id %in% e_arm)
+
+# Some studies have multiple arms, resulting in each irAE listed multiple times. Find the number of arms. 
+# Some studies list more arm than results (eg -  NCT00112580), in cases like this we reduce the number of arm
+int_fac <- min(c(length(unique(df_out$group_id))), max_arm) # Take the minimum number
+new_group <- vector()
+if(int_fac == max_arm){
+  new_group <- ser_event_armTitle
+}else{
+  new_group <- paste("first_group_only", ser_event_armTitle[1], sep=" ")
+}
+
+df_ser_number <- df_out %>%
+  dplyr::mutate(study_id = xml_study_id,
+                arm_title = rep(new_group, times=length(ser_event_subTitle)),
+                serEvent = rep(ser_event_subTitle, each=int_fac))
+
+  
+list_1[[i]] <- df_study_info
+list_2[[i]] <- df_ser_number
+
+}
+
+```
+
+Save the list files into data frame 
+
+Once we extracted the data, we compile everything into one big DF.
+
+```{r}
+df_study_info <- do.call(rbind, list_1)
+df_av_eff <- do.call(rbind, list_2)
+```
+
+Save the file for future analysis
+
+```{r}
+save(df_study_info,df_av_eff,
+     file=file.path(wd$dataP, "DF_ClinGov_immuno.Rdata"))
+```
+
+
+
+
+# References
+
+Reading XML 
+https://www.delftstack.com/howto/r/read-xml-in-r/
+https://medium.com/geekculture/reading-xml-files-in-r-3122c3a2a8d9
+https://stackoverflow.com/questions/52065772/extracting-attributes-from-xml-file
+https://appsilon.com/r-xml/
+
+
+XML to df https://stackoverflow.com/questions/17198658/how-to-parse-an-xml-file-to-an-r-data-frame
+Nested list 
+https://stackoverflow.com/questions/50367666/extract-contents-from-a-nested-list-in-r
+https://stackoverflow.com/questions/63786411/how-to-unnest-wider-with-loop-over-all-the-columns-containing-lists
+https://community.rstudio.com/t/extracting-from-nested-list/17016
+
+
