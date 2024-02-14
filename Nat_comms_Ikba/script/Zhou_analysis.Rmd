@@ -1,0 +1,829 @@
+---
+title: "Zhou analysis"
+author: "Zaki Wilmot"
+date: "14/03/2024"
+output:
+  html_document:
+    self_contained: yes
+    toc: true
+    toc_float: true
+    df_print: paged
+    number_sections: false
+editor_options: 
+  chunk_output_type: console
+---
+
+# Set-up
+
+Load required library
+
+```{r, warning=FALSE, message=FALSE}
+library(ggplot2)
+library(dplyr)
+library(reshape2)
+library(ggbeeswarm)
+library(gghighlight)
+library(paletteer)
+library(ggsignif)
+
+
+library(DropletUtils)
+library(scater)
+library(Seurat)
+library(Matrix)
+library(UCell)
+library(scran)
+library(limma)
+library(edgeR)
+```
+
+Specify the workspace
+
+```{r}
+workDir <- getwd()
+workDir <- gsub("/scripts", "", workDir)
+dataDir <- file.path(workDir, "data")
+outDir <- file.path(workDir, "output")
+dir.create(outDir)
+
+set.seed(100)
+```
+
+> Knitr was reurning error when 'file.path()' was used. So we had to use full path to read in files. Please edit accordingly
+
+Some colour scheme
+
+```{r}
+pal.tmp <- paletteer::paletteer_d("ggthemes::Tableau_20", 20)
+pal.tmp2 <- c("#8CD17DFF",  
+              "#D4A6C8FF", pal.tmp[11], pal.tmp[12], 
+              pal.tmp[1], pal.tmp[2],
+              "#9D7660FF")
+```
+
+Small function
+
+```{r}
+# Capitilisation of first letter
+simpleCap <- function(x) {
+  x <- tolower(x)
+  s <- strsplit(x, " ")[[1]]
+  paste(toupper(substring(s, 1,1)), substring(s, 2),
+        sep="", collapse=" ")
+}
+
+# -------- Calculating dropout ------ #
+dropOut_Pop <- function(se, POP){
+  se_sub <- se[, se$Population %in% POP]
+  
+  gene_qc <- scater::perFeatureQCMetrics(se_sub)
+  
+  drp <- gene_qc$detected
+  
+  return(drp)
+}
+```
+
+
+# Pre-processing
+
+We prepare reference genome, download sequencing files and perform mapping
+
+## Reference genome
+
+We use the 10x reference genome. Reference genome can be downloaded from the download link provided at https://support.10xgenomics.com/single-cell-gene-expression/software/downloads/latest.
+
+```{bash, eval=FALSE}
+# 10x reference and GTF can be downloaded using wget
+wget https://cf.10xgenomics.com/supp/cell-exp/refdata-gex-mm10-2020-A.tar.gz
+```
+
+
+## STAR preparation
+
+We used STAR version: 2.7.9a. Using the STAR solo command 
+
+STAR index was generated as follows. 
+
+```{bash, eval=FALSE}
+ml apps/star/2.7.9a
+
+# Based on the guide https://github.com/alexdobin/STAR/blob/master/docs/STARsolo.md#multi-gene-reads
+# To make the agreement between STARsolo and CellRanger even more perfect, you can add
+# --genomeSAsparseD 3
+
+
+STAR \
+--runMode genomeGenerate \
+--genomeDir ${outIndex} \
+--genomeFastaFiles ${faFile} \
+--sjdbGTFfile ${gtfFile} \
+--genomeSAsparseD 3 \
+--runThreadN 5
+```
+
+
+STAR mapping was done as follows
+
+```{bash, eval=FALSE}
+STAR \
+--runThreadN 6 \
+--soloType SmartSeq \
+--readFilesCommand zcat \
+--genomeDir <STAR_inde_location> \
+--readFilesManifest <manifest_file_location> \
+--outSAMattrRGline <manifest_file_location> \
+--soloUMIdedup Exact \
+--soloStrand Unstranded \
+--soloFeatures Gene GeneFull \
+--soloMultiMappers EM \
+--genomeLoad NoSharedMemory \
+--outSAMtype BAM SortedByCoordinate
+```
+
+
+## SRA download
+
+
+The original publication of this paper is from https://www.nature.com/articles/nature17997. However we downloaded this data from SRA
+
+```{r}
+outDir_Zhou <- file.path(outDir, "Zhou_2016")
+dir.create(outDir_Zhou)
+```
+
+
+There was no processed data provided, so we download the data from GEO
+
+```{bash, eval=FALSE}
+# 1) Donaload the list of SRA files
+# 2) Use the sratoolkit module in cluster to download the SRA files
+#  A table of files we want to download is in the data folder
+prefetch --option-file SraAccList.txt
+
+# Once data is downloaded by prefetch, we need to process using fasstq-dump convert SRA file to fasta file
+fastq-dump --split-e  SRR1922583.sra
+
+# Then we map the data with STAR solo, as we have done with the Next-seq and Smart-Seq2 data
+# To map with star solo, we need to supply the manifest file ls -1 $PWD/* > ../tmp.list.txt
+```
+
+
+# Analysis
+
+# Generate single cell object
+
+Generate the single cell object
+
+```{r}
+# zhou.sce <- DropletUtils::read10xCounts(file.path(dataDir, "STAR_solo_output/Zhou_STARsolo/filtered"))
+
+# Knitr gave error when reading, so we just load the saved data directly with full path
+load("~/Desktop/Nat_comms_Ikba/data/zhou.sce.Rdata")
+se <- zhou.sce
+```
+
+
+To annotate the genes further, we import the GTF file
+
+```{r}
+#simple_gtf <- read.delim(file.path(dataDir, "simple_gtf.txt"))
+# Error with knitr again
+simple_gtf <- read.delim("~/Desktop/Nat_comms_Ikba/data/simple_gtf.txt")
+
+# Combine GTF with sc object
+simple_gtf_sub <- simple_gtf %>%
+  select(gene_id, gene_type, seqnames)
+rD <- rowData(se) %>%
+  as.data.frame() %>%
+  left_join(simple_gtf_sub, by = c("ID" = "gene_id"))
+```
+
+
+Add cell metaData
+
+```{r}
+# Read the file accompanying the SRA file
+mData_SRA <- read.csv("~/Desktop/Nat_comms_Ikba/data//GEO_download/Zhou_2016/SraRunTable_Zhou2016.csv")
+# Read the manifest file used as input to STAR solo
+mData_starSolo <- read.delim("~/Desktop/Nat_comms_Ikba/data/GEO_download/Zhou_2016/manifest_Zhou.txt",header=FALSE)
+
+# We need to link the SRA name with the population identifier (eg T1 pre-HSC, T2 pre-HSC) with the name of the cells as named by STARsolo during mapping
+mData_1<- mData_SRA %>%
+  dplyr::select(Run, cell_type)
+mData_2 <- mData_starSolo %>%
+  mutate(Run = gsub("_1.fastq", "", V1),
+         Run = gsub(".*fastq/", "", Run)) %>%
+  dplyr::rename(Barcode = V3) %>%
+  dplyr::select(Run, Barcode)
+mData_comb <- left_join(mData_1, mData_2)
+
+
+# Combine with cell annotation
+cD <- colData(se) %>%
+  as.data.frame() %>%
+  left_join(mData_comb, by = c("Barcode" = "Barcode")) %>%
+  dplyr::select(-Sample) %>%
+  dplyr::rename(condition = cell_type)
+```
+
+Rename the populations in the Zhou data
+
+```{r}
+table(cD$condition)
+```
+
+
+New names
+
+```{r}
+# Make a factor level
+Zhou_lvl <- c("AGM_E11.0_Endo", "AGM_E11.0_T1_preHSC_CD201neg", "AGM_E11.0_T1_preHSC_CD201hig",
+              "AGM_E11.0_T2_preHSC_CD201hig", "AGM_E11.0_T2_preHSC",
+              "FL_E12.0_HSC", "FL_E14.0_HSC",
+              "BM_Adult_HSC")
+
+# Rename
+NewName <- cD$condition
+NewName <- dplyr::case_when(
+  NewName == 'endothelial cells' ~ "AGM_E11.0_Endo",
+  NewName == 'T1 CD201-: CD31+CD45-CD41low c-Kit+CD201low/-' ~ "AGM_E11.0_T1_preHSC_CD201neg",
+  NewName == 'Type1 pre-HSCs' ~ "AGM_E11.0_T1_preHSC_CD201hig",
+  
+  NewName == 'T2 pre-HSCs' ~ "AGM_E11.0_T2_preHSC_CD201hig",
+  NewName == 'Type2 pre-HSCs' ~ "AGM_E11.0_T2_preHSC",
+  
+  NewName == 'E12 HSCs' ~ "FL_E12.0_HSC",
+  NewName == 'E14 HSCs' ~ "FL_E14.0_HSC",
+  NewName == 'Haematopoietic stem cells' ~ "BM_Adult_HSC",
+  
+)
+NewName <- factor(NewName, levels=Zhou_lvl)
+
+cD$condition <- NewName
+```
+
+Add new colData and rowData to se object
+
+```{r}
+colData(se) <- DataFrame(cD)
+rowData(se) <- DataFrame(rD)
+```
+
+
+## Filtering low-quality cells
+
+Our first aim is to remove low-quality cells. For all of the run, we apply a threshold to filter the cells. We will use the follwoing 
+
+* Number of genes detected
+* Percentage of Mitochondira reads
+* Percentage of Hemoglobin (Hbb) genes
+
+
+
+Find the QC of specific genes
+
+```{r}
+# Specific the location
+MT_gene <- rD$seqnames == "chrM"
+Hbbs <- rD[grepl("Hb[a-b]", rD$Symbol),] %>% pull(Symbol)
+Hbbs <- c(Hbbs, "Gypa")
+#Hbbs <- c("Hba-x", "Hbb-bh1", "Hbb-y", "Hba-a1")
+
+# Get the Ens ID
+Hb_ens <- rD %>%
+  dplyr::filter(Symbol %in% Hbbs)
+Hbb_gene <- rowData(se)$ID %in% Hb_ens$ID
+```
+
+We examine the distibution of the data in all the run
+
+```{r}
+df_cData <- 
+  perCellQCMetrics(se,
+                   subsets=list(Mito=MT_gene,
+                                Hbb=Hbb_gene)) %>%
+  cbind(as.data.frame(colData(se))) %>%
+  as.data.frame() %>%
+  dplyr::mutate(Cell = colnames(se))
+
+
+# To plot select a subset of columns
+df_cData_sub <- as.data.frame(df_cData) %>%
+  #tibble::rownames_to_column(var = "Cell") %>%
+  dplyr::select(Barcode, sum, detected, subsets_Mito_percent, subsets_Hbb_percent, condition)
+
+
+
+m <- melt(df_cData_sub)
+```
+Plot the distribution 
+
+```{r}
+ggplot(m, aes(x=condition, y=value, colour=condition)) +
+  geom_boxplot(aes(),fill=NA) +
+  geom_quasirandom(dodge.width=0.75) +
+  theme_bw()  +
+  facet_wrap(~variable, scales = "free_y") +
+  theme(axis.text.x = element_text(angle = 45)) +
+  NULL
+```
+
+
+Lets apply a cut-off
+
+```{r}
+df_cData_fil <- df_cData_sub %>%
+  dplyr::filter(
+    detected > 2000,
+    subsets_Mito_percent < 15,
+    subsets_Hbb_percent < 10)
+```
+
+
+Subset the sc object
+
+```{r}
+se <- se[,se$Barcode %in% df_cData_fil$Barcode]
+```
+
+
+
+## Convert to gene symbol 
+
+To enable a user-friendly analysis, it is convenient to exchange the ENSEMBL IDs with the name of the genes. 
+
+For duplicated gene names, we merge them with the ENSEMBL IDs to avoid confusion.
+
+
+```{r}
+new.row.names <- uniquifyFeatureNames(
+    rowData(se)$ID,
+    rowData(se)$Symbol
+)
+
+rownames(se) <- new.row.names
+head(rownames(se), 5)
+
+se_Zhou <- se
+```
+
+
+# Quick seurat
+
+```{r}
+colnames(se) <- se$Barcode
+seu <- 
+  Seurat::CreateSeuratObject(counts = assay(se, "counts"), 
+                     project = "Zhou", 
+                     meta.data = as.data.frame(colData(se)),
+                     min.cells = 3, min.features = 200)
+# Colour scheme
+#pal.pop2_sub <- df_pal_pop2 %>%
+#  dplyr::filter(Population %in% se2$condition) %>% pull(Col)
+
+
+seuset <- NormalizeData(
+  object = seu, 
+  normalization.method = "LogNormalize", 
+  scale.factor = 10000
+)
+# Feature selections
+seuset <- 
+  FindVariableFeatures(object = seuset, selection.method = "vst", nfeatures = 2500)
+# Scaling the data
+all.genes <- rownames(x = seuset)
+seuset <- ScaleData(object = seuset, features = all.genes)
+
+
+
+# These are now standard steps in the Seurat workflow for visualization and clustering
+seuset <- RunPCA(seuset, verbose = FALSE)
+#ElbowPlot(object = seuset, ndims = 30)
+seuset <- RunUMAP(seuset, dims = 1:30, verbose = FALSE)
+
+seuset <- FindNeighbors(seuset, dims = 1:30, verbose = FALSE)
+seuset <- FindClusters(seuset, verbose = FALSE,resolution = 1)
+
+seuset_zhou <- seuset
+```
+
+## UMAP visualisation
+
+Extract the UMAP dimension
+
+```{r}
+umap.df <- as.data.frame(Embeddings(object = seuset, reduction = "umap")) %>%
+  tibble::rownames_to_column(var="Cell") %>%
+  cbind(seuset[[]]) 
+
+
+# Subset based on sorted population
+p1 <- 
+  ggplot(umap.df, aes(x=UMAP_1, y=UMAP_2, colour=condition)) +
+  geom_point() +
+  gghighlight(use_direct_label = FALSE) +
+  theme(legend.position = "right") +
+  facet_wrap(~condition) +
+  theme_bw() +
+  #scale_colour_manual(values=pal.pop2_sub) + 
+  labs(title="Highlighting the FACS population")
+
+p2 <- 
+  ggplot(umap.df, aes(x=UMAP_1, y=UMAP_2, colour=seurat_clusters)) +
+  geom_point() +
+  gghighlight(use_direct_label = FALSE) +
+  theme(legend.position = "right") +
+  facet_wrap(~seurat_clusters) +
+  theme_bw() +
+  #scale_colour_manual(values=pal.pop2_sub) + 
+  labs(title="Highlighting the in silico clusters")
+
+png(file.path(outDir, "Zhou_UMAP_condition.png"), width=1200, height=900)
+p1
+dev.off()
+
+png(file.path(outDir, "Zhou_UMAP_cluster.png"), width=1200, height=900)
+p2
+dev.off()
+
+su.markers <- 
+  FindAllMarkers(seuset, only.pos = TRUE, min.pct = 0.25, logfc.threshold = 0.25)
+write.csv(su.markers, file.path(outDir, "MarkerGenes.csv"))
+```
+
+## Filtering clusters
+
+
+Cluster 5 showed no expression of CD27 and very high expression of Macrophage (Fcr gene family) expression. So we remove all cluster 5
+
+Show expression of Fcr
+
+```{r}
+FeaturePlot(seuset, reduction = "umap", 
+            features = c("Fcgr3"),order = T)
+
+```
+
+Remove cluster 5
+
+```{r}
+seuset <- seuset[,!seuset$seurat_clusters == "5"]
+```
+
+Re-run clustering and variable genes
+
+```{r}
+# Feature selections
+seuset <- 
+  FindVariableFeatures(object = seuset, selection.method = "vst", nfeatures = 2500)
+# Scaling the data
+all.genes <- rownames(x = seuset)
+seuset <- ScaleData(object = seuset, features = all.genes)
+
+
+# These are now standard steps in the Seurat workflow for visualization and clustering
+seuset <- RunPCA(seuset, verbose = FALSE)
+ElbowPlot(object = seuset, ndims = 30)
+seuset <- RunUMAP(seuset, dims = 1:30, verbose = FALSE)
+
+seuset <- FindNeighbors(seuset, dims = 1:30, verbose = FALSE)
+seuset <- FindClusters(seuset, verbose = FALSE,resolution = 1)
+
+seuset_zhou <- seuset
+
+
+umap.df <- as.data.frame(Embeddings(object = seuset, reduction = "umap")) %>%
+  tibble::rownames_to_column(var="Cell") %>%
+  cbind(seuset[[]]) 
+
+
+# Subset based on sorted population
+p1 <- 
+  ggplot(umap.df, aes(x=UMAP_1, y=UMAP_2, colour=condition)) +
+  geom_point() +
+  gghighlight(use_direct_label = FALSE) +
+  theme(legend.position = "right") +
+  facet_wrap(~condition) +
+  theme_bw() +
+  #scale_colour_manual(values=pal.pop2_sub) + 
+  labs(title="Highlighting the FACS population")
+
+p1
+```
+
+# Interested populations
+
+The population *AGM_E11.0_T1_preHSC_CD201neg* appears clustering with Endo. Hence we are not interested in this population. Re-analyze the data without this population.
+
+```{r}
+# Save original
+seuset_zhou_ori <- seuset_zhou
+
+seuset_zhou2 <- seuset_zhou[,!seuset_zhou$condition %in% 
+                             #c("AGM_E11.0_T1_preHSC_CD201neg","FL_E12.0_HSC", "FL_E14.0_HSC", "BM_Adult_HSC")]
+                             c("AGM_E11.0_T1_preHSC_CD201neg")]
+
+
+
+tmp <- seuset_zhou2$condition
+tmp <- case_when(tmp == "AGM_E11.0_Endo" ~ "EC",
+                 tmp == "AGM_E11.0_T1_preHSC_CD201hig" ~ "T1-preHSC",
+                 tmp == "AGM_E11.0_T2_preHSC" ~ "T2-CD41_low",
+                 tmp == "AGM_E11.0_T2_preHSC_CD201hig" ~ "T2-preHSC",
+                 tmp == "FL_E12.0_HSC" ~ "FL_E12.0_HSC",
+                 TRUE ~ as.character(tmp))
+tmp <- factor(tmp, levels = 
+                        c("EC", "T1-preHSC",
+                          "T2-CD41_low",
+                          "T2-preHSC", 
+                          "FL_E12.0_HSC", "FL_E14.0_HSC",
+                          "BM_Adult_HSC"))
+seuset_zhou2$condition2 <- tmp
+
+# Recompute UMAP
+seuset <- seuset_zhou2
+seuset <- 
+  FindVariableFeatures(object = seuset, selection.method = "vst", nfeatures = 2500)
+# Scaling the data
+all.genes <- rownames(x = seuset)
+seuset <- ScaleData(object = seuset, features = all.genes)
+#seuset <- CellCycleScoring(seuset, s.features = s.genes, g2m.features = g2m.genes, set.ident = FALSE)
+
+
+# These are now standard steps in the Seurat workflow for visualization and clustering
+seuset <- RunPCA(seuset, verbose = FALSE)
+#ElbowPlot(object = seuset, ndims = 30)
+seuset <- RunUMAP(seuset, dims = 1:30, verbose = FALSE, set.seed = 9999)
+
+seuset <- FindNeighbors(seuset, dims = 1:30, verbose = FALSE)
+seuset <- FindClusters(seuset, verbose = FALSE,resolution = 1)
+
+pal.tmp2 <- c("#8CD17DFF",  
+              "#D4A6C8FF", pal.tmp[11], pal.tmp[12], 
+              pal.tmp[1], pal.tmp[2],
+              "#9D7660FF")
+DimPlot(seuset, reduction = "umap", group.by = "condition2", cols=pal.tmp2)
+ggsave(file.path(outDir, "Zhou_UMAP.pdf"), device = "pdf", width=8, height = 5, dpi=300)
+
+```
+
+Now plot some interested genes on the UMAP
+
+```{r}
+FeaturePlot(seuset, reduction = "umap",
+            features = c("Nfkbia", "Nfkbid", "Nfkbie",
+                         "Rela", "Relb", "Rel"),
+            ncol = 3,order = T)
+
+```
+
+# Signature score
+
+Now we calculate the a signature score from mulitple genes.
+
+First define the signatures
+
+```{r}
+# List of NfkB members that were manually curated
+#list_1 <- read.csv(file.path(dataDir, "list_1_small_genes.csv")) %>% pull(genes)
+list_1 <- read.csv("~/Desktop/Nat_comms_Ikba/data/list_1_small_genes.csv") %>% pull(genes)
+
+# Selected Inflammation genes
+#list_2 <- read.csv(file.path(dataDir, "list_2_Inflm.csv")) %>% pull(genes)
+list_2 <- read.csv("~/Desktop/Nat_comms_Ikba/data/list_2_Inflm.csv") %>% pull(genes)
+
+# Long GSEA gene list of TNFA extrated from Hallmark
+#list_3 <- read.csv(file.path(dataDir, "list_3_GSEA.csv"))
+list_3 <- read.csv("~/Desktop/Nat_comms_Ikba/data//list_3_GSEA.csv")
+list_3 <- as.character(mapply(simpleCap, list_3$genes)) # Convert to lower case 
+
+# Convert as list
+seu_lists <- list(list_1, list_2, list_3)
+names(seu_lists) <- c("NFKB_curated", "Inflm", "Hallmark_NFKB")
+
+```
+
+Calculate the score using 'Ucell' package. Remove populations that we are not interested in
+
+```{r}
+seuset_zhou <- seuset_zhou[,!seuset_zhou$condition %in% 
+                             #c("AGM_E11.0_T1_preHSC_CD201neg","FL_E12.0_HSC", "FL_E14.0_HSC", "BM_Adult_HSC")]
+                             c("AGM_E11.0_T1_preHSC_CD201neg", "AGM_E11.0_T2_preHSC")]
+
+seuset_zhou <- AddModuleScore_UCell(seuset_zhou, features = seu_lists)
+
+df_plot2 <- data.frame(seuset_zhou[[]]) %>%
+  dplyr::select(condition, NFKB_curated_UCell:Hallmark_NFKB_UCell) %>%
+  dplyr::mutate(
+    condition = case_when(condition == "AGM_E11.0_Endo" ~ "EC",
+                          condition == "AGM_E11.0_T1_preHSC_CD201hig" ~ "T1-preHSC",
+                          condition == "AGM_E11.0_T2_preHSC" ~ "T2-CD41_low",
+                          condition == "AGM_E11.0_T2_preHSC_CD201hig" ~ "T2-preHSC",
+                          condition == "FL_E12.0_HSC" ~ "FL_E12.0_HSC",
+                          TRUE ~ as.character(condition))) %>%
+  dplyr::mutate(
+    condition = factor(condition, levels = 
+                        c("EC", "T1-preHSC",
+                          "T2-CD41_low",
+                          "T2-preHSC", 
+                          "FL_E12.0_HSC", "FL_E14.0_HSC",
+                          "BM_Adult_HSC"))) %>%
+  melt() %>%
+  dplyr::mutate(variable = gsub("_UCell", "", variable),
+                variable = factor(variable, levels=c("Inflm", "Hallmark_NFKB", "NFKB_curated")))
+
+
+# Plot
+pal.tmp3 <- c("#8CD17DFF",  
+              "#D4A6C8FF", pal.tmp[11], #pal.tmp[12], 
+              pal.tmp[1], pal.tmp[2],
+              "#9D7660FF")
+
+
+p_viol_gene2 <- 
+  df_plot2 %>%
+  ggplot(aes(x = condition, y = value, fill = condition)) +
+  geom_violin(alpha = 0.5, scale = "width", position = position_dodge(width = 0.9)) +
+  geom_boxplot(aes(), coef=0,
+               fill=NA, colour="black", outlier.alpha = 0,  width = 0.15, position = position_dodge(width = 0.9)) +
+  scale_fill_manual(values=unique(pal.tmp3)) +
+  theme_bw() +
+  theme(legend.position = "none",
+        panel.grid.major = element_line(linetype = "blank"), 
+        panel.grid.minor = element_line(linetype = "blank"),
+        axis.text.x = element_text(angle = 45, hjust = 1)) +
+  #scale_y_continuous(limits = c(0,12),
+  #                   breaks = c(0,5,10)) +
+  xlab("") +
+  facet_wrap(~variable, ncol = 5) +
+  geom_signif(comparisons = list(
+    c("EC", "T1-preHSC"),
+    c("EC", "T2-preHSC"),
+    c("EC", "T2-preHSC"),
+    c("EC", "FL_E12.0_HSC"),
+    c("EC", "FL_E14.0_HSC"),
+    c("EC", "BM_Adult_HSC")),
+    map_signif_level=TRUE, test = "t.test",
+    y_position = c(0.2,0.22,0.24,0.26,0.28,0.3)
+    ) +
+  scale_y_continuous(limits = c(0,0.32), breaks=c(0,0.1,0.2,0.3)) +
+  NULL
+  
+p_viol_gene2
+
+
+
+ggsave(file.path(outDir, "Zhou_Signature2.pdf"), device = "pdf", width=12, height = 4, dpi=300)
+
+```
+
+
+# GSEA analysis
+
+We create single cell object, just to extract count data
+
+```{r}
+# Make single cell object
+c1 <- Seurat::GetAssayData(seuset_zhou_ori, slot = "counts")
+cD <- seuset_zhou_ori[[]]
+se_zhou <- SingleCellExperiment(
+  assay=list(counts= c1),
+  colData = cD
+)
+
+
+set.seed(123)
+clust.se <- quickCluster(se_zhou) 
+se_zhou <- computeSumFactors(se_zhou, cluster=clust.se, min.mean=0.1)
+se_zhou <- logNormCounts(se_zhou)
+```
+
+
+We fist run a DE using limma
+
+```{r}
+sde <- se_zhou
+
+# Grouping
+df_tmp <- as.data.frame(colData(sde)) %>%
+  dplyr::mutate(Pop2 = as.character(condition),
+                Pop2 = case_when(Pop2 == 'AGM_E11.0_T1_preHSC_CD201hig' ~ "T1_T2_preHSC",
+                                 Pop2 == 'AGM_E11.0_T2_preHSC_CD201hig' ~ "T1_T2_preHSC",
+                                 Pop2 == 'FL_E12.0_HSC' ~ "FL_HSC",
+                                 Pop2 == 'FL_E14.0_HSC' ~ "FL_HSC",
+                                 TRUE ~ Pop2))
+
+
+sde$Population <- df_tmp$Pop2
+
+#sde <- sde[rD$gene_biotype == "protein_coding", ]
+
+# --- Remove genes with a lot of DropOut ---- #
+# Retain genes with more than 20% detection in any group
+rD_qc <- perFeatureQCMetrics(sde)
+
+# Find the percentage expressing gene per-cluster
+dpt_list <- list()
+
+p_list <- as.factor(unique(as.character(sde$Population)))
+p_list <- levels(p_list)
+
+for (i in seq_along(p_list)){
+  x <- dropOut_Pop(sde, p_list[i])
+  dpt_list[[i]] <- x
+}
+
+
+dpt_df <- as.data.frame(do.call(cbind, dpt_list))
+colnames(dpt_df) <- paste0("pct_detect_", p_list)
+dpt_df$UniqGeneID <- row.names(sde)
+
+rr <- as.data.frame(rowData(sde)) %>%
+  tibble::rownames_to_column(var = "UniqGeneID") %>%
+  dplyr::inner_join(dpt_df) 
+
+rr_sub <- rr %>% 
+  dplyr::filter_at(vars(starts_with("pct_detect")), any_vars(. >=10))
+
+sde <- sde[row.names(sde) %in% rr_sub$UniqGeneID,]
+
+
+# --- DO DGE ---- #
+# Set up the EdgeR object
+group <- sde$Population
+#group <- sde$Cluster
+cts <- assay(sde, "counts")
+cD <- as.data.frame(colData(sde))
+cD$group <- group
+
+dge <- DGEList(counts = cts, group =group)
+dge <- calcNormFactors(dge)
+
+
+design <- model.matrix(~0 + group, cD)
+vm <- voom(dge, design = design, plot = TRUE)
+fit <- lmFit(vm, design)
+
+# Endo vs preHSC
+contrast.matrix <- makeContrasts(groupAGM_E11.0_Endo-groupT1_T2_preHSC, levels=design)
+fit2 <- contrasts.fit(fit, contrast.matrix)
+fit2 <- eBayes(fit2)
+# We extract the DE genes in each comparison.
+dge_g1 <- 
+  topTable(fit2, n = Inf, adjust.method = "BH", coef=1) %>%
+  tibble::rownames_to_column(var = "UniqGeneID") %>%
+  dplyr::arrange((t))
+
+
+# HE vs FL
+contrast.matrix <- makeContrasts(groupAGM_E11.0_Endo-groupFL_HSC, levels=design)
+fit2 <- contrasts.fit(fit, contrast.matrix)
+fit2 <- eBayes(fit2)
+# We extract the DE genes in each comparison.
+dge_g2 <- 
+  topTable(fit2, n = Inf, adjust.method = "BH", coef=1) %>%
+  tibble::rownames_to_column(var = "UniqGeneID") %>%
+  dplyr::arrange((t))
+
+
+# T1/T2 HSC vs FL
+contrast.matrix <- makeContrasts(groupT1_T2_preHSC-groupFL_HSC, levels=design)
+fit2 <- contrasts.fit(fit, contrast.matrix)
+fit2 <- eBayes(fit2)
+# We extract the DE genes in each comparison.
+dge_g3 <- 
+  topTable(fit2, n = Inf, adjust.method = "BH", coef=1) %>%
+  tibble::rownames_to_column(var = "UniqGeneID") %>%
+  dplyr::arrange((t))
+```
+
+Save as GSEA pre-ranked object
+
+```{r}
+dge_g1_sub <- dge_g1 %>%
+  dplyr::select(UniqGeneID, t) %>%
+  dplyr::mutate(UniqGeneID = toupper(UniqGeneID))
+write.table(dge_g1_sub, file.path(outDir, "GSEA_preRanked_Endo_vs_preHSC_T1_T2_v2023.rnk"),
+            sep="\t",row.names=FALSE, quote=F, col.names = FALSE)
+
+
+dge_g2_sub <- dge_g2 %>%
+  dplyr::select(UniqGeneID, t) %>%
+  dplyr::mutate(UniqGeneID = toupper(UniqGeneID))
+write.table(dge_g2_sub, file.path(outDir, "GSEA_preRanked_Endo_vs_FL_v2023.rnk"),
+            sep="\t",row.names=FALSE, quote=F, col.names = FALSE)
+
+dge_g3_sub <- dge_g3 %>%
+  dplyr::select(UniqGeneID, t) %>%
+  dplyr::mutate(UniqGeneID = toupper(UniqGeneID))
+write.table(dge_g3_sub, file.path(outDir, "GSEA_preRanked_preHSC_T1_T2_vs_FL_v2023.rnk"),
+            sep="\t",row.names=FALSE, quote=F, col.names = FALSE)
+```
+
+# Session info
+
+```{r}
+sessionInfo()
+```
+

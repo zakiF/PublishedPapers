@@ -1,0 +1,11 @@
+﻿genes,p-value,log 2 fold change,ptc1,ptc2,p-val adjust,cell surface
+Nfkbia,0.0000022,3.02,0.857,0.5,0.0276,FALSE
+Nfkbiz,0.222,1.22,0.286,0.342,1,FALSE
+Nfkb2,0.0787,1.13,0.286,0.368,1,FALSE
+Nfkbil1,0.0464,0.994,0.357,0.579,1,FALSE
+Nfkbib,0.295,0.432,0.571,0.789,1,FALSE
+Nfkbid,0.0674,-3.74,0.071,0.342,1,fal
+Relb,0.000358,3.13,0.643,0.184,1,FALSE
+Rela,0.000816,-0.253,0.286,0.789,1,FALSE
+Relt,0.0811,-0.287,0.214,0.526,1,FALSE
+Rel,0.0454,-1.28,0.071,0.395,1,FALSE
