@@ -1,0 +1,2171 @@
+---
+title: "Analyse WES CNR"
+date: "2023-09-12"
+output: 
+  html_document:
+    toc: true
+    toc_float:
+      collapsed: true
+    toc_depth: 3
+    number_sections: true
+    theme: lumen
+---
+
+# Background
+
+In the previous part of the analysis, we extracted copy number data from exome sequencing. Here we plot the data in the form of heatmap and calculate the correlation. 
+
+# Objectives
+
+1. Calculate risk score
+
+
+# Objective 1 
+
+**Calculate risk score**
+
+Lets generate a cox-proportional model.
+
+## Overal survival
+
+### Liquid data
+
+We first predict the overall survival / PFS
+
+We start by the trying to replicate the old data from Manish 2022 paper. Lets read the overall surival time and outcome.
+
+```{r}
+# file_dir <- file.path(wd$data, "from_papers/cancers_2022_plasma/")
+# # Visit 1
+# os_v1 <- readxl::read_excel(file.path(file_dir, "Table S3.xlsx"),
+#                               sheet = 2) %>%
+#   select(PatientID...26:Progression) %>%
+#   rename(PatientID = PatientID...26,
+#          Death = 'Death (0-no death event)',
+#          OS = 'OS (Days)',
+#          Res = 'Response at 3-months; 0=no response',
+#          PFS = 'PFS (Days)',
+#          Prog = Progression) %>%
+#   # Convert to month
+#   # divide by the average day by month.
+#   mutate(OS = round(OS/30, digit=2),
+#          PFS = round(PFS/30.417, digit=2))
+# 
+# # Visit 2
+# os_v2 <- readxl::read_excel(file.path(file_dir, "Table S3.xlsx"),
+#                               sheet = 3) %>%
+#   select(PatientID...26:Progression) %>%
+#   rename(PatientID = PatientID...26,
+#          Death = 'Death (0-no death event)',
+#          OS = 'OS (Days)',
+#          Res = 'Response at 3-months; 0=no response',
+#          PFS = 'PFS (Days)',
+#          Prog = Progression) %>%
+#   # Convert to month
+#   # divide by the average day by month.
+#   mutate(OS = round(OS/30.417, digit=2),
+#          PFS = round(PFS/30.417, digit=2))
+```
+
+Read the CNR results and join with the metadata above. This is for visit 1
+
+
+```{r}
+file_dir <- file.path(wd$data, "from_papers/cancers_2022_plasma/")
+cnr_v1 <- readxl::read_excel(file.path(file_dir, "Table S3.xlsx"),
+                             sheet = 2)  %>%
+  select(PatientID...1, AR, COL22A1, MYC, NCOR1, NKX3.1, NOTCH1, PIK3CA, PIK3CB, TP53, ZBTB16, TMPRSS2) %>%
+  mutate(across(AR:TMPRSS2, ~ case_when(
+    . == "NC" ~ 0,
+    . == "Amp" ~ 1,
+    . == "Del" ~ -1))) %>% as.data.frame() %>%
+  rename(PatientID = PatientID...1) %>% 
+  mutate(across(AR:TMPRSS2, ~ abs(.)))
+
+df_join_v1 <- cnr_v1 %>% left_join(os_v1) # --- Swap visit 1 or 2
+
+```
+
+Run Cox proportional hazard models for one gene
+
+```{r}
+# Fit one gene
+tmp_df <- df_join_v1 %>% select(AR:TMPRSS2, OS, Death) # ------- CAHNGE TO OS = Death OR PFS - Prog
+cox_model2 <- coxph(Surv(OS, Death) ~ AR, data = tmp_df)
+cox_model3 <- coxph(Surv(OS, Death) ~ ., data = tmp_df)
+
+cox_model2
+print("---------------")
+cox_model3
+```
+
+The results are different in each analysis, not sure why. For now we stick to run the gene 1 by 1. Lets run the loop.
+
+
+```{r}
+cox_results <- list()
+gene_col <- df_join_v1 %>% select(AR:TMPRSS2) %>% colnames()
+for (gene in colnames(df_join_v1)[2:12]) {
+  
+  tmp_df <- df_join_v1 %>% select(!!as.name(gene), OS, Death) %>%  # ------- CAHNGE TO OS = Death OR PFS - Prog
+    rename(gene = !!as.name(gene))
+  cox_model <- summary(coxph(Surv(OS, Death) ~ gene, data = tmp_df))
+  
+  cox_results[[gene]] <- cox_model$coefficients
+}
+
+cox_result_v1 <- do.call(rbind, cox_results) %>% as.data.frame()
+rownames(cox_result_v1) <- gene_col
+
+df_cox_v1 <- tibble(rownames_to_column(cox_result_v1, var = "Gene")) %>%
+  rename(pVal = 'Pr(>|z|)')
+
+```
+
+
+Now lets calculate the risk score. According to the manuscript
+
+> Sum [Cox regression coefficient × CNA status (1 for gain or loss, and 0 for no change) of each gene selected (ranked by best p values)].
+
+
+```{r}
+# So for a patient we can do like this
+patID <- "MJ1"
+pat_1 <- df_join_v1 %>% filter(PatientID == patID) %>% select(PatientID, AR:TMPRSS2) %>% 
+  pivot_longer(!PatientID, names_to = "Gene", values_to = "CNR") %>%
+  left_join(df_cox_v1) %>%
+  # Calculate risk score
+  mutate(RS = coef * CNR)
+pat_sum <- sum(pat_1$RS)
+```
+
+Repeat for all patient
+
+
+```{r,warning=FALSE, message=FALSE}
+pat_all <- df_join_v1$PatientID
+pat_sum_list <- list()
+
+for (i in seq_along(pat_all)){
+  patID <- pat_all[i]
+  pat_1 <- df_join_v1 %>% filter(PatientID == patID) %>% select(PatientID, AR:TMPRSS2) %>% 
+    pivot_longer(!PatientID, names_to = "Gene", values_to = "CNR") %>%
+    left_join(df_cox_v1) %>%
+    # Calculate risk score
+    mutate(RS = coef * CNR)
+  # get the sum
+  pat_sum_list[[i]] <- sum(pat_1$RS)
+}
+
+df_pat_sum <- data.frame(
+  PatientID = pat_all,
+  Sum_RS = unlist(pat_sum_list)
+)
+```
+
+
+Divide the risk score based on median value
+
+```{r}
+df_pat_sum <- df_pat_sum %>% 
+  mutate(RS_binr = case_when(Sum_RS > median(Sum_RS) ~ "high",
+                             Sum_RS <= median(Sum_RS) ~ "low"))
+```
+
+
+Calculate and plot OS
+
+```{r}
+df_risk_v1 <- df_join_v1 %>% left_join(df_pat_sum)
+
+# Fit survival data using the Kaplan-Meier method
+surv_object <- Surv(time = df_risk_v1$OS, event = df_risk_v1$Death)  # ------- CAHNGE TO OS = Death OR PFS - Prog
+# Fit Kaplan-Meier curve
+fit1 <- survfit(surv_object ~ RS_binr, data = df_risk_v1)
+
+p_l_OS <- 
+  ggsurvplot(fit1, data = df_risk_v1, pval = TRUE, risk.table=TRUE,
+             palette = c("#e41a1c", "#7F7F7F"))
+
+pdf(file.path(wd$output, "OS_PROMOTE_liquid.pdf"), 
+    width = 12, height = 8)
+p_l_OS
+dev.off()
+```
+
+
+Save variable
+
+```{r}
+df_risk_v1_OS <- df_risk_v1
+```
+
+
+We subset to samples with solid information
+
+```{r,eval=FALSE}
+df_risk_v1 <- df_risk_v1_OS %>% 
+  filter(PatientID %in% df_risk_v1_OS_solid$PatientID)
+
+# Fit survival data using the Kaplan-Meier method
+surv_object <- Surv(time = df_risk_v1$OS, event = df_risk_v1$Death)  # ------- CAHNGE TO OS = Death OR PFS - Prog
+# Fit Kaplan-Meier curve
+fit1 <- survfit(surv_object ~ RS_binr, data = df_risk_v1)
+
+p_l_OS <- 
+  ggsurvplot(fit1, data = df_risk_v1, pval = TRUE, risk.table=TRUE,
+             palette = c("#e41a1c", "#7F7F7F"))
+
+pdf(file.path(wd$output, "OS_PROMOTE_liquid_sameSolidPatients.pdf"), 
+    width = 12, height = 8)
+p_l_OS
+dev.off()
+```
+
+
+Now repeat for PFS
+
+```{r, warning=FALSE, message=FALSE}
+cox_results <- list()
+gene_col <- df_join_v1 %>% select(AR:TMPRSS2) %>% colnames()
+for (gene in colnames(df_join_v1)[2:12]) {
+  
+  tmp_df <- df_join_v1 %>% select(!!as.name(gene), PFS, Prog) %>%  # ------- CAHNGE TO OS = Death OR PFS - Prog
+    rename(gene = !!as.name(gene))
+  cox_model <- summary(coxph(Surv(PFS, Prog) ~ gene, data = tmp_df))
+  
+  cox_results[[gene]] <- cox_model$coefficients
+}
+
+cox_result_v1 <- do.call(rbind, cox_results) %>% as.data.frame()
+rownames(cox_result_v1) <- gene_col
+
+df_cox_v1 <- tibble(rownames_to_column(cox_result_v1, var = "Gene")) %>%
+  rename(pVal = 'Pr(>|z|)')
+
+# Calculate risk score
+
+pat_all <- df_join_v1$PatientID
+pat_sum_list <- list()
+
+for (i in seq_along(pat_all)){
+  patID <- pat_all[i]
+  pat_1 <- df_join_v1 %>% filter(PatientID == patID) %>% select(PatientID, AR:TMPRSS2) %>% 
+    pivot_longer(!PatientID, names_to = "Gene", values_to = "CNR") %>%
+    left_join(df_cox_v1) %>%
+    # Calculate risk score
+    mutate(RS = coef * CNR)
+  # get the sum
+  pat_sum_list[[i]] <- sum(pat_1$RS)
+}
+
+df_pat_sum <- data.frame(
+  PatientID = pat_all,
+  Sum_RS = unlist(pat_sum_list)
+)
+
+df_pat_sum <- df_pat_sum %>% 
+  mutate(RS_binr = case_when(Sum_RS > median(Sum_RS) ~ "high",
+                             Sum_RS <= median(Sum_RS) ~ "low"))
+
+# Fit survival data
+df_risk_v1 <- df_join_v1 %>% left_join(df_pat_sum)
+
+# Fit survival data using the Kaplan-Meier method
+surv_object <- Surv(time = df_risk_v1$PFS, event = df_risk_v1$Prog)  # ------- CAHNGE TO OS = Death OR PFS - Prog
+# Fit Kaplan-Meier curve
+fit1 <- survfit(surv_object ~ RS_binr, data = df_risk_v1)
+
+ggsurvplot(fit1, data = df_risk_v1, pval = TRUE, risk.table=TRUE)
+```
+
+Save variable
+
+```{r}
+df_risk_v1_PFS <- df_risk_v1
+```
+
+We subset to samples with solid information
+
+```{r,eval=FALSE}
+df_risk_v1 <- df_risk_v1_PFS %>% 
+  filter(PatientID %in% df_risk_v1_OS_solid$PatientID)
+
+# Fit survival data using the Kaplan-Meier method
+surv_object <- Surv(time = df_risk_v1$PFS, event = df_risk_v1$Prog)  # ------- CAHNGE TO OS = Death OR PFS - Prog
+# Fit Kaplan-Meier curve
+fit1 <- survfit(surv_object ~ RS_binr, data = df_risk_v1)
+
+p_l_PFS <- 
+  ggsurvplot(fit1, data = df_risk_v1, pval = TRUE, risk.table=TRUE,
+             palette = c("#e41a1c", "#7F7F7F"))
+
+pdf(file.path(wd$output, "PFS_PROMOTE_liquid_sameSolidPatients.pdf"), 
+    width = 12, height = 8)
+p_l_PFS
+dev.off()
+```
+
+#### Visit 2
+
+Repeat for visit 2 OS
+
+```{r, warning=FALSE, message=FALSE}
+
+cnr_v2 <- readxl::read_excel(file.path(file_dir, "Table S3.xlsx"),
+                             sheet = 3)  %>%
+  select(PatientID...1, AR, COL22A1, MYC, NCOR1, NKX3.1, NOTCH1, PIK3CA, PIK3CB, TP53, ZBTB16, TMPRSS2) %>%
+  mutate(across(AR:TMPRSS2, ~ case_when(
+    . == "NC" ~ 0,
+    . == "Amp" ~ 1,
+    . == "Del" ~ -1))) %>% as.data.frame() %>%
+  rename(PatientID = PatientID...1) %>% 
+  mutate(across(AR:TMPRSS2, ~ abs(.)))
+
+df_join_v1 <- cnr_v2 %>% left_join(os_v2) # --- Swap visit 1 or 2
+
+cox_results <- list()
+gene_col <- df_join_v1 %>% select(AR:TMPRSS2) %>% colnames()
+for (gene in colnames(df_join_v1)[2:12]) {
+  
+  tmp_df <- df_join_v1 %>% select(!!as.name(gene), OS, Death) %>%  # ------- CAHNGE TO OS = Death OR PFS - Prog
+    rename(gene = !!as.name(gene))
+  cox_model <- summary(coxph(Surv(OS, Death) ~ gene, data = tmp_df))
+  
+  cox_results[[gene]] <- cox_model$coefficients
+}
+
+cox_result_v1 <- do.call(rbind, cox_results) %>% as.data.frame()
+rownames(cox_result_v1) <- gene_col
+
+df_cox_v1 <- tibble(rownames_to_column(cox_result_v1, var = "Gene")) %>%
+  rename(pVal = 'Pr(>|z|)')
+
+# Calculate risk score
+
+pat_all <- df_join_v1$PatientID
+pat_sum_list <- list()
+
+for (i in seq_along(pat_all)){
+  patID <- pat_all[i]
+  pat_1 <- df_join_v1 %>% filter(PatientID == patID) %>% select(PatientID, AR:TMPRSS2) %>% 
+    pivot_longer(!PatientID, names_to = "Gene", values_to = "CNR") %>%
+    left_join(df_cox_v1) %>%
+    # Calculate risk score
+    mutate(RS = coef * CNR)
+  # get the sum
+  pat_sum_list[[i]] <- sum(pat_1$RS)
+}
+
+df_pat_sum <- data.frame(
+  PatientID = pat_all,
+  Sum_RS = unlist(pat_sum_list)
+)
+
+df_pat_sum <- df_pat_sum %>% 
+  mutate(RS_binr = case_when(Sum_RS > median(Sum_RS) ~ "high",
+                             Sum_RS <= median(Sum_RS) ~ "low"))
+
+# Fit survival data
+df_risk_v1 <- df_join_v1 %>% left_join(df_pat_sum)
+
+# Fit survival data using the Kaplan-Meier method
+surv_object <- Surv(time = df_risk_v1$OS, event = df_risk_v1$Death)  # ------- CAHNGE TO OS = Death OR PFS - Prog
+# Fit Kaplan-Meier curve
+fit1 <- survfit(surv_object ~ RS_binr, data = df_risk_v1)
+
+ggsurvplot(fit1, data = df_risk_v1, pval = TRUE, risk.table=TRUE)
+```
+
+
+Save variable
+
+```{r}
+df_risk_v2_OS <- df_risk_v1
+```
+
+
+### Solid data
+
+#### Visit 1
+
+We established that we can replicate the previous analysis, now lets run the same analysis on solid (exome) data
+
+Step 1 - Combine the CNR solid call with survival data
+
+```{r}
+# WITHOUT FILTERING
+cnr_solid_v1 <- abs(mat_solid_v1) %>% as.data.frame() %>% t() # -- without filtering
+
+
+# # FILTER TO SPECIFIC SITE
+# dd <- meta_v1 %>% left_join(meta_l)
+# # Filter to only bone site
+# bone_samp <- dd %>% filter(Sample_type == "Bone") %>% filter(Type == "Promote1") %>% pull(PatientID)
+# bone_samp <- bone_samp[bone_samp %in% colnames(mat_v1_or2)]
+# mat_v1_sub <- mat_v1_or2[,bone_samp]
+
+# Visit 2
+#bone_samp <- dd %>% filter(Sample_type == "non-bone") %>% filter(Type == "Promote2") %>% pull(PatientID)
+#bone_samp <- bone_samp[bone_samp %in% colnames(mat_v2_or2)]
+#mat_v1_sub <- mat_v2_or2[,bone_samp] # Visit 2
+
+
+#cnr_solid_v1 <- abs(mat_v1_sub) %>% as.data.frame() %>% t() 
+
+#cnr_solid_v1 <- abs(pap_v1) %>% as.data.frame() %>% t()
+colnames(cnr_solid_v1) <- gsub(" .*", "", colnames(cnr_solid_v1)) 
+cnr_solid_v1 <- cnr_solid_v1 %>% as.data.frame() %>%
+  tibble::rownames_to_column(var = "PatientID") %>% 
+  left_join(os_v1) %>%        # EDIT FOR VISIT 1 or VISIT 2
+  rename(NKX3.1 = 'NKX3-1')
+
+# add additionall annotation
+df_purity_sub <- df_purity_or_v1 %>% select(PatientID, Purity_tresh)
+cnr_solid_v1 <- cnr_solid_v1 %>% left_join(df_purity_sub) #%>%
+#filter(!is.na(Purity_tresh))
+```
+
+
+Step 2 - Calculate cox-regression based on PFS
+
+
+```{r}
+cox_results <- list()
+gene_col <- cnr_solid_v1 %>% select(AR:NKX3.1 ) %>% colnames()
+for (gene in colnames(cnr_solid_v1)[2:12]) {
+  
+  tmp_df <- cnr_solid_v1 %>% select(!!as.name(gene), PFS, Prog) %>% # ------- CAHNGE TO OS = Death OR PFS - Prog
+    rename(gene = !!as.name(gene))
+  cox_model <- summary(coxph(Surv(PFS, Prog) ~ gene, data = tmp_df))
+  
+  cox_results[[gene]] <- cox_model$coefficients
+}
+
+cox_result_v1 <- do.call(rbind, cox_results) %>% as.data.frame()
+rownames(cox_result_v1) <- gene_col
+
+df_cox_v1 <- tibble(rownames_to_column(cox_result_v1, var = "Gene")) %>%
+  rename(pVal = 'Pr(>|z|)') %>%
+  filter(!is.na(coef))
+```
+
+
+
+Step 3 - Calculate risk score
+
+
+```{r,warning=FALSE, message=FALSE}
+# Only for bone / non-bone
+#pat_all <- bone_samp
+
+# All patient
+pat_all <- cnr_solid_v1$PatientID
+pat_sum_list <- list()
+
+for (i in seq_along(pat_all)){
+  patID <- pat_all[i]
+  pat_1 <- cnr_solid_v1 %>% filter(PatientID == patID) %>% select(PatientID, df_cox_v1$Gene) %>% 
+    pivot_longer(!PatientID, names_to = "Gene", values_to = "CNR") %>%
+    left_join(df_cox_v1) %>%
+    # Calculate risk score
+    mutate(RS = coef * CNR)
+  # get the sum
+  pat_sum_list[[i]] <- sum(pat_1$RS)
+}
+
+df_pat_sum <- data.frame(
+  PatientID = pat_all,
+  Sum_RS = unlist(pat_sum_list)
+)
+
+
+df_pat_sum <- df_pat_sum %>% 
+  mutate(RS_binr = case_when(Sum_RS > median(Sum_RS) ~ "high",
+                             Sum_RS <= median(Sum_RS) ~ "low"))
+
+# Calculate and plot PFS
+df_risk_solid_v1 <- cnr_solid_v1 %>% left_join(df_pat_sum)
+
+# Fit survival data using the Kaplan-Meier method
+surv_object <- Surv(time = df_risk_solid_v1$PFS, event = df_risk_solid_v1$Prog) # ------- CAHNGE TO OS = Death OR PFS - Prog
+# Fit Kaplan-Meier curve
+fit1 <- survfit(surv_object ~ RS_binr, data = df_risk_solid_v1)
+p_PFS <- ggsurvplot(fit1, data = df_risk_solid_v1, pval = TRUE, risk.table=TRUE)
+p_PFS
+
+# # add additionall annotation
+# kk <- df_purity_or %>% select(PatientID, Body_Site)
+# df_risk_solid_v1 <- df_risk_solid_v1 %>% left_join(df_purity_sub) %>%
+#   left_join(kk) %>%
+#   mutate(Cat = paste(RS_binr, Purity_tresh, sep="_"),
+#          Cat2 = case_when(Cat == "high_t1_high" ~ "High.risk_High.Purity",
+#                           TRUE ~ "Low.risk"),
+#          Cat3 = paste(Body_Site, Purity_tresh, sep="_")) 
+
+# # If we want to stratify, re-calculate
+# df_risk_solid_v1_sub <- df_risk_solid_v1 %>% filter(!is.na(Purity_tresh)) %>%
+#   # Remove the low number of samples from the low purity
+#   #filter(!Cat %in% c("high_t2_low", "low_t2_low"))
+#   #filter(Cat %in% c("high_t1_high", "low_t2_low"))
+# surv_object2 <- Surv(time = df_risk_solid_v1_sub$OS, event = df_risk_solid_v1_sub$Death) # ------- CAHNGE TO OS = Death OR PFS - Prog
+# # Fit Kaplan-Meier curve
+# fit2 <- survfit(surv_object2 ~ Cat, data = df_risk_solid_v1_sub)
+# p_sur <- ggsurvplot(fit2, data = df_risk_solid_v1_sub, pval = TRUE, risk.table=TRUE,
+#                     palette = c("red", "pink", "darkblue", "lightblue"))
+# p_sur
+```
+
+Save variable
+
+```{r}
+df_risk_v1_PFS_solid <- df_risk_solid_v1
+```
+
+Make nicer figure and save
+
+```{r}
+# Fit survival data using the Kaplan-Meier method
+surv_object <- Surv(time = df_risk_v1_PFS_solid$PFS, event = df_risk_v1_PFS_solid$Prog)  # ------- CAHNGE TO OS = Death OR PFS - Prog
+# Fit Kaplan-Meier curve
+fit1 <- survfit(surv_object ~ RS_binr, data = df_risk_v1_PFS_solid)
+
+pdf(file.path(wd$output, "PFS_visit_1.pdf"), width = 12, height = 8)
+ggsurvplot(fit1, data = df_risk_v1_PFS_solid, pval = TRUE, risk.table=TRUE,
+           conf.int = TRUE,
+           palette = c("red", "grey50"))
+dev.off()
+```
+
+Repeat for OS
+
+```{r, warning=FALSE, message=FALSE}
+# Calculate cox
+
+cox_results <- list()
+gene_col <- cnr_solid_v1 %>% select(AR:NKX3.1 ) %>% colnames()
+for (gene in colnames(cnr_solid_v1)[2:12]) {
+  
+  tmp_df <- cnr_solid_v1 %>% select(!!as.name(gene), OS, Death) %>% # ------- CAHNGE TO OS = Death OR PFS - Prog
+    rename(gene = !!as.name(gene))
+  cox_model <- summary(coxph(Surv(OS, Death) ~ gene, data = tmp_df))
+  
+  cox_results[[gene]] <- cox_model$coefficients
+}
+
+cox_result_v1 <- do.call(rbind, cox_results) %>% as.data.frame()
+rownames(cox_result_v1) <- gene_col
+
+df_cox_v1 <- tibble(rownames_to_column(cox_result_v1, var = "Gene")) %>%
+  rename(pVal = 'Pr(>|z|)') %>%
+  filter(!is.na(coef))
+
+# Save the weignt
+df_cox_visit_1 <- df_cox_v1
+
+# Cacluate Risk score
+# All patient
+pat_all <- cnr_solid_v1$PatientID
+pat_sum_list <- list()
+
+for (i in seq_along(pat_all)){
+  patID <- pat_all[i]
+  pat_1 <- cnr_solid_v1 %>% filter(PatientID == patID) %>% select(PatientID, df_cox_v1$Gene) %>% 
+    pivot_longer(!PatientID, names_to = "Gene", values_to = "CNR") %>%
+    left_join(df_cox_v1) %>%
+    # Calculate risk score
+    mutate(RS = coef * CNR)
+  # get the sum
+  pat_sum_list[[i]] <- sum(pat_1$RS)
+}
+
+df_pat_sum <- data.frame(
+  PatientID = pat_all,
+  Sum_RS = unlist(pat_sum_list)
+)
+
+
+df_pat_sum <- df_pat_sum %>% 
+  mutate(RS_binr = case_when(Sum_RS > median(Sum_RS) ~ "high",
+                             Sum_RS <= median(Sum_RS) ~ "low"))
+
+# Calculate and plot OS
+df_risk_solid_v1 <- cnr_solid_v1 %>% left_join(df_pat_sum)
+
+# Fit survival data using the Kaplan-Meier method
+surv_object <- Surv(time = df_risk_solid_v1$OS, event = df_risk_solid_v1$Death) # ------- CAHNGE TO OS = Death OR PFS - Prog
+# Fit Kaplan-Meier curve
+fit1 <- survfit(surv_object ~ RS_binr, data = df_risk_solid_v1)
+p_OS <- ggsurvplot(fit1, data = df_risk_solid_v1, pval = TRUE, risk.table=TRUE)
+p_OS
+```
+
+Save variable
+
+
+```{r}
+df_risk_v1_OS_solid <- df_risk_solid_v1
+```
+
+Plot nicer
+
+```{r}
+# Fit survival data using the Kaplan-Meier method
+surv_object <- Surv(time = df_risk_v1_OS_solid$OS, event = df_risk_v1_OS_solid$Death)  # ------- CAHNGE TO OS = Death OR PFS - Prog
+# Fit Kaplan-Meier curve
+fit1 <- survfit(surv_object ~ RS_binr, data = df_risk_v1_OS_solid)
+
+pdf(file.path(wd$output, "OS_visit_1.pdf"), width = 12, height = 8)
+ggsurvplot(fit1, data = df_risk_v1_OS_solid, pval = TRUE, risk.table=TRUE,
+           conf.int = TRUE,
+           palette = c("red", "grey50"))
+dev.off()
+
+```
+
+Get the min and max OS value for the high risk score
+
+```{r}
+summary(filter(df_risk_v1_OS_solid, RS_binr == "high") %>% pull(OS))
+summary(filter(df_risk_v1_OS_solid, RS_binr == "low") %>% pull(OS))
+```
+## Comparing liquid and solid RS
+
+
+```{r}
+solid_v1_rs <- df_risk_v1_OS_solid %>% 
+  select(PatientID, Sum_RS, RS_binr, OS) %>% 
+  rename(Sol_OS_RS = Sum_RS,
+         Sol_OS_bin = RS_binr,
+         Sol_OS = OS) %>% 
+  mutate(Sol_OS_bin2 = paste0("s_", Sol_OS_bin))
+
+
+liquid_v1_rs <- df_risk_v1_OS %>% 
+  select(PatientID, Sum_RS, RS_binr, OS) %>% 
+  rename(Liq_OS_RS = Sum_RS,
+         Liq_OS_bin = RS_binr,
+         Liq_OS = OS)
+
+v1_rs <- left_join(solid_v1_rs, liquid_v1_rs) %>% 
+  mutate(Cat_RS = case_when(
+    Sol_OS_bin == "high" & Liq_OS_bin == "high" ~ "both_high",
+    Sol_OS_bin == "low" & Liq_OS_bin == "low" ~ "both_low",
+    Sol_OS_bin == "high" & Liq_OS_bin == "low" ~ "only_solid_h",
+    Sol_OS_bin == "low" & Liq_OS_bin == "high" ~ "only_liquid_h"))
+
+
+# purity_info <- df_tumor_p3 %>% select(PatientID, ct_cut)
+# 
+# v1_rs <- v1_rs %>% left_join(purity_info)
+# 
+
+vector1 <- v1_rs$Liq_OS_bin
+vector2 <- v1_rs$Sol_OS_bin
+vector2.2 <- v1_rs$Sol_OS_bin2
+
+table(vector1, vector2.2)
+
+kappa_result2 <- cohen.kappa(x=cbind(vector1,vector2))
+
+ggplot(v1_rs, aes(x=Cat_RS, y=Sol_OS)) +
+  geom_boxplot(outlier.alpha = 0,  width = 0.4, fatten=3, alpha=0.6, colour="grey50",
+                position = position_dodge(width = 0.9)) +
+  geom_quasirandom(dodge.width=0.9, alpha=0.5, groupOnX = TRUE) +
+  NULL
+
+```
+
+
+Limit the concordance to the samples with high tumor purity and high ctDNA fraction
+
+```{r}
+g5 <- df_purity_or_v1 %>% filter(Sample_type == "Bone" & Purity_tresh == "t1_high" & ct_tresh == "ct1_high")
+```
+
+
+```{r}
+v1_rs_sub <- v1_rs %>% 
+  filter(PatientID %in% g5$PatientID)
+  
+  
+vector1 <- v1_rs_sub$Liq_OS_bin
+vector2 <- v1_rs_sub$Sol_OS_bin
+vector2.2 <- v1_rs_sub$Sol_OS_bin2
+
+table(vector1, vector2.2)
+
+kappa_result2 <- cohen.kappa(x=cbind(vector1,vector2))
+
+ggplot(v1_rs_sub, aes(x=Cat_RS, y=Sol_OS)) +
+  geom_boxplot(outlier.alpha = 0,  width = 0.4, fatten=3, alpha=0.6, colour="grey50",
+                position = position_dodge(width = 0.9)) +
+  geom_quasirandom(dodge.width=0.9, alpha=0.5, groupOnX = TRUE) +
+  NULL
+
+```
+
+Limit the concordance to high ctDNA fraction samples
+
+```{r}
+g6 <- df_purity_or_v1 %>% filter(ct_tresh == "ct1_low")
+```
+
+
+```{r}
+v1_rs_sub <- v1_rs %>% 
+  filter(PatientID %in% g6$PatientID)
+  
+  
+vector1 <- v1_rs_sub$Liq_OS_bin
+vector2 <- v1_rs_sub$Sol_OS_bin
+vector2.2 <- v1_rs_sub$Sol_OS_bin2
+
+table(vector1, vector2.2)
+
+kappa_result2 <- cohen.kappa(x=cbind(vector1,vector2))
+
+ggplot(v1_rs_sub, aes(x=Cat_RS, y=Sol_OS)) +
+  geom_boxplot(outlier.alpha = 0,  width = 0.4, fatten=3, alpha=0.6, colour="grey50",
+                position = position_dodge(width = 0.9)) +
+  geom_quasirandom(dodge.width=0.9, alpha=0.5, groupOnX = TRUE) +
+  NULL
+
+```
+
+
+
+We look at the range of the risk score in solid and liquid
+
+
+```{r}
+# Extract data 
+# 1) Risk score values
+RS_liq_PFS <- df_risk_v1_PFS$Sum_RS
+RS_liq_OS <- df_risk_v1_OS$Sum_RS
+
+RS_sol_PFS <- df_risk_v1_PFS_solid$Sum_RS
+RS_sol_OS <- df_risk_v1_OS_solid$Sum_RS
+
+# 2) Risk score binary
+RS_liq_PFS_bin <- df_risk_v1_PFS$RS_binr
+RS_liq_OS_bin <- df_risk_v1_OS$RS_binr
+
+RS_sol_PFS_bin <- df_risk_v1_PFS_solid$RS_binr
+RS_sol_OS_bin <- df_risk_v1_OS_solid$RS_binr
+
+# 3) Patient ID
+id_1 <- df_risk_v1_PFS$PatientID
+id_2 <- df_risk_v1_OS$PatientID
+
+id_3 <- df_risk_v1_PFS_solid$PatientID
+id_4 <- df_risk_v1_OS_solid$PatientID
+
+
+df_risk_values <-
+  data.frame(
+    PatientID = c(id_1, id_2, id_3, id_4),
+    RiskValue = c(RS_liq_PFS, RS_liq_OS,
+                  RS_sol_PFS, RS_sol_OS),
+    Source = c(rep("liquid", length(c(RS_liq_PFS, RS_liq_OS))),
+               rep("solid", length(c(RS_sol_PFS, RS_sol_OS)))),
+    Variable = c(rep("PFS", length(RS_liq_PFS)),
+                 rep("OS", length(RS_liq_OS)),
+                 rep("PFS", length(RS_sol_PFS)),
+                 rep("OS", length(RS_sol_OS))),
+    Cat = c(RS_liq_PFS_bin, RS_liq_OS_bin,
+                  RS_sol_PFS_bin, RS_sol_OS_bin)
+  )
+
+# Plot
+
+ggplot(df_risk_values, aes(x=Source, y=RiskValue, colour=Cat)) +
+  #geom_violin(alpha = 0.5, scale = "width", position = position_dodge(width = 0.9), colour="grey50") +
+  geom_boxplot(outlier.alpha = 0,  width = 0.1, fatten=3, alpha=0.6, colour="grey50",
+                position = position_dodge(width = 0.9)) +
+  geom_quasirandom(dodge.width=0.9, alpha=0.5, groupOnX = TRUE) +
+  facet_wrap(~Variable, ncol=1) +
+  theme_bw() +
+  theme(legend.position = "none",
+          panel.grid.major = element_line(linetype = "blank"), 
+          panel.grid.minor = element_line(linetype = "blank")) +
+  scale_colour_manual(values=c("red", "lightblue"))
+```
+
+
+Lets show it in a heatmap style
+
+```{r}
+df_1_tmp <- df_risk_v1_PFS %>% select(PatientID, RS_binr) %>% rename(RS_PFS_l = RS_binr)
+df_2_tmp <- df_risk_v1_OS %>% select(PatientID, RS_binr) %>% rename(RS_OS_l = RS_binr)
+df_3_tmp <- df_risk_v1_PFS_solid %>% select(PatientID, RS_binr) %>% rename(RS_PFS_s = RS_binr)
+df_4_tmp <- df_risk_v1_OS_solid %>% select(PatientID, RS_binr) %>% rename(RS_OS_s = RS_binr)
+
+df_tmp <- df_1_tmp %>% left_join(df_2_tmp) %>% left_join(df_3_tmp) %>% left_join(df_4_tmp) %>%
+  mutate(across(RS_PFS_l:RS_OS_s, ~ case_when(
+    . == "low" ~ 0,
+    . == "high" ~ 1))) %>% as.data.frame() %>%
+  arrange(desc(RS_PFS_s), desc(RS_OS_s), desc(RS_PFS_l), desc(RS_OS_l))
+
+
+mm <- melt(df_tmp) %>%
+  mutate(value = as.character(value),
+         PatientID = factor(PatientID, levels=df_tmp$PatientID))
+
+
+
+ggplot(mm, aes(x=PatientID, y=variable, colour=value)) +
+  geom_point(size=4, shape=15) +
+  theme_bw() +
+  theme(legend.position = "bottom",
+        panel.grid.major = element_line(linetype = "blank"), 
+        panel.grid.minor = element_line(linetype = "blank"),
+        axis.text.x = element_blank()) +
+  scale_colour_discrete(type=c("lightblue", "red")) +
+  NULL
+
+```
+Only the OS
+
+```{r}
+int_sample <- intersect(df_2_tmp$PatientID, df_4_tmp$PatientID)
+mm_OS <- mm %>%  filter(variable %in% c("RS_OS_s", "RS_OS_l")) %>% 
+  filter(PatientID %in% int_sample) 
+
+# Add purity info
+mm_OS <- mm_OS %>%  left_join(df_purity_or_v1)
+
+# Manually order based on input file
+new_or <- read_xlsx(file.path(wd$data, "heatmap_risk_or.xlsx"), sheet = 2) %>% pull(New_or)
+  
+mm_OS <- mm_OS %>% 
+  mutate(PatientID = factor(PatientID, levels=new_or))
+
+ggplot(mm_OS, aes(x=PatientID, y=variable, colour=value)) +
+  geom_point(size=4, shape=15) +
+  theme_bw() +
+  theme(legend.position = "bottom",
+        panel.grid.major = element_line(linetype = "blank"), 
+        panel.grid.minor = element_line(linetype = "blank"),
+        axis.text.x = element_blank()) +
+  scale_colour_discrete(type=c("lightblue", "red")) +
+  NULL
+
+
+ggsave(file=file.path(wd$output, "RS_OS_solid_liquid.pdf"), device = "pdf", width = 12, height = 4)
+```
+
+
+
+Calculate the concordence using kappa
+
+```{r}
+v1 <- mm_OS %>% filter(variable == "RS_OS_s")
+v2 <- mm_OS %>% filter(variable == "RS_OS_l")
+identical(v1$PatientID, v2$PatientID)
+
+
+kappa_result2 <- cohen.kappa(x=cbind(v1$value,v2$value))
+kappa_result2
+```
+
+Make it as percentage
+
+```{r}
+mm_OS_wide <- mm_OS %>% pivot_wider(names_from = variable, values_from = value)
+
+# Calculate percentage
+s1 <- mm_OS_wide %>% filter(RS_OS_s == 1) 
+s1_l0 = s1 %>% filter(RS_OS_l == 0)
+s1_l1 = s1 %>% filter(RS_OS_l == 1)
+
+# Perc in solid
+p1 <- nrow(s1_l1)  / nrow(s1) # Both 1
+p2 <- nrow(s1_l0)  / nrow(s1) # Solid 1, liquid 0
+
+s0 <- mm_OS_wide %>% filter(RS_OS_s == 0) 
+s0_l0 = s0 %>% filter(RS_OS_l == 0)
+s0_l1 = s0 %>% filter(RS_OS_l == 1)
+
+# Perc in solid
+p3 <- nrow(s0_l0)  / nrow(s0) * 100 # Both 0
+p4 <- nrow(s0_l1)  / nrow(s0) * 100 # Solid 0, liquid 1
+```
+
+
+
+#### Subset - Purity
+
+Lets plot the OS / PFS  based on purity
+
+```{r}
+# OS Based on purity
+tmp_surv <- df_risk_v1_OS_solid 
+surv_object <- Surv(time = tmp_surv$OS, event = tmp_surv$Death) 
+fit1 <- survfit(surv_object ~ Purity_tresh, data = tmp_surv)
+
+pdf(file.path(wd$output, "OS_visit_1_byPurity.pdf"), width = 12, height = 8)
+ggsurvplot(fit1, data = tmp_surv, pval = TRUE, risk.table=TRUE,
+            palette = c("#e41a1c", "#377eb8"))
+dev.off()
+
+
+# PFS Based on purity
+tmp_surv <- df_risk_v1_PFS_solid 
+surv_object <- Surv(time = df_risk_v1_OS_solid$PFS, event = df_risk_v1_OS_solid$Prog) 
+fit1 <- survfit(surv_object ~ Purity_tresh, data = tmp_surv)
+
+pdf(file.path(wd$output, "PFS_visit_1_byPurity.pdf"), width = 12, height = 8)
+ggsurvplot(fit1, data = tmp_surv, pval = TRUE, risk.table=TRUE,
+            palette = c("#e41a1c", "#377eb8"))
+dev.off()
+```
+
+
+#### Subset - Site
+
+```{r}
+# OS Based on site
+kk <- df_purity_or_v1 %>% select(PatientID, Body_Site)
+tmp_surv <- df_risk_v1_OS_solid %>% left_join(kk) 
+#tmp_surv <- tmp_surv %>% filter(Purity_tresh == "t2_low")
+surv_object <- Surv(time = tmp_surv$OS, event = tmp_surv$Death) 
+fit1 <- survfit(surv_object ~ Body_Site, data = tmp_surv)
+
+pdf(file.path(wd$output, "OS_visit_1_bySite.pdf"), width = 12, height = 8)
+ggsurvplot(fit1, data = tmp_surv, pval = TRUE, risk.table=TRUE,
+            palette = c("#8CD17D", "#FFBE7D"))
+dev.off()
+
+
+# PFS Based on site
+tmp_surv <- df_risk_v1_PFS_solid %>% left_join(kk) 
+surv_object <- Surv(time = df_risk_v1_OS_solid$PFS, event = df_risk_v1_OS_solid$Prog) 
+fit1 <- survfit(surv_object ~ Body_Site, data = tmp_surv)
+
+pdf(file.path(wd$output, "PFS_visit_1_bySite.pdf"), width = 12, height = 8)
+ggsurvplot(fit1, data = tmp_surv, pval = TRUE, risk.table=TRUE,
+            palette = c("#8CD17D", "#FFBE7D"))
+dev.off()
+```
+
+
+
+
+#### Visit 2
+
+Run risk score calculation for visit 2
+
+```{r,warning=FALSE, message=FALSE}
+# Get copy number call
+cnr_solid_v1 <- abs(mat_solid_v2) %>% as.data.frame() %>% t() # -- without filtering
+
+colnames(cnr_solid_v1) <- gsub(" .*", "", colnames(cnr_solid_v1)) 
+cnr_solid_v1 <- cnr_solid_v1 %>% as.data.frame() %>%
+  tibble::rownames_to_column(var = "PatientID") %>% 
+  left_join(os_v2) %>%        # EDIT FOR VISIT 1 or VISIT 2
+  rename(NXK3.1 = 'NKX3-1')
+
+# add additionall annotation
+df_purity_sub <- df_purity_or_v2 %>% select(PatientID, Purity_tresh)
+cnr_solid_v1 <- cnr_solid_v1 %>% left_join(df_purity_sub) #%>%
+
+# Get cox
+cox_results <- list()
+gene_col <- cnr_solid_v1 %>% select(AR:NXK3.1 ) %>% colnames()
+for (gene in colnames(cnr_solid_v1)[2:12]) {
+  
+  tmp_df <- cnr_solid_v1 %>% select(!!as.name(gene), OS, Death) %>% # ------- CAHNGE TO OS = Death OR PFS - Prog
+    rename(gene = !!as.name(gene))
+  cox_model <- summary(coxph(Surv(OS, Death) ~ gene, data = tmp_df))
+  
+  cox_results[[gene]] <- cox_model$coefficients
+}
+
+cox_result_v1 <- do.call(rbind, cox_results) %>% as.data.frame()
+rownames(cox_result_v1) <- gene_col
+
+df_cox_v1 <- tibble(rownames_to_column(cox_result_v1, var = "Gene")) %>%
+  rename(pVal = 'Pr(>|z|)') %>%
+  filter(!is.na(coef))
+
+# Only for bone / non-bone
+#pat_all <- bone_samp
+
+# All patient
+pat_all <- cnr_solid_v1$PatientID
+pat_sum_list <- list()
+
+for (i in seq_along(pat_all)){
+  patID <- pat_all[i]
+  pat_1 <- cnr_solid_v1 %>% filter(PatientID == patID) %>% select(PatientID, df_cox_v1$Gene) %>% 
+    pivot_longer(!PatientID, names_to = "Gene", values_to = "CNR") %>%
+    left_join(df_cox_v1) %>%
+    # Calculate risk score
+    mutate(RS = coef * CNR)
+  # get the sum
+  pat_sum_list[[i]] <- sum(pat_1$RS)
+}
+
+df_pat_sum <- data.frame(
+  PatientID = pat_all,
+  Sum_RS = unlist(pat_sum_list)
+)
+
+
+df_pat_sum <- df_pat_sum %>% 
+  mutate(RS_binr = case_when(Sum_RS > median(Sum_RS) ~ "high",
+                             Sum_RS <= median(Sum_RS) ~ "low"))
+
+# Calculate risk score
+df_risk_v2_OS_solid <- cnr_solid_v1 %>% left_join(df_pat_sum)
+```
+
+Repeat for PFS
+
+```{r, warning=FALSE, message=FALSE}
+# Get copy number call
+cnr_solid_v1 <- abs(mat_solid_v2) %>% as.data.frame() %>% t() # -- without filtering
+
+colnames(cnr_solid_v1) <- gsub(" .*", "", colnames(cnr_solid_v1)) 
+cnr_solid_v1 <- cnr_solid_v1 %>% as.data.frame() %>%
+  tibble::rownames_to_column(var = "PatientID") %>% 
+  left_join(os_v2) %>%        # EDIT FOR VISIT 1 or VISIT 2
+  rename(NXK3.1 = 'NKX3-1')
+
+# add additionall annotation
+df_purity_sub <- df_purity_or_v2 %>% select(PatientID, Purity_tresh)
+cnr_solid_v1 <- cnr_solid_v1 %>% left_join(df_purity_sub) #%>%
+
+# Get cox
+cox_results <- list()
+gene_col <- cnr_solid_v1 %>% select(AR:NXK3.1 ) %>% colnames()
+for (gene in colnames(cnr_solid_v1)[2:12]) {
+  
+  tmp_df <- cnr_solid_v1 %>% select(!!as.name(gene), PFS, Prog) %>% # ------- CAHNGE TO OS = Death OR PFS - Prog
+    rename(gene = !!as.name(gene))
+  cox_model <- summary(coxph(Surv(PFS, Prog) ~ gene, data = tmp_df))
+  
+  cox_results[[gene]] <- cox_model$coefficients
+}
+
+cox_result_v1 <- do.call(rbind, cox_results) %>% as.data.frame()
+rownames(cox_result_v1) <- gene_col
+
+df_cox_v1 <- tibble(rownames_to_column(cox_result_v1, var = "Gene")) %>%
+  rename(pVal = 'Pr(>|z|)') %>%
+  filter(!is.na(coef))
+
+# Only for bone / non-bone
+#pat_all <- bone_samp
+
+# All patient
+pat_all <- cnr_solid_v1$PatientID
+pat_sum_list <- list()
+
+for (i in seq_along(pat_all)){
+  patID <- pat_all[i]
+  pat_1 <- cnr_solid_v1 %>% filter(PatientID == patID) %>% select(PatientID, df_cox_v1$Gene) %>% 
+    pivot_longer(!PatientID, names_to = "Gene", values_to = "CNR") %>%
+    left_join(df_cox_v1) %>%
+    # Calculate risk score
+    mutate(RS = coef * CNR)
+  # get the sum
+  pat_sum_list[[i]] <- sum(pat_1$RS)
+}
+
+df_pat_sum <- data.frame(
+  PatientID = pat_all,
+  Sum_RS = unlist(pat_sum_list)
+)
+
+
+df_pat_sum <- df_pat_sum %>% 
+  mutate(RS_binr = case_when(Sum_RS > median(Sum_RS) ~ "high",
+                             Sum_RS <= median(Sum_RS) ~ "low"))
+
+# Calculate risk score
+df_risk_v2_PFS_solid <- cnr_solid_v1 %>% left_join(df_pat_sum)
+```
+
+
+
+
+# Objective 2
+
+## Compare CNR score
+
+
+```{r}
+df_CNR <- df_simple2
+prog_dat <- d_v %>% select(SubjectID, Prog)
+  
+#df_CNR <- df_simple2
+df_CNR2 <- df_CNR %>% left_join(prog_dat) %>%
+  mutate(Prog = case_when(Prog == 0 ~ "Non-responder",
+                          Prog == 1 ~ "Responder"))
+```
+
+Example plot
+
+```{r}
+tt <- df_CNR2 %>% filter(Genes == "AR")
+v1_id <- df_CNR2 %>% filter(visit == "V1") %>% pull(SubjectID)
+v2_id <- df_CNR2 %>% filter(visit == "V2") %>% pull(SubjectID)
+int_id <- intersect(v1_id, v2_id)
+
+tt2 <- filter(tt, SubjectID %in% int_id) %>% distinct()
+#write.csv(tt2, "~/Desktop/tmp.csv")
+
+ggplot(tt2, aes(x=visit, y=lg2CNR)) +
+  geom_point() +
+  geom_line(aes(group=SubjectID)) +
+  facet_wrap(Genes~Prog, ncol=6) +
+  geom_signif(
+    comparisons = list(c("V1", "V2")),
+    map_signif_level = TRUE, textsize = 6,
+    test = "t.test",
+    test.args = list(paired = TRUE),
+  ) + theme_bw() +
+  NULL
+  
+
+```
+
+
+Now repeat for each plot
+
+```{r}
+# Repeat for each plot
+df_CNR3 <- df_CNR2 %>% filter(SubjectID %in% int_id) %>% distinct()
+
+list_p <- list()
+
+uq <- unique(df_CNR3$Genes)
+
+for (i in seq_along(uq)) {
+  
+  tt2 <- df_CNR3 %>% filter(Genes == uq[i])
+  
+  # Get 20% of max to increase scale to add the significant bar
+  min_val <- min(tt2$lg2CNR)
+  max_val <- max(tt2$lg2CNR)
+  max_val <- max_val * 2
+  
+  pp <- ggplot(tt2, aes(x=visit, y=lg2CNR)) +
+    geom_point() +
+    geom_line(aes(group=SubjectID)) +
+    facet_wrap(Genes~Prog, ncol=6) +
+    geom_signif(
+      comparisons = list(c("V1", "V2")),
+      map_signif_level = TRUE, textsize = 6,
+      test = "t.test",
+      test.args = list(paired = TRUE),
+    ) + theme_bw() +
+    scale_y_continuous(limits=c(min_val, max_val ))
+    NULL
+  
+  list_p[[i]] <- pp
+}
+
+pdf(file.path(wd$output, "CNR_genes_Res_vs_nonRes.pdf"), height = 10, width = 15)
+list_p[[1]] + list_p[[2]] +
+  list_p[[3]] + list_p[[4]] +
+  list_p[[5]] + list_p[[6]] +
+  list_p[[7]] + list_p[[8]] +
+  list_p[[9]] + list_p[[10]] + 
+  list_p[[11]] + plot_layout(ncol=4)
+dev.off()
+
+```
+
+## Compare risk score
+
+We compare the risk score of OS and PFS for visit1 and visit 2
+
+
+
+```{r}
+# df linking patientID with subject ID
+tmp_df_1 <- d_v %>% select(SubjectID, Visit_1_ID) %>% rename(PatientID = Visit_1_ID) %>% distinct()
+tmp_df_2 <- d_v %>% select(SubjectID, Visit_2_ID) %>% rename(PatientID = Visit_2_ID) %>% distinct()
+
+# OS
+t1 <- df_risk_v1_OS_solid %>% mutate(Visit = "V1") %>% select(PatientID, Sum_RS, Visit, Res, RS_binr) %>% left_join(tmp_df_1)
+t2 <- df_risk_v2_OS_solid %>% mutate(Visit = "V2") %>% select(PatientID, Sum_RS, Visit, Res, RS_binr) %>% left_join(tmp_df_2)
+df_os_risk <- rbind(t1, t2) 
+
+# PFS
+t1 <- df_risk_v1_PFS_solid %>% mutate(Visit = "V1") %>% select(PatientID, Sum_RS, Visit, Res, RS_binr) %>% left_join(tmp_df_1)
+t2 <- df_risk_v2_PFS_solid %>% mutate(Visit = "V2") %>% select(PatientID, Sum_RS, Visit, Res, RS_binr) %>% left_join(tmp_df_2)
+df_pfs_risk <- rbind(t1, t2) 
+
+```
+
+Plot
+
+```{r}
+int_id <- intersect(t1$SubjectID, t2$SubjectID)
+
+df_os_risk <- filter(df_os_risk, SubjectID %in% int_id) %>% distinct() %>%
+  mutate(Res = case_when(Res == 0 ~ "non-responder",
+                         Res == 1 ~ "responder"))
+
+# Get numeber of Res and Non-res
+xx <- df_os_risk %>% filter(Visit == "V1")
+table(xx$Res)
+
+p_os <- 
+  ggplot(df_os_risk, aes(x=Visit, y=Sum_RS)) +
+  geom_point(size=2) +
+  geom_line(aes(group=SubjectID)) +
+  facet_wrap(~Res, ncol=2) +
+  geom_signif(
+    comparisons = list(c("V1", "V2")),
+    map_signif_level = FALSE, textsize = 6,
+    test = "t.test",
+    test.args = list(paired = TRUE),
+  ) + 
+  theme_bw() +
+  theme(legend.position = "none",
+          panel.grid.major = element_line(linetype = "blank"), 
+          panel.grid.minor = element_line(linetype = "blank")) +
+  NULL
+
+p_os
+
+ggsave(p_os, file=file.path(wd$output, "RS_OS_response.pdf"), device = "pdf", width = 12, height = 8)
+```
+
+Make plot nicer
+
+```{r}
+# https://yjunechoe.github.io/posts/2020-07-13-geom-paired-raincloud/
+p_OS2 <- 
+df_os_risk %>% 
+  arrange(Visit) %>%
+  ggplot(aes(x = Visit, y = Sum_RS, fill = Visit)) +
+  #geom_paired_raincloud(alpha = .5, trim=TRUE, scale="count") +
+  geom_point(aes(group = SubjectID),
+             #position = position_nudge(c(.15, -.15)),
+             alpha = 1) +
+  geom_line(aes(group = SubjectID),
+            #position = position_nudge(c(.13, -.13)),
+            linetype = 3) +
+  geom_boxplot(position = position_nudge(c(-.08, .08)),
+               alpha = .5, width = .05, outlier.shape = " ") +
+  facet_wrap(~Res) +
+  theme_bw() +
+  theme(legend.position = "none",
+        panel.grid.major = element_line(linetype = "blank"), 
+        panel.grid.minor = element_line(linetype = "blank")) +
+  geom_signif(
+    comparisons = list(c("V1", "V2")),
+    map_signif_level = TRUE, textsize = 6,
+    test = "t.test",
+    test.args = list(paired = TRUE),
+  ) + 
+  NULL
+
+ggsave(p_OS2, file=file.path(wd$output, "RS_OS_response_2.pdf"), device = "pdf", width = 12, height = 8)
+```
+
+
+For PFS
+
+
+```{r}
+df_pfs_risk <- filter(df_pfs_risk, SubjectID %in% int_id) %>% distinct() %>%
+  mutate(Res = case_when(Res == 0 ~ "non-responder",
+                         Res == 1 ~ "responder"))
+
+p_pfs <-
+  ggplot(df_pfs_risk, aes(x=Visit, y=Sum_RS)) +
+  geom_point(size=2) +
+  geom_line(aes(group=SubjectID)) +
+  facet_wrap(~Res, ncol=2) +
+  geom_signif(
+    comparisons = list(c("V1", "V2")),
+    map_signif_level = FALSE, textsize = 6,
+    test = "t.test",
+    test.args = list(paired = TRUE),
+  ) + 
+  theme_bw() +
+  theme(legend.position = "none",
+          panel.grid.major = element_line(linetype = "blank"), 
+          panel.grid.minor = element_line(linetype = "blank")) +
+  NULL
+p_pfs
+
+ggsave(p_pfs, file=file.path(wd$output, "RS_PFS_response.pdf"), device = "pdf", width = 12, height = 8)
+```
+
+Make plot nicer
+
+```{r}
+# https://yjunechoe.github.io/posts/2020-07-13-geom-paired-raincloud/
+p_PFS2 <- 
+df_pfs_risk %>% 
+  arrange(Visit) %>%
+  ggplot(aes(x = Visit, y = Sum_RS, fill = Visit)) +
+  #geom_paired_raincloud(alpha = .5, trim=TRUE, scale="count") +
+  geom_point(aes(group = SubjectID),
+             #position = position_nudge(c(.15, -.15)),
+             alpha = 1) +
+  geom_line(aes(group = SubjectID),
+            #position = position_nudge(c(.13, -.13)),
+            linetype = 3) +
+  geom_boxplot(position = position_nudge(c(-.08, .08)),
+               alpha = .5, width = .05, outlier.shape = " ") +
+  facet_wrap(~Res) +
+  theme_bw() +
+  theme(legend.position = "none",
+        panel.grid.major = element_line(linetype = "blank"), 
+        panel.grid.minor = element_line(linetype = "blank")) +
+  geom_signif(
+    comparisons = list(c("V1", "V2")),
+    map_signif_level = FALSE, textsize = 6,
+    test = "t.test",
+    test.args = list(paired = TRUE),
+  ) + 
+  NULL
+
+ggsave(p_PFS2, file=file.path(wd$output, "RS_PFS_response_2.pdf"), device = "pdf", width = 12, height = 8)
+```
+
+
+Save the risk score information
+
+
+```{r}
+# OS
+t1 <- df_risk_v1_OS_solid %>% mutate(Visit = "V1") %>% select(PatientID, Sum_RS, Visit, Res, RS_binr) %>% left_join(tmp_df_1) %>%
+  rename(RS_OS = Sum_RS,
+         RS_OS_bin = RS_binr) 
+t2 <- df_risk_v1_PFS_solid %>% mutate(Visit = "V1") %>% select(PatientID, Sum_RS, Visit, Res, RS_binr) %>% left_join(tmp_df_1) %>%
+  rename(RS_PFS = Sum_RS,
+         RS_PFS_bin = RS_binr)  %>%
+  select(PatientID, RS_PFS, RS_PFS_bin)
+
+df_visit_1_rs <- left_join(t1, t2)
+
+write.csv(df_visit_1_rs, file.path(wd$output, "Visit_1_RS.csv"))
+
+# PFS
+t1 <- df_risk_v2_OS_solid %>% mutate(Visit = "V2") %>% select(PatientID, Sum_RS, Visit, Res, RS_binr) %>% left_join(tmp_df_2) %>%
+    rename(RS_OS = Sum_RS,
+         RS_OS_bin = RS_binr) 
+t2 <- df_risk_v2_PFS_solid %>% mutate(Visit = "V2") %>% select(PatientID, Sum_RS, Visit, Res, RS_binr) %>% left_join(tmp_df_2) %>%
+  rename(RS_PFS = Sum_RS,
+         RS_PFS_bin = RS_binr)  %>%
+  select(PatientID, RS_PFS, RS_PFS_bin)
+
+df_visit_2_rs <- left_join(t1, t2)
+
+
+write.csv(df_visit_2_rs, file.path(wd$output, "Visit_2_RS.csv"))
+```
+
+### ctDNA compare
+
+We compare ctDNA before and after treatment
+
+```{r}
+ct_info <- df_tumor_p3 %>% select(PatientID, ctDNA, ct_cut)
+df_pfs_risk_ct <- df_pfs_risk %>% left_join(ct_info)
+
+# Make ctDNA plot
+p_ctDNA <- 
+df_pfs_risk_ct %>% 
+  arrange(Visit) %>%
+  ggplot(aes(x = Visit, y = ctDNA, fill = Visit)) +
+  #geom_paired_raincloud(alpha = .5, trim=TRUE, scale="count") +
+  geom_point(aes(group = SubjectID),
+             #position = position_nudge(c(.15, -.15)),
+             alpha = 1) +
+  geom_line(aes(group = SubjectID),
+            #position = position_nudge(c(.13, -.13)),
+            linetype = 3) +
+  geom_boxplot(position = position_nudge(c(-.08, .08)),
+               alpha = .5, width = .05, outlier.shape = " ") +
+  facet_wrap(~Res) +
+  theme_bw() +
+  theme(legend.position = "none",
+        panel.grid.major = element_line(linetype = "blank"), 
+        panel.grid.minor = element_line(linetype = "blank")) +
+  geom_signif(
+    comparisons = list(c("V1", "V2")),
+    map_signif_level = FALSE, textsize = 6,
+    test = "t.test",
+    test.args = list(paired = TRUE),
+  ) + 
+  NULL
+
+ggsave(p_ctDNA, file=file.path(wd$output, "ctDNA_response_2.pdf"), device = "pdf", width = 12, height = 8)
+```
+
+
+
+
+
+# Public risk score
+
+Lets calculate the risk score using an independent data. For this we use this [paper](https://www.pnas.org/doi/10.1073/pnas.1902651116) and the cBioPoral [link](https://www.cbioportal.org/study/summary?id=prad_su2c_2019). Its the stand up to cancer where we have treatment naive patients and the information on OS. 
+
+Lets read clinical data and OS data into R
+
+```{r}
+# Where we manually select the pre-treatment
+# We extracted the metadata from the supplemntary table of the original publication - https://www.ncbi.nlm.nih.gov/pubmed/31061129
+d6_pub <- read_xlsx(file.path(wd$data, "public_data/pnas.1902651116.sd01_filtered.xlsx")) %>%
+  # Filter to Adrenocarcioma samples and treatment Naive
+  filter(`Pathology Classification` == "Adenocarcinoma" & 
+           `Abiraterone (ABI) and Enzalutamide (ENZA) Exposure Status` == "Naive" &
+           `Taxane exposure status` == "Naïve") 
+
+# All 444 samples from cBioPortal 
+d6_sub <- read_xlsx(file.path(wd$data, "public_data/cBioPortal_prostate/02_prad_su2c_2019_clinical_data.xlsx"))  %>%
+  # Subset
+  filter(`Patient ID` %in% d6_pub$`Subject ID`) %>%
+  filter(`Abiraterone (ABI) and Enzalutamide (ENZA) Exposure Status` == "Naive") %>%
+  # Add column to be used in cBioPortal
+  mutate(Study_Sample_ID = paste(`Study ID`, `Sample ID`, sep= ":"))
+
+writexl::write_xlsx(d6_sub, file.path(wd$output, "PNAS_2019_Naive.xlsx"))
+
+```
+
+
+Using the naive samples above, **query cBioPotal for the 11 genes alternations in search box**. Use the identifier from "Sample ID" column in the excel file above to query cBioPortal.  
+
+cBioPortal provdes two ways of downlading the data. The first from the OncoPrint plot itself you can download the Tabluar data. The second from the "Download" tab under "Downloadable Data Files". 
+
+An alternate way to download data from cBioPortal is without querying the genes of interest. On the main [page](https://www.cbioportal.org/study/summary?id=prad_su2c_2019), we can go to the download symbol button at the top of the page. The direct link to download all data from this study is - https://cbioportal-datahub.s3.amazonaws.com/prad_su2c_2019.tar.gz.
+
+
+
+
+
+```{r}
+# First file from OoncoPrint plot
+# We cleaned the file to make amp:-1 and del :1
+d1 <- read_xlsx(file.path(wd$data, "public_data/cBioPortal_prostate/SU2C_perPatient_CNV/PATIENT_DATA_oncoprint_edited.xlsx"))
+
+
+# Read the 2nd file
+d2 <- read.delim(file.path(wd$data, "public_data/cBioPortal_prostate/SU2C_perPatient_CNV/cna_edit.txt"))
+
+# When we read in the full data of cBioportal
+# d2 <- read.delim(file.path(wd$data, "public_data/cBioPortal_prostate/SU2C_perPatient_CNV/data_cna.txt")) %>% 
+#   filter(Hugo_Symbol %in% gene_or)
+# Need to use readr package, other wise colnames will have .
+d2 <- read_delim(file.path(wd$data, "public_data/cBioPortal_prostate/SU2C_perPatient_CNV/data_cna.txt")) %>%
+  filter(Hugo_Symbol %in% gene_or)
+# Subset to the 126 treatment naive patients
+pt_naive <- d6_sub$`Sample ID`
+
+gene_name <- d2$Hugo_Symbol
+d2 <- d2[,pt_naive]
+d2 <- t(d2)
+colnames(d2) <- gene_name
+
+# The matching patient ID and smample id
+d3 <- read.delim(file.path(wd$data, "public_data/cBioPortal_prostate/SU2C_perPatient_CNV/alterations_across_samples.tsv")) %>% 
+  select(Sample_ID, Patient_ID)
+  
+```
+
+Lets convert the call to binary, similar to the PROMOTE cohort
+
+```{r}
+d2 <- d2 %>% as.data.frame() %>% tibble::rownames_to_column(var = "Sample_ID")
+# Exclude with no data on all genes
+d2 <- d2 %>% na.omit()
+
+# Rearrange the df to make it easier
+d2 <- d2 %>% select(Sample_ID, one_of(gene_or))
+
+d2 <- d2 %>%
+  mutate(
+    across(AR:NOTCH1, ~ case_when(
+      . == 0 ~ 0,
+      . == -1 ~ 0,
+      . == -2 ~ 0,
+      . == 1 ~ 1,
+      . == 2 ~ 1)),
+    across(TMPRSS2:'NKX3-1', ~ case_when(
+      . == 0 ~ 0,
+      . == -1 ~ -1,
+      . == -2 ~ -1,
+      . == 1 ~ 0,
+      . == 2 ~ 0)))
+
+```
+
+
+
+The first data has OS information extracted from cBioPortal, we also have OS information from the publication. We see if these matches
+
+
+```{r}
+d6_sub2 <- d6_sub %>% 
+  rename(Patient = 'Patient ID',
+         Sample_ID = 'Sample ID',
+         OS_supp = 'Overall Survival (Months)',
+         OS_status_supp = 'Overall Survival Status',
+         AR_Score = 'AR Score',
+         NEPC_Score = 'NEPC Score') %>%
+  dplyr::select(Sample_ID, OS_supp,OS_status_supp,AR_Score,NEPC_Score) %>%
+  mutate(OS_status_supp = gsub(":.*", "", OS_status_supp))
+
+# df_1 <- d1 %>%  left_join(d6_sub2) %>%  # Yes its the same 
+#   mutate(across(AR:ZBTB16, ~ case_when(
+#     . == -1 ~ 1,
+#     TRUE ~ . ))) %>% 
+#     mutate(OS_supp = as.numeric(OS_supp),
+#          OS_status_supp = as.numeric(OS_status_supp)) %>%
+#   filter(!is.na(OS_supp)) %>%
+#   select(-OS, -Death) %>%
+#   rename(Patient_ID = Patient)
+
+```
+
+
+Add OS to the 2nd file, but first add the patient ID
+
+```{r}
+df_2 <- d2 %>%  left_join(d3) %>%  
+    mutate(across(AR:'NKX3-1', ~ case_when(
+    . == -1 ~ 1,
+    TRUE ~ . ))) %>% 
+  left_join(d6_sub2, by = c("Sample_ID" = "Sample_ID")) %>%
+  mutate(OS_supp = as.numeric(OS_supp),
+         OS_status_supp = as.numeric(OS_status_supp)) %>%
+  filter(!is.na(OS_supp))
+
+
+```
+
+Now lets calculate the risk score and run survival analysis. Modify the top to df_1 or df_2 based on the input data. 
+
+```{r,message=FALSE, warning=FALSE}
+# Calculate cox
+in_df <- df_2
+cox_results <- list()
+gene_col <- in_df %>% select(AR:'NKX3-1' ) %>% colnames()
+for (gene in colnames(in_df)[2:12]) {
+  
+  tmp_df <- in_df %>% select(!!as.name(gene), OS_supp, OS_status_supp) %>% # ------- CAHNGE TO OS = Death OR PFS - Prog
+    rename(gene = !!as.name(gene))
+  cox_model <- summary(coxph(Surv(OS_supp, OS_status_supp) ~ gene, data = tmp_df))
+  
+  cox_results[[gene]] <- cox_model$coefficients
+}
+
+cox_result_v1 <- do.call(rbind, cox_results) %>% as.data.frame()
+rownames(cox_result_v1) <- gene_col
+
+df_cox_v1 <- tibble(rownames_to_column(cox_result_v1, var = "Gene")) %>%
+  rename(pVal = 'Pr(>|z|)') %>%
+  filter(!is.na(coef))
+
+# Cacluate Risk score
+# All patient
+pat_all <- in_df$Patient_ID
+pat_sum_list <- list()
+
+for (i in seq_along(pat_all)){
+  patID <- pat_all[i]
+  pat_1 <- in_df %>% filter(Patient_ID == patID) %>% select(Patient_ID, df_cox_v1$Gene) %>% 
+    pivot_longer(!Patient_ID, names_to = "Gene", values_to = "CNR") %>%
+    left_join(df_cox_v1) %>%
+    # Calculate risk score
+    mutate(RS = coef * CNR)
+  # get the sum
+  pat_sum_list[[i]] <- sum(pat_1$RS)
+}
+
+df_pat_sum <- data.frame(
+  Patient_ID = pat_all,
+  Sum_RS = unlist(pat_sum_list)
+)
+
+
+df_pat_sum <- df_pat_sum %>% 
+  mutate(RS_binr = case_when(Sum_RS > median(Sum_RS) ~ "high",
+                             Sum_RS <= median(Sum_RS) ~ "low"))
+
+# Calculate and plot OS
+df_risk_public <- in_df %>% left_join(df_pat_sum)
+
+write.csv(df_risk_public, file.path(wd$output, "cBioPortal_riskScore.csv"))
+
+# Fit survival data using the Kaplan-Meier method
+surv_object <- Surv(time = df_risk_public$OS_supp, event = df_risk_public$OS_status_supp) # ------- CAHNGE TO OS = Death OR PFS - Prog
+# Fit Kaplan-Meier curve
+fit1 <- survfit(surv_object ~ RS_binr, data = df_risk_public)
+p_OS <- ggsurvplot(fit1, data = df_risk_public, pval = TRUE, risk.table=TRUE)
+p_OS
+
+```
+
+Make figure nicer
+
+```{r}
+pdf(file.path(wd$output, "OS_cBioPortal.pdf"), width = 12, height = 8)
+ggsurvplot(fit1, data = df_risk_public, pval = TRUE, risk.table=TRUE,
+           conf.int = TRUE,
+           palette = c("#e41a1c", "#7F7F7F"))
+dev.off()
+```
+
+
+## Other risk score
+
+In the cBioportal dataset, we had two other clinical information, the NEPC and AR score. 
+
+We binarize this score based on median
+
+```{r}
+df_risk_public_AR <- df_risk_public %>% 
+  filter(!is.na(AR_Score)) %>% 
+  filter(!AR_Score == "NA") %>% 
+  mutate(AR_Score = as.numeric(AR_Score),
+         AR_Score_bin = case_when(
+           AR_Score > median(AR_Score) ~ "high",
+           AR_Score <= median(AR_Score) ~ "low"))
+
+  
+surv_object <- Surv(time = df_risk_public_AR$OS_supp, event = df_risk_public_AR$OS_status_supp)    
+```
+
+
+```{r}
+# Fit survival data using the Kaplan-Meier method
+surv_object <- Surv(time = df_risk_public_AR$OS_supp, event = df_risk_public_AR$OS_status_supp) 
+# Fit Kaplan-Meier curve
+fit1 <- survfit(surv_object ~ AR_Score_bin, data = df_risk_public_AR)
+p_OS_AR <- ggsurvplot(fit1, data = df_risk_public_AR, pval = TRUE, risk.table=TRUE, conf.int = TRUE)
+p_OS_AR
+```
+
+
+Repeat for NEPC
+
+```{r}
+df_risk_public_NEPC <- df_risk_public %>% 
+  filter(!is.na(NEPC_Score)) %>% 
+  filter(!NEPC_Score == "NA") %>% 
+  mutate(NEPC_Score = as.numeric(NEPC_Score),
+         NEPC_Score_bin = case_when(
+           NEPC_Score > median(NEPC_Score) ~ "high",
+           NEPC_Score <= median(NEPC_Score) ~ "low"))
+
+  
+surv_object <- Surv(time = df_risk_public_NEPC$OS_supp, event = df_risk_public_NEPC$OS_status_supp)   
+
+# Fit survival data using the Kaplan-Meier method
+surv_object <- Surv(time = df_risk_public_NEPC$OS_supp, event = df_risk_public_NEPC$OS_status_supp) 
+# Fit Kaplan-Meier curve
+fit1 <- survfit(surv_object ~ NEPC_Score_bin, data = df_risk_public_NEPC)
+p_OS_NEPC <- ggsurvplot(fit1, data = df_risk_public_NEPC, pval = TRUE, risk.table=TRUE, conf.int = TRUE)
+p_OS_NEPC
+```
+
+Save the plot
+
+```{r}
+pdf(file.path(wd$output, "OS_cBioPortal_AR_NEPC.pdf"), width = 12, height = 8)
+p_OS_AR
+p_OS_NEPC
+dev.off()
+```
+
+Save the risk score information, alongside the AR and NEPC score
+
+```{r}
+t1 <- df_risk_public_NEPC %>% select(Sample_ID, NEPC_Score, NEPC_Score_bin)
+t2 <- df_risk_public_AR %>% select(Sample_ID, AR_Score, AR_Score_bin)
+
+df_risk_public_full <- df_risk_public %>% 
+  select(-AR_Score, -NEPC_Score) %>% 
+  left_join(t1) %>% 
+  left_join(t2)
+
+
+write.csv(df_risk_public_full, file.path(wd$output, "cBioPortal_riskScore.csv"))
+
+```
+
+
+## Pre-calculated weights
+
+What if we used the pre-calculated weights
+
+```{r, warning=FALSE, message=FALSE}
+# We stotred the visit 1 coeeficients - df_cox_visit_1
+in_df <- df_2
+
+
+pat_all <- in_df$Patient_ID
+pat_sum_list <- list()
+
+for (i in seq_along(pat_all)){
+  patID <- pat_all[i]
+  pat_1 <- in_df %>% filter(Patient_ID == patID) %>% select(Patient_ID, df_cox_v1$Gene) %>% 
+    pivot_longer(!Patient_ID, names_to = "Gene", values_to = "CNR") %>%
+    left_join(df_cox_visit_1) %>%
+    # Calculate risk score
+    mutate(RS = coef * CNR)
+  # get the sum
+  pat_sum_list[[i]] <- sum(pat_1$RS)
+}
+
+df_pat_sum <- data.frame(
+  Patient_ID = pat_all,
+  Sum_RS = unlist(pat_sum_list)
+)
+
+
+
+df_pat_sum <- df_pat_sum %>% 
+  mutate(RS_binr = case_when(Sum_RS > median(Sum_RS) ~ "high",
+                             Sum_RS <= median(Sum_RS) ~ "low"))
+
+# Calculate and plot OS
+df_risk_public <- in_df %>% left_join(df_pat_sum)
+
+# Fit survival data using the Kaplan-Meier method
+surv_object <- Surv(time = df_risk_public$OS_supp, event = df_risk_public$OS_status_supp) # ------- CAHNGE TO OS = Death OR PFS - Prog
+# Fit Kaplan-Meier curve
+fit1 <- survfit(surv_object ~ RS_binr, data = df_risk_public)
+p_OS <- ggsurvplot(fit1, data = df_risk_public, pval = TRUE, risk.table=TRUE)
+p_OS
+```
+
+
+# Wyatt risk score
+
+
+Manish reached out to Wyatt for his patients clinical outcome and copy number scores. We read in the data provided. 
+
+```{r}
+dat_wyat <- readxl::read_xlsx(file.path(wd$data, "validation_cohort_kohli_feb_14_2024_edit.xlsx"))
+```
+
+Make the copy number calls on selected genes. Wyatt have data only from 8 of the 11 genes we are interested in.
+
+```{r}
+# We use 0.3 / -0.3 threshold
+thresh_val <- 0.3
+
+# Note that some of the samples does not have CNV calls for TMPRSS2. 
+# So we will keep a data frame with all samples and a second data frame excluding these samples
+
+# Full samples
+dat_wyatt_full <- dat_wyat %>% 
+  rename(OS = 'OS (days) measured from initiation of 1L mCRPC treatment',
+         Death = 'Survival status (alive or lost to follow-up = 0; dead = 1)',
+         PFS = 'PSA PFS (days) measured from initiation of 1L mCRPC treatment',
+         Prog = 'PSA progression (no = 0; yes = 1)',
+         Txt = '1L mCRPC systemic treatment (abiraterone = 1; enzalutamide = 2; docetaxel = 3; cabazitaxel = 4; other = 5; radium-223 = 6)',
+         ALP = 'ALP per ULN',
+         LDH = 'LDH per ULN',
+         Hb = 'Hb (g/L)') %>% 
+  select(Patient_ID, 
+         AR, MYC, PIK3CA, PIK3CB, 
+         NKX3.1, TMPRSS2, TP53, ZBTB16,
+         OS, Death, PFS, Prog,
+         Txt, ALP, LDH, Hb) %>% 
+  mutate(
+    OS = round(OS/30.417, digit=2),
+    PFS = round(PFS/30.417, digit=2),
+    across(AR:PIK3CB, ~ case_when(
+      . >= thresh_val ~ 1,
+      TRUE ~ 0)),
+    across(NKX3.1:ZBTB16, ~ case_when(
+      . <= -thresh_val ~ -1,
+      is.na(.) ~ NA,
+      TRUE ~ 0))
+    ) %>% as.data.frame()
+
+dat_wyatt <- dat_wyatt_full %>% 
+  # Note that some of the samples does not have CNV calls for TMPRSS2. So we will exclude these samples
+  filter(!is.na(TMPRSS2))
+
+
+# # Filter to those that was treated with Abi
+# #dat_wyatt_abi <- dat_wyatt %>% filter(Txt == 1)
+# dat_wyatt_abi <- dat_wyatt 
+```
+
+
+
+## Risk score
+
+### OS
+
+Calculate risk score based on OS
+
+```{r,warning=FALSE, message=FALSE}
+# Calculate cox
+in_df <- dat_wyatt
+cox_results <- list()
+gene_col <- in_df %>% select(AR:ZBTB16 ) %>% colnames()
+for (gene in colnames(in_df)[2:9]) {
+  
+  tmp_df <- in_df %>% select(!!as.name(gene), OS, Death) %>% # ------- CAHNGE TO OS = Death OR PFS - Prog
+    rename(gene = !!as.name(gene))
+  cox_model <- summary(coxph(Surv(OS, Death) ~ gene, data = tmp_df))
+  
+  cox_results[[gene]] <- cox_model$coefficients
+}
+
+cox_result_v1 <- do.call(rbind, cox_results) %>% as.data.frame()
+rownames(cox_result_v1) <- gene_col
+
+df_cox_v1 <- tibble(rownames_to_column(cox_result_v1, var = "Gene")) %>%
+  rename(pVal = 'Pr(>|z|)') %>%
+  filter(!is.na(coef))
+
+# Cacluate Risk score
+# All patient
+pat_all <- in_df$Patient_ID
+pat_sum_list <- list()
+
+for (i in seq_along(pat_all)){
+  patID <- pat_all[i]
+  pat_1 <- in_df %>% filter(Patient_ID == patID) %>% select(Patient_ID, df_cox_v1$Gene) %>% 
+    pivot_longer(!Patient_ID, names_to = "Gene", values_to = "CNR") %>%
+    left_join(df_cox_v1) %>%
+    # Calculate risk score
+    mutate(RS = coef * CNR)
+  # get the sum
+  pat_sum_list[[i]] <- sum(pat_1$RS)
+}
+
+df_pat_sum <- data.frame(
+  Patient_ID = pat_all,
+  Sum_RS = unlist(pat_sum_list)
+)
+
+
+df_pat_sum <- df_pat_sum %>% 
+  mutate(RS_binr = case_when(Sum_RS > median(Sum_RS) ~ "high",
+                             Sum_RS <= median(Sum_RS) ~ "low"))
+
+
+
+
+# Calculate and plot OS
+df_risk_public <- in_df %>% left_join(df_pat_sum)
+
+# Save csv
+write.csv(df_risk_public, file.path(wd$output, "Wyatt_riskScore.csv"))
+
+
+df_risk_os_wyatt <- df_risk_public
+# Fit survival data using the Kaplan-Meier method
+surv_object <- Surv(time = df_risk_public$OS, event = df_risk_public$Death) # ------- CAHNGE TO OS = Death OR PFS - Prog
+# Fit Kaplan-Meier curve
+fit1 <- survfit(surv_object ~ RS_binr, data = df_risk_public)
+p_OS <- ggsurvplot(fit1, data = df_risk_public, pval = TRUE, risk.table=TRUE,
+                    conf.int = TRUE,
+                    palette = c("#e41a1c", "#7F7F7F"))
+p_OS
+
+
+pdf(file.path(wd$output, "OS_WyattData_all.pdf"), width = 12, height = 8)
+p_OS
+dev.off()
+```
+### PFS 
+
+Now we want to calculate the risk score based on PFS. We sepecifically want to look at the PFS for patients treated with 1) abiraterone and 2) Enzalutamide.
+
+First calculate a global PFS risk score of all patients.
+
+```{r,warning=FALSE, message=FALSE}
+# Calculate cox
+in_df <- dat_wyatt
+cox_results <- list()
+gene_col <- in_df %>% select(AR:ZBTB16 ) %>% colnames()
+for (gene in colnames(in_df)[2:9]) {
+  
+  tmp_df <- in_df %>% select(!!as.name(gene), PFS, Prog) %>% # ------- CAHNGE TO OS = Death OR PFS - Prog
+    rename(gene = !!as.name(gene))
+  cox_model <- summary(coxph(Surv(PFS, Prog) ~ gene, data = tmp_df))
+  
+  cox_results[[gene]] <- cox_model$coefficients
+}
+
+cox_result_v1 <- do.call(rbind, cox_results) %>% as.data.frame()
+rownames(cox_result_v1) <- gene_col
+
+df_cox_v1 <- tibble(rownames_to_column(cox_result_v1, var = "Gene")) %>%
+  rename(pVal = 'Pr(>|z|)') %>%
+  filter(!is.na(coef))
+
+# Cacluate Risk score
+# All patient
+pat_all <- in_df$Patient_ID
+pat_sum_list <- list()
+
+for (i in seq_along(pat_all)){
+  patID <- pat_all[i]
+  pat_1 <- in_df %>% filter(Patient_ID == patID) %>% select(Patient_ID, df_cox_v1$Gene) %>% 
+    pivot_longer(!Patient_ID, names_to = "Gene", values_to = "CNR") %>%
+    left_join(df_cox_v1) %>%
+    # Calculate risk score
+    mutate(RS = coef * CNR)
+  # get the sum
+  pat_sum_list[[i]] <- sum(pat_1$RS)
+}
+
+df_pat_sum <- data.frame(
+  Patient_ID = pat_all,
+  Sum_RS = unlist(pat_sum_list)
+)
+
+
+df_pat_sum <- df_pat_sum %>% 
+  mutate(RS_binr = case_when(Sum_RS > median(Sum_RS) ~ "high",
+                             Sum_RS <= median(Sum_RS) ~ "low"))
+
+# Calculate and plot OS
+df_risk_public <- in_df %>% left_join(df_pat_sum)
+df_risk_pfs_wyatt <- df_risk_public
+
+# Save csv
+write.csv(df_risk_public, file.path(wd$output, "Wyatt_riskScore_PFS.csv"))
+
+# Fit survival data using the Kaplan-Meier method
+surv_object <- Surv(time = df_risk_public$PFS, event = df_risk_public$Prog) # ------- CAHNGE TO OS = Death OR PFS - Prog
+# Fit Kaplan-Meier curve
+fit1 <- survfit(surv_object ~ RS_binr, data = df_risk_public)
+p_PFS <- ggsurvplot(fit1, data = df_risk_public, pval = TRUE, risk.table=TRUE,
+                    conf.int = TRUE,
+                    palette = c("#e41a1c", "#7F7F7F"))
+p_PFS
+
+
+pdf(file.path(wd$output, "PFS_WyattData.pdf"), width = 12, height = 8)
+p_PFS
+dev.off()
+```
+
+Save the risk score values (OS & PFS) into a table.
+
+```{r}
+os_sub <- df_risk_os_wyatt %>% 
+  select(Patient_ID, Sum_RS, RS_binr) %>% 
+  dplyr::rename(OS_RS = Sum_RS,
+                OS_bin = RS_binr)
+
+pfs_sub <- df_risk_pfs_wyatt %>% 
+  select(Patient_ID, Sum_RS, RS_binr) %>% 
+  dplyr::rename(PFS_RS = Sum_RS,
+                PFS_bin = RS_binr)
+
+wyatt_rs <- dat_wyatt_full %>% left_join(os_sub) %>% left_join(pfs_sub)
+
+write.csv(wyatt_rs, file.path(wd$output, "Wyatt_MetaData.csv"))
+```
+
+
+
+#### Abi
+
+To obtain abi specific plot, we subset the risk score and PFS for only abi treated patients
+
+```{r}
+# Data frame of only abi
+df_risk_public_abi <- df_risk_public %>% 
+  filter(Txt == 1)
+
+# Fit survival data using the Kaplan-Meier method
+surv_object <- Surv(time = df_risk_public_abi$PFS, event = df_risk_public_abi$Prog) # ------- CAHNGE TO OS = Death OR PFS - Prog
+# Fit Kaplan-Meier curve
+fit_abi <- survfit(surv_object ~ RS_binr, data = df_risk_public_abi)
+p_PFS_abi <- ggsurvplot(fit_abi, data = df_risk_public_abi, pval = TRUE, risk.table=TRUE,
+                        conf.int = TRUE,
+                        palette = c("#e41a1c", "#7F7F7F"))
+p_PFS_abi
+
+
+pdf(file.path(wd$output, "PFS_WyattData_abi.pdf"), width = 12, height = 8)
+p_PFS_abi
+dev.off()
+```
+#### Enza
+
+Repeat for enzalutamide
+
+```{r}
+# Data frame of only enza
+df_risk_public_enz <- df_risk_public %>% 
+  filter(Txt == 2)
+
+# Fit survival data using the Kaplan-Meier method
+surv_object <- Surv(time = df_risk_public_enz$PFS, event = df_risk_public_enz$Prog) # ------- CAHNGE TO OS = Death OR PFS - Prog
+# Fit Kaplan-Meier curve
+fit_enz <- survfit(surv_object ~ RS_binr, data = df_risk_public_enz)
+p_PFS_enz <- ggsurvplot(fit_enz, data = df_risk_public_enz, pval = TRUE, risk.table=TRUE,
+                        conf.int = TRUE,
+                        palette = c("#e41a1c", "#7F7F7F"))
+p_PFS_enz
+
+
+pdf(file.path(wd$output, "PFS_WyattData_enz.pdf"), width = 12, height = 8)
+p_PFS_enz
+dev.off()
+```
+
+## Other factors
+
+Lets try to do the cox model on other factors, not only genes
+
+Fist run uni-variate analysis
+
+```{r}
+df_risk_public2 <- df_risk_os_wyatt %>% 
+  mutate(RS_binr = factor(RS_binr, levels=c("low", "high")))
+
+df_in <- df_risk_public2
+df_in_low <- df_in %>% filter(RS_binr == "low")
+df_in_high <- df_in %>% filter(RS_binr == "high")
+
+
+surv_object <- Surv(time = df_in$OS, event = df_in$Death) # ------- CHANGE TO OS = Death OR PFS - Prog
+# --------- #
+# Uni-variate
+# --------- #
+# # Fit a Cox proportional hazards model
+# fit.coxph <- coxph(surv_object ~ RS_binr,
+#                    data = df_in)
+# # Extact values
+# hr <- exp(coef(fit.coxph))
+# hr
+# ggforest(fit.coxph, data = df_in)
+# 
+# 
+# xx <- survfit2(Surv(OS, Death) ~ RS_binr + ALP, data = df_in)
+# 
+# # Plot
+# ggsurvfit(xx, linewidth = 1)
+# 
+#  #Plot survival curves for each variable
+#  ggsurvplot(survfit(fit.coxph), data = df_in_low, title = "Univariate Survival Analysis",
+#             pval = TRUE, risk.table=TRUE)
+
+# --------- #
+# Uni-variate
+# --------- #
+
+# Fit a Cox proportional hazards model
+fit.coxph2.1 <- coxph(surv_object ~  ALP,
+                   data = df_in)
+fit.coxph2.2 <- coxph(surv_object ~  LDH,
+                   data = df_in)
+fit.coxph2.3 <- coxph(surv_object ~  Hb,
+                   data = df_in)
+fit.coxph2.4 <- coxph(surv_object ~  RS_binr,
+                   data = df_in)
+# hr2 <- exp(coef(fit.coxph2))
+# ggforest(fit.coxph2, data = df_in)
+
+pdf(file.path(wd$output, "HR_OS_Wyatt_Uni_RS.pdf"), width = 12, height = 8)
+ggforest(fit.coxph2.1, data = df_in)
+ggforest(fit.coxph2.2, data = df_in)
+ggforest(fit.coxph2.3, data = df_in)
+ggforest(fit.coxph2.4, data = df_in)
+dev.off()
+
+
+# Extract results
+r1 <- summary(fit.coxph2.1)
+
+# --------- #
+# Multi-variate
+# --------- #
+fit.coxph3 <- coxph(surv_object ~ ALP + LDH + Hb + RS_binr,
+                   data = df_in)
+# hr3 <- exp(coef(fit.coxph3))
+# ggforest(fit.coxph2, data = df_in)
+
+pdf(file.path(wd$output, "HR_OS_Wyatt_Multi_RS.pdf"), width = 12, height = 8)
+ggforest(fit.coxph3, data = df_in)
+dev.off()
+```
+
+
+Extract resutls of individual
+
+```{r}
+extract_coxph_results <- function(cox_models) {
+  result_list <- lapply(cox_models, function(model) {
+    # Extract coefficients and confidence intervals
+    coef_summary <- summary(model)$coefficients
+    coef_summary2 <- summary(model)$conf.int
+    coef_names <- row.names(coef_summary)
+    coef <- coef_summary[, 1]
+    lower_bound <- coef_summary2[, 3]
+    upper_bound <- coef_summary2[, 4]
+    p_value <- coef_summary[, 5]
+    
+    # Exponentiate coefficients for hazard ratios (HRs)
+    exp_coef <- exp(coef)
+    
+    # Create a data frame
+    result_df <- data.frame(
+      Coefficient = coef,
+      Lower_Bound = lower_bound,
+      Upper_Bound = upper_bound,
+      P_Value = p_value,
+      HR = exp_coef
+    )
+    row.names(result_df) <- coef_names
+    return(result_df)
+  })
+  
+  # Combine results into a single data frame
+  combined_results <- do.call(rbind, result_list)
+  
+  return(combined_results)
+}
+
+# List of Cox models
+cox_models <- list(fit.coxph2.1, fit.coxph2.2, fit.coxph2.3, fit.coxph2.4)
+
+# Extract results for the multiple univariate Cox models 
+results_uni <- extract_coxph_results(cox_models) %>% 
+  tibble::rownames_to_column(var = "Features")
+# Save as csv
+writexl::write_xlsx(results_uni, file.path(wd$output, "UniVariate_cox.xlsx"))
+
+
+# Extract results for multi-variate Cox model
+coef_summary <- summary(fit.coxph3)$coefficients
+results_multi <- data.frame(
+  Coefficient = coef_summary[, 1],
+  Lower_Bound = summary(fit.coxph3)$conf.int[, 3],
+  Upper_Bound =summary(fit.coxph3)$conf.int[, 4],
+  P_Value = coef_summary[, 5],
+  HR =coef_summary[, 2]
+) %>% 
+  tibble::rownames_to_column(var = "Features")
+
+writexl::write_xlsx(results_multi, file.path(wd$output, "MultiVariate_cox.xlsx"))
+```
+
+
+
+
+## Responders
+
+What if we do the risk score difference between responder and non responders
+
+```{r}
+
+```
+

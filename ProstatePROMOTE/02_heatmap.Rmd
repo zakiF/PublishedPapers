@@ -1,0 +1,1781 @@
+---
+title: "Analyse WES CNR"
+date: "2023-09-12"
+output: 
+  html_document:
+    toc: true
+    toc_float:
+      collapsed: true
+    toc_depth: 3
+    number_sections: true
+    theme: lumen
+---
+
+# Background
+
+In the previous part of the analysis, we extracted copy number data from exome sequencing. Here we plot the data in the form of heatmap and calculate the correlation. 
+
+# Objectives
+
+1. Generate heatmap for visit 1
+2. Calculate concordence 
+3. Repeat for visit 2
+
+# Pre-processing 
+
+## Loading packages
+
+```{r, message=FALSE, warning=FALSE}
+library(here)
+library(tidyverse)
+library(ggplot2)
+library(readxl)
+library(psych)
+```
+
+## Read previous data
+
+```{r}
+load(file.path(wd$outputData, "Section_01.RData"))
+```
+
+
+# Objective 1 
+
+## Visit 1
+
+Generate heatmap for visit 1. Separate bone vs non-bone
+
+All samples
+
+```{r}
+# Workflow to play around with threshold 
+amp_thresh <- 0.5
+del_thresh <- -0.5
+
+df_simple2 <- df_simple %>%
+  group_by(Genes, UniqID) %>%
+  mutate(lg2CNR = case_when(Genes %in% amp_genes ~ max(lg2CNR),
+                            Genes %in% del_genes ~ min(lg2CNR))) %>%
+  distinct()
+
+
+df_simple2 <- df_simple2 %>%
+  mutate(cr = case_when(
+    Genes %in% amp_genes & lg2CNR >= amp_thresh ~ 1,
+    Genes %in% del_genes & lg2CNR <= del_thresh~ -1,
+    TRUE ~ 0
+  )) %>%
+  select(-pass_thresh) %>% distinct()
+
+# Check if this runs
+df_v1 <- df_simple2 %>%
+  ungroup() %>%
+  filter(visit == "V1") %>%
+  #filter(pass_thresh == "true") %>%
+  dplyr::select(Genes, PatientID, cr) %>%
+  distinct() %>%
+  # Convert to wide format, absent values is given 0
+  pivot_wider(names_from = PatientID, values_from = cr, values_fill = 0)
+
+mat_v1 <- df_v1 %>% as.data.frame()
+row.names(mat_v1) <- df_v1$Genes
+mat_v1 <- mat_v1[,-1] %>% as.matrix()
+
+#Heatmap(mat_v1)
+
+#gene_or <- sort(apply(mat_v1, 1, sum)) %>% names() %>% rev()
+
+mat_v1_or <- mat_v1[gene_or,]
+perc_cn <- apply(abs(mat_v1_or), 1, sum)
+row_lab <- paste0(rownames(mat_v1_or), " (", round(perc_cn / ncol(mat_v1_or) * 100, 0), "%)")
+rownames(mat_v1_or) <- row_lab
+
+ht <- Heatmap(mat_v1_or, cluster_rows=FALSE, show_column_names=FALSE, show_column_dend=FALSE, show_heatmap_legend=FALSE)
+#draw(ht)
+col_or <- column_order(ht)
+
+sample_or_v1 <- colnames(mat_v1_or)[col_or]
+
+mat_v1_or2 <- mat_v1_or[,sample_or_v1]
+
+# Visit 1
+file_dir <- file.path(wd$data, "from_papers/cancers_2022_plasma/")
+pap_v1 <- readxl::read_excel(file.path(file_dir, "Table S3.xlsx"),
+                             sheet = 2)  %>%
+  select(PatientID...1, AR, COL22A1, MYC, NCOR1, NKX3.1, NOTCH1, PIK3CA, PIK3CB, TP53, ZBTB16, TMPRSS2) %>%
+  mutate(across(AR:TMPRSS2, ~ case_when(
+    . == "NC" ~ 0,
+    . == "Amp" ~ 1,
+    . == "Del" ~ -1))) %>% as.data.frame()
+row.names(pap_v1) <- pap_v1$PatientID...1
+pap_v1 <- pap_v1[,-1]
+pap_v1 <- t(pap_v1)
+row.names(pap_v1) <- gsub("NKX3.1", "NKX3-1", row.names(pap_v1))
+
+# Add percentage
+#sample_or_v2 <- sample_or_v1[sample_or_v1 %in% colnames(pap_v1)]
+pap_v1 <- pap_v1[gene_or,sample_or_v1]
+perc_cn <- apply(abs(pap_v1), 1, sum) 
+row_lab <- paste0(rownames(pap_v1), " (", round(perc_cn / ncol(pap_v1) * 100, 0), "%)")
+rownames(pap_v1) <- row_lab
+
+# Onco print
+# Create a new data frame with concatenated values
+df1 <- as.data.frame(mat_v1_or2) %>%
+  mutate(across(everything(), ~ case_when(
+    . == 0 ~ "s_CN",
+    . == -1 ~ "s_del",
+    . == 1 ~ "s_amp"))) 
+row.names(df1) <- gsub(" .*", "", rownames(df1))
+
+df2 <- as.data.frame(pap_v1)  %>%
+  mutate(across(everything(), ~ case_when(
+    . == 0 ~ "l_CN",
+    . == -1 ~ "l_del",
+    . == 1 ~ "l_amp"))) 
+row.names(df2) <- gsub(" .*", "", rownames(df2))
+
+
+mat_com <- mapply(function(x, y){paste(x,y, sep = ";")}, df1, df2)
+mat_com <- as.data.frame(mat_com)
+mat_com <- as.matrix(mat_com)
+row.names(mat_com) <- row.names(df2)
+
+
+# annotations
+# To the right of the heatmap -
+# Annotate the % of gene mutated in solid or liquid
+df_gene_per <- data.frame(
+  solid = rownames(mat_v1_or2),
+  liquid = rownames(pap_v1)) %>%
+  mutate(
+    solid = gsub(".*\\(", "", solid),
+    solid = gsub("\\%).*", "", solid),
+    solid = as.numeric(solid),
+    
+    liquid = gsub(".*\\(", "", liquid),
+    liquid = gsub("\\%).*", "", liquid),
+    liquid = as.numeric(liquid),
+  )
+rownames(df_gene_per) <- rownames(mat_com)
+
+row_ha <- rowAnnotation(
+  perc = anno_barplot(df_gene_per, beside=TRUE, attach=TRUE, ylim=c(0,100), 
+                      add_numbers = TRUE),
+  annotation_height = unit(2, "cm"))
+
+
+# To the top of the heatmap -
+# Add the tumor purity % annotation
+df_link2_v1 <- df_link2 %>% filter(visit == "V1" & !Body_Site == "Blood") %>% 
+  select(SubjectID, PatientID, Body_Site) %>% distinct() %>%
+  mutate(Body_Site = case_when(Body_Site == "bone"  ~ "bone",
+                               TRUE ~ "non_bone"))
+
+df_purity <- meta_v1 %>%
+  full_join(df_link2_v1)
+
+# Add ctDNA information
+ct_info <- df_tumor_p3 %>% select(PatientID, ctDNA, ct_cut)
+df_purity <- df_purity %>% left_join(ct_info)
+
+# ---------- Ordering the heatmap ----------------- #
+
+
+# Select only samples in the heatmap and arrange based on tumor purity
+df_purity_or <- df_purity %>% 
+  filter(PatientID %in% colnames(mat_com)) %>% as.data.frame() %>% 
+  mutate(Purity_tresh = case_when(Tumor_content <=20 ~ "t2_low",
+                                  TRUE ~ "t1_high"))
+# Combine with liquid metadata
+meta_l_tmp <- meta_l %>% select(-SubjectID) %>%
+    mutate(ct_tresh = case_when(ctDNA <= ct_cutoff ~ "ct2_low",
+                                  TRUE ~ "ct1_high"))
+
+df_purity_or <- df_purity_or %>% left_join(meta_l_tmp) %>%
+  # 1st arrange by site, 2nd by tumor content categroy, 3rd by ctDNA 
+  arrange(Body_Site, 
+          #Purity_tresh, ct_tresh,
+          desc(Tumor_content), desc(ctDNA)) #%>%
+  #filter(Body_Site == "bone")
+  #filter(!is.na(Tumor_content)) #%>%
+  #filter(!is.na(ctDNA)) 
+rownames(df_purity_or) <- df_purity_or$PatientID
+
+# Additional ordering - we order by bone first
+#o1 <- df_purity_or %>% filter(Body_Site == "bone" & Purity_tresh == "t1_high")
+#o2 <- df_purity_or %>% filter(!PatientID %in% o1$PatientID) %>% arrange(Body_Site, desc(Tumor_content))
+
+#df_purity_or <- rbind(o1,o2)
+
+# Re-arrange heamtap
+mat_com_or <- mat_com[,df_purity_or$PatientID]
+# Check if the order is the same
+identical(rownames(df_purity_or), colnames(mat_com_or))
+
+# # Combine with risk score
+# risk_liq = df_risk_v1 %>% select(PatientID, RS_binr, Sum_RS) %>%
+#   rename(RS_liq_num = Sum_RS)
+# df_purity_or <- left_join(df_purity_or, risk_liq)
+
+# #  ------------------------------------------------------------------------------ NEED TO RE-RUN THIS
+# risk_solid <- df_risk_solid_v1 %>% select(PatientID, RS_binr, Sum_RS)  %>% 
+#   rename(RS_solid = RS_binr,
+#          RS_solid_num = Sum_RS)
+# df_purity_or <- left_join(df_purity_or, risk_solid)
+
+# Add annotation
+col_ha2 = HeatmapAnnotation(
+  Purity_t = anno_points(df_purity_or$Tumor_content),
+  #Purity_t2 = anno_barplot(round(df_purity_or$Tumor_content, 0), add_numbers = TRUE),
+  #ctDNA = anno_points(df_purity_or$ctDNA),
+  Site = df_purity_or$Sample_type,
+  tClass = df_purity_or$Purity_tresh,
+  ctClass = df_purity_or$ct_tresh,
+  # Add annotation on the risk-score
+  #liqRisk = df_purity_or$RS_binr,
+  #liqSolid= df_purity_or$RS_solid,
+  annotation_height = unit(3, "cm"),
+    col = list(
+    Site = c(
+      "Bone" = "#F28E2BFF", 
+      "non-bone" = "#F1CE63FF",
+      "NA" = "grey50"),
+    tClass = c(
+      "t1_high" = "red",
+      "t2_low" = "lightblue"),
+    ctClass = c(
+      "ct1_high" = "black",
+      "ct2_low" = "lightgrey"),
+    liqRisk = c(
+      "high" = "red",
+      "low" = "lightblue"),
+    liqSolid = c(
+      "high" = "red",
+      "low" = "lightblue")
+    )
+  )
+
+
+# Final heatmap
+get_type_fun = function(x) strsplit(x, ";")[[1]]
+get_type_fun(mat_com[1, 1])
+
+col = c(s_amp = "red", l_amp = "pink",
+        s_del = "darkblue", l_del = "cadetblue2", 
+        s_CN = "white", l_CN = "white")
+
+
+
+pdf(file.path(wd$output, paste0("Heatmap_gain_", amp_thresh, "__loss_", del_thresh, "_overall", ".pdf")),
+    width=12, height = 5)
+oncoPrint(mat_com_or,
+          alter_fun = list(
+            background = function(x, y, w, h) {
+              grid.polygon(
+                unit.c(x - 0.5*w, x - 0.5*w, x + 0.5*w), 
+                unit.c(y - 0.5*h, y + 0.5*h, y - 0.5*h),
+                gp = gpar(fill = "grey", col = "white"))
+              grid.polygon(
+                unit.c(x + 0.5*w, x + 0.5*w, x - 0.5*w), 
+                unit.c(y + 0.5*h, y - 0.5*h, y + 0.5*h),
+                gp = gpar(fill = "grey", col = "white"))
+            },
+            # Amp
+            s_amp = function(x, y, w, h) {
+              grid.polygon(
+                unit.c(x - 0.5*w, x - 0.5*w, x + 0.5*w), 
+                unit.c(y - 0.5*h, y + 0.5*h, y - 0.5*h),
+                gp = gpar(fill = col["s_amp"], col = "white"))
+            },
+            l_amp = function(x, y, w, h) {
+              grid.polygon(
+                unit.c(x + 0.5*w, x + 0.5*w, x - 0.5*w), 
+                unit.c(y + 0.5*h, y - 0.5*h, y + 0.5*h),
+                gp = gpar(fill = col["l_amp"], col = "white"))
+            },
+            # Deletion
+            s_del = function(x, y, w, h) {
+              grid.polygon(
+                unit.c(x - 0.5*w, x - 0.5*w, x + 0.5*w), 
+                unit.c(y - 0.5*h, y + 0.5*h, y - 0.5*h),
+                gp = gpar(fill = col["s_del"], col = "white"))
+            },
+            l_del = function(x, y, w, h) {
+              grid.polygon(
+                unit.c(x + 0.5*w, x + 0.5*w, x - 0.5*w), 
+                unit.c(y + 0.5*h, y - 0.5*h, y + 0.5*h),
+                gp = gpar(fill = col["l_del"], col = "white"))
+            },
+            # CN
+            s_CN = function(x, y, w, h) {
+              grid.polygon(
+                unit.c(x - 0.5*w, x - 0.5*w, x + 0.5*w), 
+                unit.c(y - 0.5*h, y + 0.5*h, y - 0.5*h),
+                gp = gpar(fill = col["s_CN"], col = "white"))
+            },
+            l_CN = function(x, y, w, h) {
+              grid.polygon(
+                unit.c(x + 0.5*w, x + 0.5*w, x - 0.5*w), 
+                unit.c(y + 0.5*h, y - 0.5*h, y + 0.5*h),
+                gp = gpar(fill = col["l_CN"], col = "white"))
+            }
+          ), 
+          col = col,
+          right_annotation = row_ha,
+          top_annotation = col_ha2,
+          column_title = paste0(
+            "Gain_treh= >", amp_thresh, " & ",
+            "Loss_tresh= <", del_thresh)
+          )
+decorate_annotation("Purity_t", {
+  grid.lines(c(0, 1), unit(c(20, 20), "native"), gp = gpar(col = "red"))
+})
+dev.off()
+```
+
+Save the information for visit 1
+
+```{r}
+# All calls (AMP and DEL)
+mat_liq_v1 <-  pap_v1
+mat_solid_v1 <- mat_v1_or2
+
+
+df_purity_or_v1 <- df_purity_or
+```
+
+
+## Visit 2
+
+```{r}
+# Check if this runs
+df_v1 <- df_simple2 %>%
+  ungroup() %>%
+  filter(visit == "V2") %>%
+  #filter(pass_thresh == "true") %>%
+  dplyr::select(Genes, PatientID, cr) %>%
+  distinct() %>%
+  # Convert to wide format, absent values is given 0
+  pivot_wider(names_from = PatientID, values_from = cr, values_fill = 0)
+
+mat_v1 <- df_v1 %>% as.data.frame()
+row.names(mat_v1) <- df_v1$Genes
+mat_v1 <- mat_v1[,-1] %>% as.matrix()
+
+
+# gene_or <- sort(apply(mat_v1, 1, sum)) %>% names() %>% rev() -- KEEP SAME GENE ORDER
+
+mat_v1_or <- mat_v1[gene_or,]
+perc_cn <- apply(abs(mat_v1_or), 1, sum)
+row_lab <- paste0(rownames(mat_v1_or), " (", round(perc_cn / ncol(mat_v1_or) * 100, 0), "%)")
+rownames(mat_v1_or) <- row_lab
+
+ht <- Heatmap(mat_v1_or, cluster_rows=FALSE, show_column_names=FALSE, show_column_dend=FALSE, show_heatmap_legend=FALSE)
+#draw(ht)
+col_or <- column_order(ht)
+
+sample_or_v1 <- colnames(mat_v1_or)[col_or]
+
+mat_v1_or2 <- mat_v1_or[,sample_or_v1]
+
+# Visit 1
+file_dir <- file.path(wd$data, "from_papers/cancers_2022_plasma/")
+pap_v1 <- readxl::read_excel(file.path(file_dir, "Table S3.xlsx"),
+                             sheet = 3)  %>%
+  select(PatientID...1, AR, COL22A1, MYC, NCOR1, NKX3.1, NOTCH1, PIK3CA, PIK3CB, TP53, ZBTB16, TMPRSS2) %>%
+  mutate(across(AR:TMPRSS2, ~ case_when(
+    . == "NC" ~ 0,
+    . == "Amp" ~ 1,
+    . == "Del" ~ -1))) %>% as.data.frame()
+row.names(pap_v1) <- pap_v1$PatientID...1
+pap_v1 <- pap_v1[,-1]
+pap_v1 <- t(pap_v1)
+row.names(pap_v1) <- gsub("NKX3.1", "NKX3-1", row.names(pap_v1))
+
+# Add percentage
+#sample_or_v2 <- sample_or_v1[sample_or_v1 %in% colnames(pap_v1)]
+pap_v1 <- pap_v1[gene_or,sample_or_v1]
+perc_cn <- apply(abs(pap_v1), 1, sum) 
+row_lab <- paste0(rownames(pap_v1), " (", round(perc_cn / ncol(pap_v1) * 100, 0), "%)")
+rownames(pap_v1) <- row_lab
+
+# Onco print
+# Create a new data frame with concatenated values
+df1 <- as.data.frame(mat_v1_or2) %>%
+  mutate(across(everything(), ~ case_when(
+    . == 0 ~ "s_CN",
+    . == -1 ~ "s_del",
+    . == 1 ~ "s_amp"))) 
+row.names(df1) <- gsub(" .*", "", rownames(df1))
+
+df2 <- as.data.frame(pap_v1)  %>%
+  mutate(across(everything(), ~ case_when(
+    . == 0 ~ "l_CN",
+    . == -1 ~ "l_del",
+    . == 1 ~ "l_amp"))) 
+row.names(df2) <- gsub(" .*", "", rownames(df2))
+
+
+mat_com <- mapply(function(x, y){paste(x,y, sep = ";")}, df1, df2)
+mat_com <- as.data.frame(mat_com)
+mat_com <- as.matrix(mat_com)
+row.names(mat_com) <- row.names(df2)
+
+
+# annotations
+# To the right of the heatmap -
+# Annotate the % of gene mutated in solid or liquid
+df_gene_per <- data.frame(
+  solid = rownames(mat_v1_or2),
+  liquid = rownames(pap_v1)) %>%
+  mutate(
+    solid = gsub(".*\\(", "", solid),
+    solid = gsub("\\%).*", "", solid),
+    solid = as.numeric(solid),
+    
+    liquid = gsub(".*\\(", "", liquid),
+    liquid = gsub("\\%).*", "", liquid),
+    liquid = as.numeric(liquid),
+  )
+rownames(df_gene_per) <- rownames(mat_com)
+
+row_ha <- rowAnnotation(
+  perc = anno_barplot(df_gene_per, beside=TRUE, attach=TRUE, ylim=c(0,100), 
+                      add_numbers = TRUE),
+  annotation_height = unit(2, "cm"))
+
+
+# To the top of the heatmap -
+# Add the tumor purity % annotation
+df_link2_v1 <- df_link2 %>% filter(visit == "V2" & !Body_Site == "Blood") %>% 
+  select(SubjectID, PatientID, Body_Site) %>% distinct() %>%
+  mutate(Body_Site = case_when(Body_Site == "bone"  ~ "bone",
+                               TRUE ~ "non_bone"))
+
+df_purity <- meta_v2 %>%
+  full_join(df_link2_v1)
+
+# ---------- Ordering the heatmap ----------------- #
+
+
+# Select only samples in the heatmap and arrange based on tumor purity
+df_purity_or <- df_purity %>% 
+  filter(PatientID %in% colnames(mat_com)) %>% as.data.frame() %>% 
+  mutate(Purity_tresh = case_when(Tumor_content <=20 ~ "t2_low",
+                                  TRUE ~ "t1_high"))
+# Combine with liquid metadata
+meta_l_tmp <- meta_l %>% select(-SubjectID) %>%
+    mutate(ct_tresh = case_when(ctDNA <= ct_cutoff ~ "ct2_low",
+                                  TRUE ~ "ct1_high"))
+
+df_purity_or <- df_purity_or %>% left_join(meta_l_tmp) %>%
+  # 1st arrange by site, 2nd by tumor content categroy, 3rd by ctDNA 
+  arrange(Body_Site, 
+          #Purity_tresh, ct_tresh,
+          desc(Tumor_content), desc(ctDNA)) #%>%
+  #filter(Body_Site == "bone")
+  #filter(!is.na(Tumor_content)) #%>%
+  #filter(!is.na(ctDNA)) 
+rownames(df_purity_or) <- df_purity_or$PatientID
+
+# Additional ordering - we order by bone first
+#o1 <- df_purity_or %>% filter(Body_Site == "bone" & Purity_tresh == "t1_high")
+#o2 <- df_purity_or %>% filter(!PatientID %in% o1$PatientID) %>% arrange(Body_Site, desc(Tumor_content))
+
+#df_purity_or <- rbind(o1,o2)
+
+# Re-arrange heamtap
+mat_com_or <- mat_com[,df_purity_or$PatientID]
+# Check if the order is the same
+identical(rownames(df_purity_or), colnames(mat_com_or))
+
+# # Combine with risk score
+# risk_liq = df_risk_v1 %>% select(PatientID, RS_binr, Sum_RS) %>%
+#   rename(RS_liq_num = Sum_RS)
+# df_purity_or <- left_join(df_purity_or, risk_liq)
+
+# #  ------------------------------------------------------------------------------ NEED TO RE-RUN THIS
+# risk_solid <- df_risk_solid_v1 %>% select(PatientID, RS_binr, Sum_RS)  %>% 
+#   rename(RS_solid = RS_binr,
+#          RS_solid_num = Sum_RS)
+# df_purity_or <- left_join(df_purity_or, risk_solid)
+
+# Add annotation
+col_ha2 = HeatmapAnnotation(
+  Purity_t = anno_points(df_purity_or$Tumor_content),
+  #Purity_t2 = anno_barplot(round(df_purity_or$Tumor_content, 0), add_numbers = TRUE),
+  #ctDNA = anno_points(df_purity_or$ctDNA),
+  Site = df_purity_or$Sample_type,
+  tClass = df_purity_or$Purity_tresh,
+  ctClass = df_purity_or$ct_tresh,
+  # Add annotation on the risk-score
+  #liqRisk = df_purity_or$RS_binr,
+  #liqSolid= df_purity_or$RS_solid,
+  annotation_height = unit(3, "cm"),
+    col = list(
+    Site = c(
+      "Bone" = "#F28E2BFF", 
+      "non-bone" = "#F1CE63FF",
+      "NA" = "grey50"),
+    tClass = c(
+      "t1_high" = "red",
+      "t2_low" = "lightblue"),
+    ctClass = c(
+      "ct1_high" = "black",
+      "ct2_low" = "lightgrey"),
+    liqRisk = c(
+      "high" = "red",
+      "low" = "lightblue"),
+    liqSolid = c(
+      "high" = "red",
+      "low" = "lightblue")
+    )
+  )
+
+
+# Final heatmap
+get_type_fun = function(x) strsplit(x, ";")[[1]]
+get_type_fun(mat_com[1, 1])
+
+col = c(s_amp = "red", l_amp = "pink",
+        s_del = "darkblue", l_del = "cadetblue2", 
+        s_CN = "white", l_CN = "white")
+
+
+
+pdf(file.path(wd$output, paste0("Heatmap_gain_", amp_thresh, "__loss_", del_thresh, "_overall_visit_2", ".pdf")),
+    width=12, height = 5)
+oncoPrint(mat_com_or,
+          alter_fun = list(
+            background = function(x, y, w, h) {
+              grid.polygon(
+                unit.c(x - 0.5*w, x - 0.5*w, x + 0.5*w), 
+                unit.c(y - 0.5*h, y + 0.5*h, y - 0.5*h),
+                gp = gpar(fill = "grey", col = "white"))
+              grid.polygon(
+                unit.c(x + 0.5*w, x + 0.5*w, x - 0.5*w), 
+                unit.c(y + 0.5*h, y - 0.5*h, y + 0.5*h),
+                gp = gpar(fill = "grey", col = "white"))
+            },
+            # Amp
+            s_amp = function(x, y, w, h) {
+              grid.polygon(
+                unit.c(x - 0.5*w, x - 0.5*w, x + 0.5*w), 
+                unit.c(y - 0.5*h, y + 0.5*h, y - 0.5*h),
+                gp = gpar(fill = col["s_amp"], col = "white"))
+            },
+            l_amp = function(x, y, w, h) {
+              grid.polygon(
+                unit.c(x + 0.5*w, x + 0.5*w, x - 0.5*w), 
+                unit.c(y + 0.5*h, y - 0.5*h, y + 0.5*h),
+                gp = gpar(fill = col["l_amp"], col = "white"))
+            },
+            # Deletion
+            s_del = function(x, y, w, h) {
+              grid.polygon(
+                unit.c(x - 0.5*w, x - 0.5*w, x + 0.5*w), 
+                unit.c(y - 0.5*h, y + 0.5*h, y - 0.5*h),
+                gp = gpar(fill = col["s_del"], col = "white"))
+            },
+            l_del = function(x, y, w, h) {
+              grid.polygon(
+                unit.c(x + 0.5*w, x + 0.5*w, x - 0.5*w), 
+                unit.c(y + 0.5*h, y - 0.5*h, y + 0.5*h),
+                gp = gpar(fill = col["l_del"], col = "white"))
+            },
+            # CN
+            s_CN = function(x, y, w, h) {
+              grid.polygon(
+                unit.c(x - 0.5*w, x - 0.5*w, x + 0.5*w), 
+                unit.c(y - 0.5*h, y + 0.5*h, y - 0.5*h),
+                gp = gpar(fill = col["s_CN"], col = "white"))
+            },
+            l_CN = function(x, y, w, h) {
+              grid.polygon(
+                unit.c(x + 0.5*w, x + 0.5*w, x - 0.5*w), 
+                unit.c(y + 0.5*h, y - 0.5*h, y + 0.5*h),
+                gp = gpar(fill = col["l_CN"], col = "white"))
+            }
+          ), 
+          col = col,
+          right_annotation = row_ha,
+          top_annotation = col_ha2,
+          column_title = paste0(
+            "Gain_treh= >", amp_thresh, " & ",
+            "Loss_tresh= <", del_thresh)
+          )
+decorate_annotation("Purity_t", {
+  grid.lines(c(0, 1), unit(c(20, 20), "native"), gp = gpar(col = "red"))
+})
+dev.off()
+```
+
+Save data for visit 2
+
+```{r}
+# All calls (AMP and DEL)
+mat_liq_v2 <-  pap_v1
+mat_solid_v2 <- mat_v1_or2
+
+
+df_purity_or_v2 <- df_purity_or
+```
+
+
+
+# Concordence plot
+
+## Visit 1
+
+## Patient concordance 
+
+### All observations 
+
+We calculate agreement on all observations, including copy neutral
+
+Subset to each group
+
+```{r}
+df_purity_or <- df_purity_or_v1
+# Overall concordance 
+g1 <- df_purity_or %>% filter(Sample_type == "Bone" & Purity_tresh == "t1_high")
+g2 <- df_purity_or %>% filter(Sample_type == "Bone" & Purity_tresh == "t2_low")
+g3 <- df_purity_or %>% filter(Sample_type == "non-bone" & Purity_tresh == "t1_high")
+g4 <- df_purity_or %>% filter(Sample_type == "non-bone" & Purity_tresh == "t2_low")
+# High tumor purity & high ctDNA (>10%)
+g5 <- df_purity_or %>% filter(Sample_type == "Bone" & Purity_tresh == "t1_high" & ct_tresh == "ct1_high")
+
+
+# All calls (AMP and DEL)
+mat_liq <-  abs(mat_liq_v1)
+mat_solid <- abs(mat_solid_v1)
+
+# # Just AMP
+# mat_liq <-  abs(mat_liq_v1)[1:6,]
+# mat_solid <- abs(mat_solid_v1)[1:6,]
+# 
+# # Just DEL
+# mat_liq <-  abs(mat_liq_v1)[7:11,]
+# mat_solid <- abs(mat_solid_v1)[7:11,]
+
+
+```
+
+
+Function to generate 2x2 contingency table
+
+```{r}
+calculate_contingency_table <- function(matrix1, matrix2, PatientID) {
+  
+  # Subset full samples to the selected samples from each group
+  matrix1_sub <- matrix1[,PatientID]
+  matrix2_sub <- matrix2[,PatientID]
+  
+  
+  # Flatten matrices to vectors
+  vector1 <- as.vector(matrix1_sub)
+  vector2 <- as.vector(matrix2_sub)
+
+  # Create a 2x2 contingency table
+  contingency_table <- table(vector1, vector2)
+
+  # Extract counts
+  SpLp <- contingency_table[2, 2] 
+  SpLn <- contingency_table[1, 2]
+  SnLp <- contingency_table[2, 1]
+  SnLn <- contingency_table[1, 1]
+  
+  result_df <- data.frame(
+    row.names = c("Sp", "Sn"),
+    Lp = c(SpLp, SnLp),
+    Ln = c(SpLn,SnLn)
+  ) %>%
+    mutate(Total = rowSums(.))
+  result_df[3,] <- colSums(result_df)
+  rownames(result_df)[3] <- "Total"
+  
+  A = result_df[1,1] 
+  B = result_df[1,2] 
+  C = result_df[2,1]
+  D = result_df[2,2] 
+  tot <- result_df[3,3]
+  
+  #Ac =   ( ( ( A + B) * (A + C ) ) / tot )
+  
+  # print(paste0("Total observed agreement=", (A + D) ))
+  # print(paste0("Maximal agreement=", tot ))
+  # print(paste0("A by chance=", ( ( ( A + B) * (A + C ) ) / tot )))
+  # print(paste0("D by chance=", ( ( (C + D ) * (B + D ) ) / tot )))
+  
+  # Manual Kappa test
+  #print(paste0("Kappa test=", ( (A+D) - (Ac) ) / (tot - (A+D) )   ))
+
+  #Add Cohen's kappa
+  # Calculate Cohen's Kappa
+  #kappa_result <- kappa2(data.frame(vector1, vector2))
+  
+  
+  # Version 2 of Cohen's kappa
+  kappa_result2 <- cohen.kappa(x=cbind(vector1,vector2))
+  
+  # Version 3 of Cohen's kappa (Manually)
+  kk <- as.matrix(result_df[1:2,1:2])
+  # 1) Relative agremment
+  po <- ( sum(diag(kk)) / sum(kk))
+  
+  # 2) Hypo probablitity
+  p1 <- ( ( kk[1,1] + kk[1,2] ) / sum(kk))   * ( (kk[1,1] + kk[2,1]) / sum(kk)   )
+  p2 <- ( ( kk[2,1] + kk[2,2] ) / sum(kk))   * ( (kk[1,2] + kk[2,2]) / sum(kk)   )
+  pe <- p1 + p2
+  
+  # Calculate Kappa
+  k <- (po - pe) / (1 - pe)
+  
+  
+  result_df <- result_df %>% 
+    mutate(#Kappa_val = kappa_result$value,
+           Kappa_val = kappa_result2[[1]][1],
+           Kappa_val_man = k)
+           #Kappa_sig = kappa_result$p.value)
+  
+  return(result_df)
+}
+```
+
+Apply the function to each matrix
+
+```{r}
+df_g1 <- calculate_contingency_table(mat_liq, mat_solid, g1$PatientID)
+df_g2 <- calculate_contingency_table(mat_liq, mat_solid, g2$PatientID)
+#df_g3 <- calculate_contingency_table(mat_liq, mat_solid, g3$PatientID)
+#df_g4 <- calculate_contingency_table(mat_liq, mat_solid, g4$PatientID)
+
+# Combine the non-bone, due to low numbers
+df_g3_4 <- calculate_contingency_table(mat_liq, mat_solid, c(g3$PatientID, g4$PatientID))
+
+# High tumor purity & high ctDNA
+df_g5 <- calculate_contingency_table(mat_liq, mat_solid, g5$PatientID)
+```
+
+We can generate a data frame of the percentage 
+
+```{r}
+d_all <- cbind(df_g1, df_g2, df_g3_4, df_g5)
+writexl::write_xlsx(d_all, file.path(wd$output, "Kappa_AMP_DEL_v1.xlsx"))
+```
+
+Generate graphs
+
+```{r}
+# To get the percentage of when both calls the CN
+plot_val <- function(indat){
+  x <- indat[1,1]
+  y <- indat[2,2]
+  tot <- indat[3,3]
+  
+  out_dat <- c( (x+y)/tot  , (x/tot), (y/tot) )
+  
+  return(as.vector(out_dat))
+}
+
+
+v1 <- plot_val(df_g1)
+v2 <- plot_val(df_g2)
+v3 <- plot_val(df_g3_4)
+#v4 <- plot_val(df_g4)
+
+df_con <- data.frame(
+  Group = rep(c("B_high", "B_low", "NB_all"), each=3),
+  Var = c("Overall", "CNA_call", "CN_call"),
+  value = c(v1,v2,v3)
+) %>% mutate(
+  Value = value * 100,
+  Var = factor(Var, levels=c("Overall", "CNA_call", "CN_call")),
+  lab = paste0(round(Value, 0), "%")) %>%
+  filter(!Var == "Overall")
+
+
+
+p_CN2 <-
+  ggplot(df_con, aes(x = Var, y = Value, fill = Var, label=lab)) +
+  geom_bar(stat="identity", width = 0.5) +
+  geom_text(size = 4, position = position_stack(vjust = 0.5)) +
+  #scale_fill_manual(values = c("#DE96B4","#FFD1D7","#B28F81", "#54483E")) +
+  #scale_fill_manual(values = refCols) +
+  labs(x="Group", y="Percentage") +
+  facet_wrap(~Group, ncol = 4) +
+  theme(
+    panel.grid.minor = element_blank(),
+    panel.grid.major = element_blank(),
+    panel.background = element_blank(),
+    panel.border = element_rect(colour = "grey30", fill=NA, size=0.5),
+    strip.background = element_rect(fill="white", colour = "white"),
+    legend.position = "none") + 
+  #coord_flip() +
+  NULL
+
+ggsave(p_CN2, file=file.path(wd$output, "CN_gene_concord_grouped.pdf"), device = "pdf", width = 12, height = 4)
+```
+
+
+### Exlcude CN
+
+We exclude copy neutral
+
+Graph of the concordance
+
+```{r}
+sub_1_solid <- mat_solid[,g1$PatientID]
+sub_1_liquid <- mat_liq[,g1$PatientID]
+
+## Calculate concordance 
+# Total observation
+tot_obs_1 <- sum(abs(sub_1_liquid), abs(sub_1_solid))
+# Agreement count (because its counted once, we muliple by 2x)
+agreement_count <- sum(sub_1_solid != 0 & sub_1_liquid != 0) * 2
+# Perc agreement 
+perc_ag_1 <- agreement_count / tot_obs_1 * 100
+
+# Generate contingency table
+
+
+# Repeat for all 4 group
+# ----- Group 2 ------ #
+sub_1_solid <- mat_solid[,g2$PatientID]
+sub_1_liquid <- mat_liq[,g2$PatientID]
+tot_obs_2 <- sum(abs(sub_1_liquid), abs(sub_1_solid))
+agreement_count <- sum(sub_1_solid != 0 & sub_1_liquid != 0) * 2
+perc_ag_2 <- agreement_count / tot_obs_2 * 100
+
+# ----- Group 3 ------ #
+sub_1_solid <- mat_solid[,g3$PatientID]
+sub_1_liquid <- mat_liq[,g3$PatientID]
+tot_obs_3 <- sum(abs(sub_1_liquid), abs(sub_1_solid))
+agreement_count <- sum(sub_1_solid != 0 & sub_1_liquid != 0) * 2
+perc_ag_3 <- agreement_count / tot_obs_3 * 100
+
+
+# ----- Group 4 ------ #
+sub_1_solid <- mat_solid[,g4$PatientID]
+sub_1_liquid <- mat_liq[,g4$PatientID]
+tot_obs_4 <- sum(abs(sub_1_liquid), abs(sub_1_solid))
+agreement_count <- sum(sub_1_solid != 0 & sub_1_liquid != 0) * 2
+perc_ag_4 <- agreement_count / tot_obs_4 * 100
+
+
+# ----- Group 3 & 4 combined ------ #
+sub_1_solid <- mat_solid[,c(g3$PatientID, g4$PatientID)]
+sub_1_liquid <- mat_liq[,c(g3$PatientID, g4$PatientID)]
+tot_obs_3_4 <- sum(abs(sub_1_liquid), abs(sub_1_solid))
+agreement_count <- sum(sub_1_solid != 0 & sub_1_liquid != 0) * 2
+perc_ag_3_4 <- agreement_count / tot_obs_3_4 * 100
+
+stat_gene <- data.frame(
+  Group = c("B_h", "B_l", "NB_h", "NB_l", "NB_all"),
+  count = c(tot_obs_1,tot_obs_2,tot_obs_3,tot_obs_4, tot_obs_3_4),
+  Value = c(perc_ag_1,perc_ag_2,perc_ag_3,perc_ag_4, perc_ag_3_4)
+) %>%
+  mutate(lab = paste0(round(Value, 0), "%"))
+
+refCols <-  paletteer::paletteer_d("ggthemes::Tableau_20",10)
+refCols2 <-  paletteer::paletteer_d("ggthemes::wsj_colors6",6)
+
+p_CN <-
+  ggplot(stat_gene, aes(x = Group, y = Value, fill = Group, 
+                    label = lab)) +
+  geom_bar(stat="identity", width = 0.5) +
+  geom_text(size = 4, position = position_stack(vjust = 0.5)) +
+  geom_text(inherit.aes = FALSE,
+            data = stat_gene,
+            aes(x = Group, y = Value,
+                label=paste0("n=", count),
+                size = 4)
+            ) +
+  #scale_fill_manual(values = c("#DE96B4","#FFD1D7","#B28F81", "#54483E")) +
+  scale_fill_manual(values = c("#59A14F", "#8CD17D", "#F28E2B", rev(refCols))) +
+  labs(x="Group", y="Percentage") +
+  theme(
+    panel.grid.minor = element_blank(),
+    panel.grid.major = element_blank(),
+    panel.background = element_blank(),
+    panel.border = element_rect(colour = "grey30", fill=NA, size=0.5),
+    strip.background = element_rect(fill="white", colour = "white"),
+    legend.position = "none") + 
+  #coord_flip() +
+  NULL
+
+ggsave(p_CN, file=file.path(wd$output, "CN_gene_concord_0.5.pdf"), device = "pdf", width = 4, height = 4)
+```
+
+## Gene levels
+
+For each gene, we calculate the concordance
+
+### Exlcude CN
+
+Make a function
+
+```{r,eval=FALSE}
+row_wise_concordence <- function(matrix1, matrix2, PatientID){
+  
+  # Subset full samples to the selected samples from each group
+  matrix1_sub <- matrix1[PatientID]
+  matrix2_sub <- matrix2[PatientID]
+  
+  tot_obs_2 <- sum(abs(matrix1_sub), abs(matrix2_sub))
+  agreement_count <- sum(matrix1_sub != 0 & matrix2_sub != 0) * 2
+  perc_ag_2 <- agreement_count / tot_obs_2 * 100
+  
+  # Get Kappa
+  kappa_result2 <- cohen.kappa(x=cbind(matrix1_sub,matrix2_sub))
+  
+  df_r <- data.frame(
+    TotCNA = tot_obs_2,
+    Agree = agreement_count,
+    Perc = perc_ag_2,
+    Kappa = kappa_result2[[1]][1]
+  )
+  
+  return(df_r)
+  
+}
+```
+
+
+Apply to each gene
+
+
+```{r,eval=FALSE}
+matrix1 <- mat_liq
+matrix2 <- mat_solid
+rownames(matrix1) <- gsub(" .*", "", rownames(matrix1))
+rownames(matrix2) <- gsub(" .*", "", rownames(matrix2))
+
+# Group 1
+list_row <- list()
+for (i in seq_along(rownames(matrix1))){
+  t1 <- matrix1[i,]
+  t2 <- matrix2[i,]
+  vv <- row_wise_concordence(t1,t2, g1$PatientID)
+  list_row[[i]] <- vv
+}
+
+df_genes_1 <- do.call(rbind, list_row) %>% as.data.frame() %>%
+  mutate(Genes = rownames(matrix1),
+         Group = "B_high")
+
+# Group 2
+list_row <- list()
+for (i in seq_along(rownames(matrix1))){
+  t1 <- matrix1[i,]
+  t2 <- matrix2[i,]
+  vv <- row_wise_concordence(t1,t2, g2$PatientID)
+  list_row[[i]] <- vv
+}
+
+df_genes_2 <- do.call(rbind, list_row) %>% as.data.frame() %>%
+  mutate(Genes = rownames(matrix1),
+         Group = "B_low")
+
+# Group 3
+list_row <- list()
+for (i in seq_along(rownames(matrix1))){
+  t1 <- matrix1[i,]
+  t2 <- matrix2[i,]
+  vv <- row_wise_concordence(t1,t2, g3$PatientID)
+  list_row[[i]] <- vv
+}
+
+df_genes_3 <- do.call(rbind, list_row) %>% as.data.frame() %>%
+  mutate(Genes = rownames(matrix1),
+         Group = "NB_high")
+
+# Group 4
+list_row <- list()
+for (i in seq_along(rownames(matrix1))){
+  t1 <- matrix1[i,]
+  t2 <- matrix2[i,]
+  vv <- row_wise_concordence(t1,t2, g4$PatientID)
+  list_row[[i]] <- vv
+}
+
+df_genes_4 <- do.call(rbind, list_row) %>% as.data.frame() %>%
+  mutate(Genes = rownames(matrix1),
+         Group = "NB_low")
+```
+
+Combine all and plot
+
+```{r,eval=FALSE}
+df_genes <- rbind(df_genes_1, df_genes_2, df_genes_3, df_genes_4) %>%
+  mutate(lab = paste0(round(Perc, 0), "%"),
+         Genes = factor(Genes, levels=rev(rownames(matrix1))),
+         Genes_grp = case_when(Genes %in% amp_genes ~ "Amp",
+                               TRUE ~ "Del"))
+
+p_g <-
+  ggplot(df_genes, aes(x = Genes, y = Perc, fill = Genes_grp, 
+                    label = lab)) +
+  geom_bar(stat="identity", width = 0.5) +
+  geom_text(size = 4, position = position_stack(vjust = 0.5)) +
+  #scale_fill_manual(values = c("#DE96B4","#FFD1D7","#B28F81", "#54483E")) +
+  scale_fill_manual(values = c("#FFC0CB", "#8EE5EE")) +
+  labs(x="Group", y="Percentage") +
+  facet_wrap(~Group, ncol = 4) +
+  theme(
+    panel.grid.minor = element_blank(),
+    panel.grid.major = element_blank(),
+    panel.background = element_blank(),
+    panel.border = element_rect(colour = "grey30", fill=NA, size=0.5),
+    strip.background = element_rect(fill="white", colour = "white"),
+    legend.position = "none") + 
+  coord_flip() +
+  NULL
+
+p_2 <-
+  ggplot(df_genes, aes(x = Genes, y = Kappa, fill = Genes_grp)) +
+  geom_bar(stat="identity", width = 0.5) +
+  scale_fill_manual(values = c("#FFC0CB", "#8EE5EE")) +
+  labs(x="Group", y="Percentage") +
+  facet_wrap(~Group, ncol = 4) +
+  geom_hline(yintercept = 0, linetype='dashed') +
+  theme(
+    panel.grid.minor = element_blank(),
+    panel.grid.major = element_blank(),
+    panel.background = element_blank(),
+    panel.border = element_rect(colour = "grey30", fill=NA, size=0.5),
+    strip.background = element_rect(fill="white", colour = "white"),
+    legend.position = "none") + 
+  coord_flip() +
+  NULL
+
+```
+
+
+## Frequency of alterations
+
+For each gene get the frequency
+
+```{r}
+matrix1 <- abs(mat_liq_v1)
+matrix2 <- abs(mat_solid_v1)
+rownames(matrix1) <- gsub(" .*", "", rownames(matrix1))
+rownames(matrix2) <- gsub(" .*", "", rownames(matrix2))
+
+
+list_row <- list()
+for (i in seq_along(rownames(matrix1))){
+  m1 <- matrix1[,g1$PatientID]
+  m2 <- matrix2[,g1$PatientID]
+  f1 <- sum(m1[i,] == !0) / ncol(m1) * 100
+  f2 <- sum(m2[i,] == !0) / ncol(m1) * 100
+  df <- data.frame(Liq = f1,
+                   Solid = f2)
+  list_row[[i]] <- df
+}
+
+df_genes_f1 <- do.call(rbind, list_row) %>% as.data.frame() %>%
+  mutate(Genes = rownames(matrix1),
+         Group = "B_high")
+
+list_row <- list()
+for (i in seq_along(rownames(matrix1))){
+  m1 <- matrix1[,g2$PatientID]
+  m2 <- matrix2[,g2$PatientID]
+  f1 <- sum(m1[i,] == !0) / ncol(m1) * 100
+  f2 <- sum(m2[i,] == !0) / ncol(m1) * 100
+  df <- data.frame(Liq = f1,
+                   Solid = f2)
+  list_row[[i]] <- df
+}
+
+df_genes_f2 <- do.call(rbind, list_row) %>% as.data.frame() %>%
+  mutate(Genes = rownames(matrix1),
+         Group = "B_low")
+
+list_row <- list()
+for (i in seq_along(rownames(matrix1))){
+  m1 <- matrix1[,g3$PatientID]
+  m2 <- matrix2[,g3$PatientID]
+  f1 <- sum(m1[i,] == !0) / ncol(m1) * 100
+  f2 <- sum(m2[i,] == !0) / ncol(m1) * 100
+  df <- data.frame(Liq = f1,
+                   Solid = f2)
+  list_row[[i]] <- df
+}
+
+df_genes_f3 <- do.call(rbind, list_row) %>% as.data.frame() %>%
+  mutate(Genes = rownames(matrix1),
+         Group = "NB_high")
+
+
+list_row <- list()
+for (i in seq_along(rownames(m1))){
+  m1 <- matrix1[,g4$PatientID]
+  m2 <- matrix2[,g4$PatientID]
+  f1 <- sum(m1[i,] == !0) / ncol(m1) * 100
+  f2 <- sum(m2[i,] == !0) / ncol(m1) * 100
+  df <- data.frame(Liq = f1,
+                   Solid = f2)
+  list_row[[i]] <- df
+}
+
+df_genes_f4 <- do.call(rbind, list_row) %>% as.data.frame() %>%
+  mutate(Genes = rownames(matrix1),
+         Group = "NB_low")
+
+
+list_row <- list()
+for (i in seq_along(rownames(m1))){
+  m1 <- matrix1[,c(g3$PatientID, g4$PatientID)]
+  m2 <- matrix2[,c(g3$PatientID, g4$PatientID)]
+  f1 <- sum(m1[i,] == !0) / ncol(m1) * 100
+  f2 <- sum(m2[i,] == !0) / ncol(m1) * 100
+  df <- data.frame(Liq = f1,
+                   Solid = f2)
+  list_row[[i]] <- df
+}
+
+df_genes_f3_f4 <- do.call(rbind, list_row) %>% as.data.frame() %>%
+  mutate(Genes = rownames(matrix1),
+         Group = "NB_all")
+```
+
+
+Combine all and plot
+
+```{r}
+df_genes_f <- rbind(df_genes_f1, df_genes_f2, df_genes_f3, df_genes_f4, df_genes_f3_f4) %>%
+  mutate(Genes = factor(Genes, levels=rev(rownames(matrix1))),
+         Genes_grp = case_when(Genes %in% amp_genes ~ "Amp",
+                               TRUE ~ "Del"))
+
+m <- melt(df_genes_f) %>%
+  mutate(lab = paste0(round(value, 0), "%"),
+         Fill_f = paste0(Genes_grp, variable)) %>%
+  filter(Group %in% c("B_high", "B_low", "NB_all"))
+
+p_g <-
+  ggplot(m, aes(x = Genes, y = value, fill = Fill_f, 
+              label = lab)) +
+  geom_bar(stat="identity", width = 0.5, position="dodge") +
+  geom_text(size = 4, position = position_dodge(width=0.4),hjust = -0.1) +
+  #scale_fill_manual(values = c("#DE96B4","#FFD1D7","#B28F81", "#54483E")) +
+  scale_fill_manual(values = c( "#FFC0CB", "#FF0000",
+                                "#8EE5EE", "#00008B")) +
+  labs(x="Group", y="Percentage") +
+  facet_wrap(~Group, ncol = 5) +
+  theme(
+    panel.grid.minor = element_blank(),
+    panel.grid.major = element_blank(),
+    panel.background = element_blank(),
+    panel.border = element_rect(colour = "grey30", fill=NA, size=0.5),
+    strip.background = element_rect(fill="white", colour = "white"),
+    legend.position = "bottom") + 
+  scale_y_continuous(limits=c(0,65, breaks=c(0,20,40,60))) +
+  coord_flip() +
+  NULL
+
+
+
+ggsave(p_g, file=file.path(wd$output, "GeneFreq_visit1.pdf"), device = "pdf", width = 12, height = 5)
+
+```
+
+
+## Visit 2
+
+We calculate agreement on all observations, including copy neutral
+
+
+Subset to each group
+
+```{r}
+df_purity_or <- df_purity_or_v2
+# Overall concordance 
+g1 <- df_purity_or %>% filter(Sample_type == "Bone" & Purity_tresh == "t1_high")
+g2 <- df_purity_or %>% filter(Sample_type == "Bone" & Purity_tresh == "t2_low")
+g3 <- df_purity_or %>% filter(Sample_type == "non-bone" & Purity_tresh == "t1_high")
+g4 <- df_purity_or %>% filter(Sample_type == "non-bone" & Purity_tresh == "t2_low")
+# High tumor purity & high ctDNA (>10%)
+g5 <- df_purity_or %>% filter(Sample_type == "Bone" & Purity_tresh == "t1_high" & ct_tresh == "ct1_high")
+
+
+
+# All calls (AMP and DEL)
+mat_liq <-  abs(mat_liq_v2)
+mat_solid <- abs(mat_solid_v2)
+
+# Just AMP
+#mat_liq <-  abs(mat_liq_v2)[1:6,]
+#mat_solid <- abs(mat_solid_v2)[1:6,]
+
+# # Just DEL
+# mat_liq <-  abs(mat_liq_v2)[7:11,]
+# mat_solid <- abs(mat_solid_v2)[7:11,]
+
+
+```
+
+Generate contingency table
+
+```{r}
+df_g1 <- calculate_contingency_table(mat_liq, mat_solid, g1$PatientID)
+df_g2 <- calculate_contingency_table(mat_liq, mat_solid, g2$PatientID)
+
+# Combine the non-bone, due to low numbers
+df_g3_4 <- calculate_contingency_table(mat_liq, mat_solid, c(g3$PatientID, g4$PatientID))
+
+# High tumor purity & high ctDNA
+df_g5 <- calculate_contingency_table(mat_liq, mat_solid, g5$PatientID)
+```
+
+We can generate a data frame of the percentage 
+
+```{r}
+d_all <- cbind(df_g1, df_g2, df_g3_4, df_g5)
+writexl::write_xlsx(d_all, file.path(wd$output, "Kappa_AMP_DEL_v2.xlsx"))
+```
+
+
+
+### Exlcude CN
+
+We exclude copy neutral
+
+Graph of the concordance
+
+```{r}
+sub_1_solid <- mat_solid[,g1$PatientID]
+sub_1_liquid <- mat_liq[,g1$PatientID]
+
+## Calculate concordance 
+# Total observation
+tot_obs_1 <- sum(abs(sub_1_liquid), abs(sub_1_solid))
+# Agreement count (because its counted once, we muliple by 2x)
+agreement_count <- sum(sub_1_solid != 0 & sub_1_liquid != 0) * 2
+# Perc agreement 
+perc_ag_1 <- agreement_count / tot_obs_1 * 100
+
+# Generate contingency table
+
+
+# Repeat for all 4 group
+# ----- Group 2 ------ #
+sub_1_solid <- mat_solid[,g2$PatientID]
+sub_1_liquid <- mat_liq[,g2$PatientID]
+tot_obs_2 <- sum(abs(sub_1_liquid), abs(sub_1_solid))
+agreement_count <- sum(sub_1_solid != 0 & sub_1_liquid != 0) * 2
+perc_ag_2 <- agreement_count / tot_obs_2 * 100
+
+# ----- Group 3 ------ #
+sub_1_solid <- mat_solid[,g3$PatientID]
+sub_1_liquid <- mat_liq[,g3$PatientID]
+tot_obs_3 <- sum(abs(sub_1_liquid), abs(sub_1_solid))
+agreement_count <- sum(sub_1_solid != 0 & sub_1_liquid != 0) * 2
+perc_ag_3 <- agreement_count / tot_obs_3 * 100
+
+
+# ----- Group 4 ------ #
+sub_1_solid <- mat_solid[,g4$PatientID]
+sub_1_liquid <- mat_liq[,g4$PatientID]
+tot_obs_4 <- sum(abs(sub_1_liquid), abs(sub_1_solid))
+agreement_count <- sum(sub_1_solid != 0 & sub_1_liquid != 0) * 2
+perc_ag_4 <- agreement_count / tot_obs_4 * 100
+
+
+# ----- Group 3 & 4 combined ------ #
+sub_1_solid <- mat_solid[,c(g3$PatientID, g4$PatientID)]
+sub_1_liquid <- mat_liq[,c(g3$PatientID, g4$PatientID)]
+tot_obs_3_4 <- sum(abs(sub_1_liquid), abs(sub_1_solid))
+agreement_count <- sum(sub_1_solid != 0 & sub_1_liquid != 0) * 2
+perc_ag_3_4 <- agreement_count / tot_obs_3_4 * 100
+
+stat_gene <- data.frame(
+  Group = c("B_h", "B_l", "NB_h", "NB_l", "NB_all"),
+  count = c(tot_obs_1,tot_obs_2,tot_obs_3,tot_obs_4, tot_obs_3_4),
+  Value = c(perc_ag_1,perc_ag_2,perc_ag_3,perc_ag_4, perc_ag_3_4)
+) %>%
+  mutate(lab = paste0(round(Value, 0), "%"))
+
+refCols <-  paletteer::paletteer_d("ggthemes::Tableau_20",10)
+refCols2 <-  paletteer::paletteer_d("ggthemes::wsj_colors6",6)
+
+p_CN <-
+  ggplot(stat_gene, aes(x = Group, y = Value, fill = Group, 
+                    label = lab)) +
+  geom_bar(stat="identity", width = 0.5) +
+  geom_text(size = 4, position = position_stack(vjust = 0.5)) +
+  geom_text(inherit.aes = FALSE,
+            data = stat_gene,
+            aes(x = Group, y = Value,
+                label=paste0("n=", count),
+                size = 4)
+            ) +
+  #scale_fill_manual(values = c("#DE96B4","#FFD1D7","#B28F81", "#54483E")) +
+  scale_fill_manual(values = c("#59A14F", "#8CD17D", "#F28E2B", rev(refCols))) +
+  labs(x="Group", y="Percentage") +
+  theme(
+    panel.grid.minor = element_blank(),
+    panel.grid.major = element_blank(),
+    panel.background = element_blank(),
+    panel.border = element_rect(colour = "grey30", fill=NA, size=0.5),
+    strip.background = element_rect(fill="white", colour = "white"),
+    legend.position = "none") + 
+  #coord_flip() +
+  NULL
+
+ggsave(p_CN, file=file.path(wd$output, "CN_gene_concord_0.5_visit_2.pdf"), device = "pdf", width = 4, height = 4)
+```
+
+## Frequency of alterations
+
+For each gene get the frequency
+
+```{r}
+matrix1 <- abs(mat_liq_v2)
+matrix2 <- abs(mat_solid_v2)
+rownames(matrix1) <- gsub(" .*", "", rownames(matrix1))
+rownames(matrix2) <- gsub(" .*", "", rownames(matrix2))
+
+
+list_row <- list()
+for (i in seq_along(rownames(matrix1))){
+  m1 <- matrix1[,g1$PatientID]
+  m2 <- matrix2[,g1$PatientID]
+  f1 <- sum(m1[i,] == !0) / ncol(m1) * 100
+  f2 <- sum(m2[i,] == !0) / ncol(m1) * 100
+  df <- data.frame(Liq = f1,
+                   Solid = f2)
+  list_row[[i]] <- df
+}
+
+df_genes_f1 <- do.call(rbind, list_row) %>% as.data.frame() %>%
+  mutate(Genes = rownames(matrix1),
+         Group = "B_high")
+
+list_row <- list()
+for (i in seq_along(rownames(matrix1))){
+  m1 <- matrix1[,g2$PatientID]
+  m2 <- matrix2[,g2$PatientID]
+  f1 <- sum(m1[i,] == !0) / ncol(m1) * 100
+  f2 <- sum(m2[i,] == !0) / ncol(m1) * 100
+  df <- data.frame(Liq = f1,
+                   Solid = f2)
+  list_row[[i]] <- df
+}
+
+df_genes_f2 <- do.call(rbind, list_row) %>% as.data.frame() %>%
+  mutate(Genes = rownames(matrix1),
+         Group = "B_low")
+
+list_row <- list()
+for (i in seq_along(rownames(matrix1))){
+  m1 <- matrix1[,g3$PatientID]
+  m2 <- matrix2[,g3$PatientID]
+  f1 <- sum(m1[i,] == !0) / ncol(m1) * 100
+  f2 <- sum(m2[i,] == !0) / ncol(m1) * 100
+  df <- data.frame(Liq = f1,
+                   Solid = f2)
+  list_row[[i]] <- df
+}
+
+df_genes_f3 <- do.call(rbind, list_row) %>% as.data.frame() %>%
+  mutate(Genes = rownames(matrix1),
+         Group = "NB_high")
+
+
+list_row <- list()
+for (i in seq_along(rownames(m1))){
+  m1 <- matrix1[,g4$PatientID]
+  m2 <- matrix2[,g4$PatientID]
+  f1 <- sum(m1[i,] == !0) / ncol(m1) * 100
+  f2 <- sum(m2[i,] == !0) / ncol(m1) * 100
+  df <- data.frame(Liq = f1,
+                   Solid = f2)
+  list_row[[i]] <- df
+}
+
+df_genes_f4 <- do.call(rbind, list_row) %>% as.data.frame() %>%
+  mutate(Genes = rownames(matrix1),
+         Group = "NB_low")
+
+
+list_row <- list()
+for (i in seq_along(rownames(m1))){
+  m1 <- matrix1[,c(g3$PatientID, g4$PatientID)]
+  m2 <- matrix2[,c(g3$PatientID, g4$PatientID)]
+  f1 <- sum(m1[i,] == !0) / ncol(m1) * 100
+  f2 <- sum(m2[i,] == !0) / ncol(m1) * 100
+  df <- data.frame(Liq = f1,
+                   Solid = f2)
+  list_row[[i]] <- df
+}
+
+df_genes_f3_f4 <- do.call(rbind, list_row) %>% as.data.frame() %>%
+  mutate(Genes = rownames(matrix1),
+         Group = "NB_all")
+```
+
+
+Combine all and plot
+
+```{r}
+df_genes_f <- rbind(df_genes_f1, df_genes_f2, df_genes_f3, df_genes_f4, df_genes_f3_f4) %>%
+  mutate(Genes = factor(Genes, levels=rev(rownames(matrix1))),
+         Genes_grp = case_when(Genes %in% amp_genes ~ "Amp",
+                               TRUE ~ "Del"))
+
+m <- melt(df_genes_f) %>%
+  mutate(lab = paste0(round(value, 0), "%"),
+         Fill_f = paste0(Genes_grp, variable)) %>%
+  filter(Group %in% c("B_high", "B_low", "NB_all"))
+
+p_g <-
+  ggplot(m, aes(x = Genes, y = value, fill = Fill_f, 
+              label = lab)) +
+  geom_bar(stat="identity", width = 0.5, position="dodge") +
+  geom_text(size = 4, position = position_dodge(width=0.4),hjust = -0.1) +
+  #scale_fill_manual(values = c("#DE96B4","#FFD1D7","#B28F81", "#54483E")) +
+  scale_fill_manual(values = c( "#FFC0CB", "#FF0000",
+                                "#8EE5EE", "#00008B")) +
+  labs(x="Group", y="Percentage") +
+  facet_wrap(~Group, ncol = 5) +
+  theme(
+    panel.grid.minor = element_blank(),
+    panel.grid.major = element_blank(),
+    panel.background = element_blank(),
+    panel.border = element_rect(colour = "grey30", fill=NA, size=0.5),
+    strip.background = element_rect(fill="white", colour = "white"),
+    legend.position = "bottom") + 
+  scale_y_continuous(limits=c(0,65, breaks=c(0,20,40,60))) +
+  coord_flip() +
+  NULL
+
+
+
+ggsave(p_g, file=file.path(wd$output, "GeneFreq_visit_2.pdf"), device = "pdf", width = 12, height = 5)
+
+```
+
+## Contingency table
+
+Based on the manually generated contingency table, we load the pre-calculated results of PPV, NPV, prevalance. 
+
+```{r}
+cc <- read_xlsx(file.path(wd$dataP, "Contingency_table_values_v1.xlsx"))
+
+# Lets plot values of interest
+mm <- melt(cc) %>%
+  filter(Category %in% c("Prevalence", "PPV", "NPV")) %>%
+  mutate(lab = paste0(round(value, 1), "%"),
+         Category = factor(Category, levels=c("Prevalence", "PPV", "NPV")))
+
+p_CN2 <-
+  ggplot(mm, aes(x = variable, y = value, fill = Category, 
+                    label = lab)) +
+  geom_bar(stat="identity", width = 0.5, position="dodge") +
+  geom_text(size = 4, position = position_dodge(width=0.5)) +
+  #scale_fill_manual(values = c("#DE96B4","#FFD1D7","#B28F81", "#54483E")) +
+  scale_fill_manual(values = c("#8dd3c7", "#ffffb3", "#bebada")) +
+  labs(x="Group", y="Percentage") +
+  theme(
+    panel.grid.minor = element_blank(),
+    panel.grid.major = element_blank(),
+    panel.background = element_blank(),
+    panel.border = element_rect(colour = "grey30", fill=NA, size=0.5),
+    strip.background = element_rect(fill="white", colour = "white"),
+    legend.position = "right") + 
+  #coord_flip() +
+  NULL
+p_CN2
+
+ggsave(p_CN2, file=file.path(wd$output, "CN_visit_1_stats.pdf"), device = "pdf", width = 6, height = 4)
+```
+
+
+For visit 2
+
+```{r}
+cc <- read_xlsx(file.path(wd$dataP, "Contingency_table_values_v2.xlsx"))
+
+# Lets plot values of interest
+mm <- melt(cc) %>%
+  filter(Category %in% c("Prevalence", "PPV", "NPV")) %>%
+  mutate(lab = paste0(round(value, 1), "%"),
+         Category = factor(Category, levels=c("Prevalence", "PPV", "NPV")))
+
+p_CN2 <-
+  ggplot(mm, aes(x = variable, y = value, fill = Category, 
+                    label = lab)) +
+  geom_bar(stat="identity", width = 0.5, position="dodge") +
+  geom_text(size = 4, position = position_dodge(width=0.5)) +
+  #scale_fill_manual(values = c("#DE96B4","#FFD1D7","#B28F81", "#54483E")) +
+  scale_fill_manual(values = c("#8dd3c7", "#ffffb3", "#bebada")) +
+  labs(x="Group", y="Percentage") +
+  theme(
+    panel.grid.minor = element_blank(),
+    panel.grid.major = element_blank(),
+    panel.background = element_blank(),
+    panel.border = element_rect(colour = "grey30", fill=NA, size=0.5),
+    strip.background = element_rect(fill="white", colour = "white"),
+    legend.position = "right") + 
+  #coord_flip() +
+  NULL
+p_CN2
+
+ggsave(p_CN2, file=file.path(wd$output, "CN_visit_2_stats.pdf"), device = "pdf", width = 6, height = 4)
+```
+
+
+# Plot AUC
+
+## Based on prevalence  
+
+
+We calculated the prevalence and the TPR and 1 - FPR from the contingency table
+
+```{r}
+# Read in the pre-calcualted values
+auc_1 <- read_xlsx(file.path(wd$output, "Kappa_AMP_DEL_edited.xlsx"), sheet=5) %>%
+  mutate(Prev = paste0(round(Prevalence, 0), "%"))
+
+
+ggplot(auc_1, aes(y=TPR, x=one_minus_FPR, colour=Cat, label=Prev)) +
+  geom_point(size=4) +
+  geom_text(colour="black", nudge_y= 0.5) + 
+  facet_wrap(~Visit) +
+  theme_bw() +
+  #theme(panel.grid = element_blank()) +
+  xlab("1 - FPR")  +
+  theme(legend.position = "bottom") +
+  scale_x_continuous(limits=c(0,100), breaks=c(0,20,40,60,80,100)) +
+  scale_y_continuous(limits=c(0,100), breaks=c(0,20,40,60,80,100)) +
+  NULL
+```
+
+
+## Based on varying log2 trehshold
+
+The idea is to find the TPR and 1-FPR for each treshold. Using the solid as baseline. 
+
+### Single threshold
+
+For a single threshold, we generate a workflow. Starting from the contingency table generation to calculating the TPR and 1-FDR
+
+```{r}
+matrix1 <- abs(mat_liq_v1)
+matrix2 <- abs(mat_solid_v1)
+rownames(matrix1) <- gsub(" .*", "", rownames(matrix1))
+rownames(matrix2) <- gsub(" .*", "", rownames(matrix2))
+
+g1 <- df_purity_or_v1 %>% filter(Sample_type == "Bone" & Purity_tresh == "t1_high")
+g2 <- df_purity_or_v1 %>% filter(Sample_type == "Bone" & Purity_tresh == "t2_low")
+
+calculate_AUC <- function(matrix1, matrix2, PatientID, groupID) {
+# Subset full samples to the selected samples from each group
+  matrix1_sub <- matrix1[,PatientID]
+  matrix2_sub <- matrix2[,PatientID]
+  
+  
+  # Flatten matrices to vectors
+  vector1 <- as.vector(matrix1_sub)
+  vector2 <- as.vector(matrix2_sub)
+
+  # Create a 2x2 contingency table
+  contingency_table <- table(vector1, vector2)
+  
+  #return(contingency_table)
+  
+  # Extract counts
+  SpLp <- contingency_table[2, 2] #
+  SpLn <- contingency_table[1, 2] 
+  SnLp <- contingency_table[2, 1]
+  SnLn <- contingency_table[1, 1]
+
+  result_df <- data.frame(
+    row.names = c("Lp", "Ln"),
+    Sp = c(SpLp, SpLn),
+    Sn = c(SnLp,SnLn)
+  ) %>%
+    mutate(Total = rowSums(.))
+  result_df[3,] <- colSums(result_df)
+  rownames(result_df)[3] <- "Total"
+
+  #return(result_df)
+  
+  # Calculate TPR: TP / (TP + FN) * 100
+  tpr_val <- SpLp / (SpLp + SpLn) * 100 
+  # Calculate 1-FPR: FP / (FP + TN) * 100
+  fpr_val <- SnLp / (SnLp + SnLn) * 100
+  fpr_val <- 100 - fpr_val
+  
+  # Return the TPR and 1-FPR
+  df <- data.frame(
+    tpr = tpr_val,
+    one_minus_fpr = fpr_val
+  ) %>% 
+    mutate(Cat = groupID)
+  
+  return(df)
+  
+}
+
+# AUC for group 1 : Bone, high
+test_auc_g1 <- calculate_AUC(matrix1, matrix2, g1$PatientID, "Bone_high")
+```
+
+### Multiple threshold
+
+Now for each log2 ratio threshold, we have to re-do the copy number calling. Make a function to call CNV from a range of threshold
+
+
+```{r}
+cnv_tresh <- c(0.1,0.2,0.3,0.4,0.5,0.6,0.7,0.8,0.9)
+#cnv_tresh <- c(0.4,0.5)
+
+thresh_cnv <- function(CNV_val){
+  
+df_simple2 <- df_simple %>%
+  group_by(Genes, UniqID) %>%
+  mutate(lg2CNR = case_when(Genes %in% amp_genes ~ max(lg2CNR),
+                            Genes %in% del_genes ~ min(lg2CNR))) %>%
+  distinct()
+
+df_simple2 <- df_simple2 %>%
+  mutate(cr = case_when(
+    Genes %in% amp_genes & lg2CNR >= CNV_val ~ 1,
+    Genes %in% del_genes & lg2CNR <= -CNV_val~ -1,
+    TRUE ~ 0
+  )) %>%
+  select(-pass_thresh) %>% distinct()
+
+# Check if this runs
+df_v1 <- df_simple2 %>%
+  ungroup() %>%
+  filter(visit == "V1") %>%
+  #filter(pass_thresh == "true") %>%
+  dplyr::select(Genes, PatientID, cr) %>%
+  distinct() %>%
+  # Convert to wide format, absent values is given 0
+  pivot_wider(names_from = PatientID, values_from = cr, values_fill = 0)
+
+mat_v1 <- df_v1 %>% as.data.frame()
+row.names(mat_v1) <- df_v1$Genes
+mat_v1 <- mat_v1[,-1] %>% as.matrix()
+mat_v1_or <- mat_v1[gene_or,]
+
+return(mat_v1_or)
+}
+
+# For 1 treshold
+cnv_0.1 <- thresh_cnv(0.1)
+
+# Do a function for multiple threshold
+list_cnv <- list()
+
+# Run for all 
+for (i in seq_along(cnv_tresh)){
+  list_cnv[[i]] <- thresh_cnv(cnv_tresh[i])
+}
+```
+
+Now calculate the TPR and 1-FPR for each log2ratio and all group
+
+```{r}
+# Visit 1
+# Patient groups
+df_purity_or <- df_purity_or_v1
+g1 <- df_purity_or %>% filter(Sample_type == "Bone" & Purity_tresh == "t1_high")
+g2 <- df_purity_or %>% filter(Sample_type == "Bone" & Purity_tresh == "t2_low")
+g3_g4 <- df_purity_or %>% filter(Sample_type == "non-bone" & Purity_tresh %in% c("t1_high", "t2_low"))
+
+# For one threshold, one group. Matrix 1 is liquid
+matrix1 <- abs(mat_liq_v1)
+rownames(matrix1) <- gsub(" .*", "", rownames(matrix1))
+
+# Test example
+test_auc_g1_0.5 <- calculate_AUC(matrix1, abs(list_cnv[[5]]), g1$PatientID, "Bone_high")
+
+# Do a function 
+auc_list <- list()
+for (i in seq_along(cnv_tresh)){
+  cnv_tmp <- thresh_cnv(cnv_tresh[i])
+  auc_tmp <- calculate_AUC(matrix1, abs(list_cnv[[i]]), g1$PatientID, "Bone_high") %>%
+    mutate(log2_thres = cnv_tresh[i])
+  auc_list[[i]] <- auc_tmp
+}
+
+auc_df_g1 <- do.call(rbind, auc_list)
+
+# Do a function 
+auc_list <- list()
+for (i in seq_along(cnv_tresh)){
+  cnv_tmp <- thresh_cnv(cnv_tresh[i])
+  auc_tmp <- calculate_AUC(matrix1, abs(list_cnv[[i]]), g2$PatientID, "Bone_low") %>%
+    mutate(log2_thres = cnv_tresh[i])
+  auc_list[[i]] <- auc_tmp
+}
+
+auc_df_g2 <- do.call(rbind, auc_list)
+
+# Do a function 
+auc_list <- list()
+for (i in seq_along(cnv_tresh)){
+  cnv_tmp <- thresh_cnv(cnv_tresh[i])
+  auc_tmp <- calculate_AUC(matrix1, abs(list_cnv[[i]]), g3_g4$PatientID, "Non_bone") %>%
+    mutate(log2_thres = cnv_tresh[i])
+  auc_list[[i]] <- auc_tmp
+}
+
+auc_df_g3 <- do.call(rbind, auc_list)
+```
+
+
+### Plot these
+
+Make AUC plot
+
+```{r}
+auc_all <- rbind(auc_df_g1, auc_df_g2, auc_df_g3) %>%
+  mutate(log2_thres = as.character(log2_thres))
+
+refCols <-  paletteer::paletteer_d("ggthemes::Tableau_10",10)
+p1 <- 
+ggplot(auc_all, aes(y=tpr, x=one_minus_fpr, colour=log2_thres)) +
+  geom_point(size=4) +
+  theme_bw() +
+  facet_wrap(~Cat, ncol=3) +
+  scale_colour_manual(values=refCols) +
+  xlab("1 - FPR") +
+  theme(legend.position = "bottom") +
+  #scale_x_continuous(limits=c(0,100), breaks=c(0,20,40,60,80,100)) +
+  #scale_y_continuous(limits=c(0,100), breaks=c(0,20,40,60,80,100)) +
+  NULL
+```
+
+
+
+
+# OTHERS
+
+
+
+
+
+
+
+
+# Objective 5
+
+Cox-value 
+
+We use all sample in visit 1, regardless if they are not present in visit 2
+
+
+```{r}
+
+```
+

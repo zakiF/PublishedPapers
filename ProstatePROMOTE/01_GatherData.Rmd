@@ -1,0 +1,2001 @@
+---
+title: "Analyse WES CNR"
+date: "2023-06-07"
+output: 
+  html_document:
+    toc: true
+    toc_float:
+      collapsed: true
+    toc_depth: 3
+    number_sections: true
+    theme: lumen
+---
+
+# Background
+
+The main aim of the project is to determine the clinical utility of a risk score algorithm based on Copy Number Variation (CNV) in liquid and solid biopsy data.
+
+Our primary patient cohorts are from the PROMOTE (**P**rostate Cancer **M**edically-**O**p**t**imized Genome-Enhanced **T**h**e**rapy) study, which contains [liquid]() and [solid tissue]() biopsies.
+
+All patients undergo two serial metastatic tissue or bone biopsies, with the first biopsy performed prior to the initiation of AA/P treatment (visit 1: pretreatment) and the second after 12 weeks of treatment (visit 2: posttreatment). We want to determine. concordance in both the vists.  
+
+We will limit our analysis to the 11 genes described in the [paper](https://www.mdpi.com/2072-6694/14/19/4714) as having a good prognostic risk score to determine survival. 
+
+
+In this part of analysis, we extract clinical data from various papers, and simplify the copy number calls provdied by [David Nix](https://uofuhealth.utah.edu/staff/david-nix). 
+
+# Objectives
+
+1. Read clinical data into R
+2. Read exome data CNA results
+3. Set trehsold of CNA
+4. Comparison to public dataset
+5. Correlation of CNV with ctDNA & tumor purity
+
+
+# Pre-processing 
+
+## Loading packages
+
+```{r, message=FALSE, warning=FALSE}
+library(here)
+library(tidyverse)
+library(ggplot2)
+library(readxl)
+library(reshape2)
+library(ComplexHeatmap)
+library(ggbeeswarm)
+library(patchwork)
+library(ggpubr)
+
+library(survival)
+library(ggsurvfit)
+library(survminer)
+library(eulerr)
+
+library(ggrain)
+devtools::source_url("https://raw.githubusercontent.com/yjunechoe/geom_paired_raincloud/master/geom_paired_raincloud.R")
+```
+
+
+## Directories
+
+```{r}
+wd <- list()
+wd$main <- here()
+wd$data <- file.path(wd$main, "data")
+wd$dataP <- file.path(wd$data, "processed")
+wd$output <- file.path(wd$main, "output")
+wd$script <- file.path(wd$main, "scripts")
+wd$outputData <- file.path(wd$output, "out_data")
+
+# Supplemental data from previous publications
+wd$papers <- file.path(wd$data, "from_papers")
+```
+
+
+Create directories
+
+```{r}
+# List of all directories
+directories <- list(wd$main, wd$data, wd$dataP, wd$output, wd$script, wd$outputData)
+
+# Create directories if they don't exist
+for (dir in directories) {
+  if (!file.exists(dir)) {
+    dir.create(dir, recursive = TRUE)
+  } else {
+    print(paste("Directory already exists:", dir))
+  }
+}
+```
+
+Read the 11 gene panel we are interested in
+
+```{r}
+df_gene <- read.delim(file.path(wd$data, "gene_panel.txt"))
+gene_panel <- df_gene %>% pull(Genes)
+```
+
+
+# Objective 1
+
+**Read metadata into R** 
+
+
+There are few data that we want to read into R ; 
+
+1. The copy number results of liquid biopsy at both visits. Based on Manish's Cancer 2020 [paper](https://www.mdpi.com/2072-6694/14/19/4714),  
+2. Metadata associated with the exome samples
+3. Summary of copy number call from David Nix exome workflow
+
+## Liquid results
+
+We read the file linking the exome sampleID with the Manish paper's ID. First read the PatientID based on the paper.
+
+```{r}
+file_dir <- file.path(wd$data, "from_papers/cancers_2022_plasma/")
+df_link <- readxl::read_excel(file.path(file_dir, "Table S3.xlsx"),
+                              sheet = 4) %>%
+  mutate(SubjectID = toupper(SubjectID))
+```
+
+Next read the copy number results. Limit to the 11 genes of interest
+
+```{r}
+# Visit 1
+file_dir <- file.path(wd$data, "from_papers/cancers_2022_plasma/")
+pap_v1 <- readxl::read_excel(file.path(file_dir, "Table S3.xlsx"),
+                              sheet = 2)  %>%
+  rename(PatientID = PatientID...1) %>%
+  select(PatientID, AR, COL22A1, MYC, NCOR1, NKX3.1, NOTCH1, PIK3CA, PIK3CB, TP53, ZBTB16, TMPRSS2) %>%
+  mutate(across(AR:TMPRSS2, ~ case_when(
+    . == "NC" ~ 0,
+    . == "Amp" ~ 1,
+    . == "Del" ~ -1))) %>% as.data.frame()
+
+
+# Repeat for visit 2
+pap_v2 <- readxl::read_excel(file.path(file_dir, "Table S3.xlsx"),
+                              sheet = 3)  %>%
+  rename(PatientID = PatientID...1) %>%
+  select(PatientID, AR, COL22A1, MYC, NCOR1, NKX3.1, NOTCH1, PIK3CA, PIK3CB, TP53, ZBTB16, TMPRSS2) %>%
+  mutate(across(AR:TMPRSS2, ~ case_when(
+    . == "NC" ~ 0,
+    . == "Amp" ~ 1,
+    . == "Del" ~ -1))) %>% as.data.frame()
+```
+
+Get the number of patient from each visit
+
+```{r}
+length(unique(pap_v1$PatientID))
+length(unique(pap_v2$PatientID))
+```
+
+## Liquid metadata
+
+We are interested in the ctDNA content of the liquid samples. This information is provided from this [paper](https://www.nature.com/articles/s41391-020-0224-4). We read the data.
+
+
+We asked Liang how to consolidate the sample names from differnt papers. 
+
+> the P1 is equal to MJ1. P is always odd number because each patient has two plasma samples (MJ1 and MJ2 are from the same patient P1)
+
+```{r}
+meta_l <- readxl::read_excel(file.path(wd$papers, "ProstateCancer_2020/Supplementary Tables.xlsx"), 
+                               sheet = 1,
+                              skip = 1)
+
+# Some renaming
+meta_l <- meta_l %>%
+  rename(ID_V1 = 'Plasma ID...2',
+         ID_V2 = 'Plasma ID...4',
+         ctDNA_V1 = 'ctDNA Content  (V1:  Pre-treatment)',
+         ctDNA_V2 = 'ctDNA Content (V2: Post-treatment)') %>%
+  select(ID_V1, ID_V2, ctDNA_V1, ctDNA_V2) %>%
+  mutate(ID_V1 = paste0("MJ", ID_V1),
+         ID_V2 = paste0("MJ", ID_V2))
+
+# Convert to long format
+meta_l <- data.frame(
+  PatientID = c(meta_l$ID_V1, meta_l$ID_V2),
+  ctDNA = c(meta_l$ctDNA_V1, meta_l$ctDNA_V2) 
+) %>%
+  mutate(ctDNA = as.numeric(ctDNA) * 100)
+
+# Add other info
+meta_l <- full_join(meta_l, df_link)
+```
+
+## Exome metadata
+
+We will read the metadata for the exome solid tumors from [visit 1](https://pubmed.ncbi.nlm.nih.gov/29069303/) and [visit 2](https://pubmed.ncbi.nlm.nih.gov/36135372/). The metadata are in supplemental tables of the papers.
+
+
+Lets extract the PatientID, progression status and sample source (bone, non-bone), tumor content.
+
+```{r}
+
+# Some samples metadata is missing from annal Onco paper. For example S78 data is missing from annal Onco paper. S
+
+# meta_v1 <- readxl::read_excel(file.path(wd$papers, "visit_1_annalOnco_2016/Suppl_TabS1-S16_mdx689.xlsx"), 
+#                                sheet = 1,
+#                               skip = 1)
+# meta_v1 <- meta_v1 %>%
+#   rename(SubjectID = Subject_ID,
+#          Comp_prog =  'Composite\r\nProgression',
+#          Sample_type = Sample_Type,
+#          Tumor_content = 'Tumor\r\ncontent') %>%
+#   select(SubjectID, Comp_prog, Sample_type, Tumor_content) %>%
+#   mutate(SubjectID = paste0("S", SubjectID),
+#          Tumor_content = as.numeric(Tumor_content),
+#          Tumor_content = Tumor_content* 100,
+#          Sample_type = case_when(Sample_type == "Bone" ~ "Bone",
+#                                  TRUE ~ "non-bone")) %>%
+#   select(-Tumor_content) %>%
+#   na.omit()
+
+
+# We take meta data from another paper
+meta_v1 <- readxl::read_excel(file.path(wd$papers, "visit_2_molCanRes_2022/mcr-22-0099_supplementary_tables_1-41_suppst1-41.xlsx"), 
+                               sheet = 3,
+                              skip = 1) %>%
+  filter(Visit == "V1") %>%
+  rename(SubjectID = SampleID_withdBGapPatient,
+         Sample_type = Tissue,
+         Tumor_content = CNPurity) %>%
+  select(SubjectID, Sample_type, Tumor_content) %>%
+  mutate(SubjectID = gsub("_.*", "", SubjectID),
+         SubjectID = paste0("S", SubjectID),
+         Tumor_content = Tumor_content * 100,
+         Sample_type = case_when(Sample_type == "Bone" ~ "Bone",
+                                 TRUE ~ "non-bone")) #%>%
+  #select(SubjectID, Tumor_content)
+
+#meta_v1 <- meta_v1 %>% left_join(meta_v1_p2)
+
+```
+
+Repeat for visit 2. The data for visit 2 is a bit messy, the information are located in different excel sheets.
+
+```{r}
+# Get the sample type
+meta_v2_p1 <- readxl::read_excel(file.path(wd$papers, "visit_2_molCanRes_2022/mcr-22-0099_supplementary_tables_1-41_suppst1-41.xlsx"), 
+                               sheet = 3,
+                              skip = 1) %>%
+  filter(Visit == "V2") %>%
+  rename(SubjectID = SampleID_withdBGapPatient,
+         Sample_type = Tissue,
+         Tumor_content = CNPurity) %>%
+  select(SubjectID, Sample_type, Tumor_content) %>%
+  mutate(SubjectID = gsub("_.*", "", SubjectID),
+         SubjectID = paste0("S", SubjectID),
+         Tumor_content = Tumor_content * 100)
+
+# Get the progression 
+meta_v2_p2 <- readxl::read_excel(file.path(wd$papers, "visit_2_molCanRes_2022/mcr-22-0099_supplementary_tables_1-41_suppst1-41.xlsx"), 
+                               sheet = 1,
+                              skip = 1) %>%
+  rename(SubjectID = dbGAP_ID,
+         Comp_prog = Composite_Progression_3_mo) %>%
+  select(SubjectID, Comp_prog) %>%
+  mutate(Comp_prog = case_when(Comp_prog == "Yes" ~ 1,
+                                Comp_prog == "-Yes" ~ 1,
+                              Comp_prog == "No" ~ 0,
+                              Comp_prog == "N/A" ~ -1,
+                              Comp_prog == "NA" ~ -1),
+         SubjectID = paste0("S", SubjectID))
+
+# # Get the tumor percentage 
+# meta_v2_p3 <- readxl::read_excel(file.path(wd$papers, "visit_2_molCanRes_2022/mcr-22-0099_supplementary_tables_1-41_suppst1-41.xlsx"), 
+#                                sheet = 4,
+#                               skip = 1) %>%
+#   mutate(visit = gsub(".*_", "", RNASeqSample),
+#          visit = gsub("N|T", "", visit)) %>%
+#   filter(visit == "V2") %>%
+#     rename(SubjectID = RNASeqSample,
+#          Tumor_content = PURITY) %>%
+#     select(SubjectID, Tumor_content) %>%
+#     mutate(SubjectID = gsub("_.*", "", SubjectID),
+#            SubjectID = paste0("S", SubjectID),
+#            Tumor_content = as.numeric(Tumor_content),
+#            Tumor_content = Tumor_content* 100)
+
+# Merge metadata for V2
+meta_v2 <- meta_v2_p1 %>% full_join(meta_v2_p2) %>% distinct() %>%
+  select(SubjectID, Comp_prog, Sample_type, Tumor_content) %>%
+  mutate(Sample_type = case_when(Sample_type == "Bone" ~ "Bone",
+                                 TRUE ~ "non-bone"))
+
+```
+
+## Exome CNR resuls
+
+Now read the sample ID from David Nix analysis. 
+
+```{r}
+file_dir <- file.path(wd$data, "from_DavidNix")
+df_link2 <- readxl::read_excel(file.path(file_dir, "sra_metadata_398SampleSets.xlsx"), 
+                               sheet = 3)
+# Select relevant columns
+df_link2_full <- df_link2 %>% select(SampleName, Subject_ID, Run, Analyte_Type, Body_Site) %>% 
+  rename(
+    Exome_ID = Subject_ID,
+    SubjectID = SampleName, 
+    lib_type = Analyte_Type) %>%
+  # Modify the Subject ID to only contain the sample name
+  mutate(visit = gsub(".*DNA_|.*RNA_", "", SubjectID),
+         visit = gsub("N|B|T", "", visit),
+         SubjectID = gsub("_.*", "", SubjectID)
+         )
+
+df_link2 <- df_link2_full %>%
+  # Select only the DNA, not interested in RNA
+  filter(lib_type == "DNA")
+```
+
+Retain to only the samples we have from the paper
+
+```{r}
+tt <- df_link %>%
+  mutate(
+    tmp = case_when(Type == "Promote1" ~ "V1",
+                    Type == "Promote2" ~ "V2"),
+    UniqID = paste(SubjectID, tmp, sep="_")) %>%
+  select(UniqID, PatientID)
+
+df_link2 <- df_link2 %>% 
+  mutate(UniqID = paste(SubjectID, visit, sep="_")) %>%
+  filter(SubjectID %in% df_link$SubjectID) %>%
+  left_join(tt)
+```
+
+## Sample overview
+
+Lets get the number of samples (PatientID from Vist 1 and Visit 2)
+
+
+```{r}
+# Get the number of patient with tumor samples regardless of site
+df_link2 %>% filter(visit == "V1" & !Body_Site == "Blood") %>% pull(PatientID) %>% unique() %>% length()
+df_link2 %>% filter(visit == "V2" & !Body_Site == "Blood") %>% pull(PatientID) %>% unique() %>% length()
+```
+
+### Exome summary 
+
+Summary of available samples 
+
+```{r}
+# Exome data
+# Samples with blood (ie - matching normal)
+d1 <- df_link2 %>% filter(Body_Site == "Blood") %>% select(SubjectID, Exome_ID, Run) %>% 
+  rename(Germline_RunID = Run)
+
+d2 <- df_link2 %>% filter(!Body_Site == "Blood" & visit == "V1") %>% select(SubjectID, visit, Body_Site, Exome_ID, Run) %>%
+  rename(Visit_1 = visit,
+         #Visit_1_ID = PatientID,
+         Visit_1_Site = Body_Site,
+         Visit_1_ExomeID = Exome_ID,
+         Visit_1_RunID = Run)
+d3 <- df_link2 %>% filter(!Body_Site == "Blood" & visit == "V2") %>% select(SubjectID, visit, Body_Site, Exome_ID, Run) %>%
+  rename(Visit_2 = visit,
+         #Visit_2_ID = PatientID,
+         Visit_2_Site = Body_Site,
+         Visit_2_ExomeID = Exome_ID,
+         Visit_2_RunID = Run)
+
+# # Add Site
+# d_tmp <- df_link2 %>% select(SubjectID, Body_Site) %>% filter(!Body_Site == "Blood") %>% distinct()
+# 
+d_all <- d1 %>% left_join(d2) %>% left_join(d3) 
+# 
+
+# Add Unique Patient ID for visit 1 and visit 2
+id_1 <- meta_l %>% filter(Type == "Promote1") %>% select(SubjectID, PatientID) %>%
+  rename(Visit_1_ID = PatientID) %>% distinct()
+id_2 <- meta_l %>% filter(Type == "Promote2") %>% select(SubjectID, PatientID) %>%
+  rename(Visit_2_ID = PatientID) %>% distinct()
+
+d_all <- d_all %>% left_join(id_1) %>% left_join(id_2) 
+
+
+```
+
+### Liquid summary
+
+Add liquid samples to the data frame
+
+```{r}
+dd <- df_link %>%
+  mutate(Type = 
+           case_when(Type == "Promote1" ~ "V1",
+                    Type == "Promote2" ~ "V2"))
+d1 <- dd %>% filter(Type == "V1") %>% select(SubjectID, Type) %>%
+    rename(l_Visit_1 = Type)
+d2 <- dd %>% filter(Type == "V2") %>% select(SubjectID, Type) %>%
+    rename(l_Visit_2 = Type)
+
+dl <- full_join(d1,d2)
+
+d_all <- full_join(d_all, dl)
+```
+
+Mark if the sample is present in the liquid
+
+Save the file
+
+```{r}
+writexl::write_xlsx(d_all, file.path(wd$output, "SampleSummary_2_ori.xlsx"))
+```
+
+
+Add the tumor purity information for visit 1
+
+```{r}
+meta_v1_sub <- meta_v1 %>% select(SubjectID, Tumor_content)
+d_all2 <- d_all %>% left_join(meta_v1_sub)
+
+# For visit 2
+meta_v2_sub <- meta_v2 %>% select(SubjectID, Tumor_content) %>%
+  rename(Tumor_content_v2 = Tumor_content)
+d_all2 <- d_all2 %>% left_join(meta_v2_sub)
+
+
+writexl::write_xlsx(d_all2, file.path(wd$output, "SampleSummary_2_ori.xlsx"))
+```
+
+
+## Sample numbers
+
+We create a Venn diagram to overlap the sample numbers between solid and liquid per-visit. 
+
+```{r}
+# Liquid patient id - same across visit 1 and visit 2
+n_l <- 83
+
+# Visit 1 solid patient that pass QC
+s1 <- 68
+s2 <- 74
+
+# Overlap in each category (we did manually by venny based on supplemental table 2)
+o1 <- 68
+o2 <- 74
+# Specify values to use in venn diagram
+fit_v1 <- euler(c('A' = 83, 'B' = 68, 'A&B' = 68))
+fit_v2 <- euler(c('A' = 83, 'B' = 74, 'A&B' = 74))
+
+plot(fit_v1, fill=c('#A53D3C', '#6F7173')) 
+plot(fit_v2, fill=c('coral2', 'steelblue')) 
+
+
+#create venn diagram with custom colors
+pdf(file.path(wd$output, "Solid_liquid_venn.pdf"), width = 7, height = 4)
+plot(fit_v1, fill=c('#A53D3C', '#6F7173')) 
+plot(fit_v2, fill=c('coral2', 'steelblue')) 
+dev.off()
+```
+
+
+## Exome copy results
+
+Lets read the folder names containing the copy results
+
+```{r}
+file_dir <- file.path(wd$data, "from_DavidNix/CNR_exome_analysis/pass_QC")
+gg <- list.files(file_dir)
+```
+
+Sample name & the RUN ID is sperated by '_' ,so separate the study arms based on the '_' separator. Then extarct the Sample name and Run ID
+
+```{r}
+list_split <- str_split(gg, "_")
+names(list_split) <- gg
+
+# Extract the Sample Name [2], Run ID [3]
+# https://stackoverflow.com/questions/38436872/get-access-to-the-first-row-of-a-list-in-r
+#s_name <- sapply(list_split,'[[',2)
+df_exome_pass <- sapply(list_split,`[`,c(2,3)) %>% t() %>% as.data.frame() %>%
+  # Rename column
+  dplyr::rename(Exome_ID_tmp = V1,
+                Run = V2) %>%
+  mutate(filter = "pass",
+         file_name = gg)
+
+# Retain only the samples in the paper
+df_exome_pass <- df_exome_pass %>% filter(Run %in% df_link2$Run)
+
+length(unique(df_exome_pass$Exome_ID_tmp))
+```
+
+Repeat for the failed
+
+```{r}
+file_dir <- file.path(wd$data, "from_DavidNix/CNR_exome_analysis/fail_QC")
+gg <- list.files(file_dir)
+
+
+list_split <- str_split(gg, "_")
+names(list_split) <- gg
+
+# Extract the Sample Name [2], Run ID [3]
+# https://stackoverflow.com/questions/38436872/get-access-to-the-first-row-of-a-list-in-r
+#s_name <- sapply(list_split,'[[',2)
+df_exome_fail <- sapply(list_split,`[`,c(2,3)) %>% t() %>% as.data.frame() %>%
+  # Rename column
+  dplyr::rename(Exome_ID_tmp = V1,
+                Run = V2)  %>%
+  mutate(filter = "fail",
+         file_name = gg)
+
+# Retain only the samples in the paper
+df_exome_fail <- df_exome_fail %>% filter(Run %in% df_link2$Run)
+
+length(unique(df_exome_fail$Exome_ID_tmp))
+```
+
+
+Merge the two
+
+```{r}
+df_exome <- rbind(df_exome_pass, df_exome_fail) %>%
+  rename(Exome_ID = Exome_ID_tmp)
+rownames(df_exome) <- NULL
+```
+
+
+We know that visit 1 starts with 'Nci' and visit 2 starts with 'Mayo'. 
+
+```{r}
+df_exome <- df_exome %>%
+  mutate(Visit = gsub("Nci_.*", "V1", file_name),
+         Visit = gsub("Mayo_.*", "V2", Visit),
+         UniqID = paste(Exome_ID, Visit, sep="_")) %>%
+  select(-Visit, -Exome_ID, -Run)
+```
+
+
+Join with the master file
+
+```{r}
+df_link2_noBlood <- df_link2 %>% filter(!Body_Site == "Blood") %>%
+    mutate(Exome_ID = as.character(Exome_ID),
+         UniqID = paste(Exome_ID, visit, sep="_"))
+
+df_join <- df_link2_noBlood %>% 
+  left_join(df_exome) 
+```
+
+
+Check sample numbers
+
+```{r}
+# Get the number of patient regardless of site
+df_join %>% filter(visit == "V1") %>% pull(PatientID) %>% unique() %>% length()
+df_join %>% filter(visit == "V2") %>% pull(PatientID) %>% unique() %>% length()
+```
+
+How to deal with samples that failed QC. 
+
+Exclude **samples** from further analysis (ie, only remove the visit that failed)
+
+```{r}
+df_join2 <- df_join %>% filter(!filter == "fail") 
+
+df_join2 %>% filter(visit == "V1") %>% pull(PatientID) %>% unique() %>% length()
+df_join2 %>% filter(visit == "V2") %>% pull(PatientID) %>% unique() %>% length()
+```
+
+Get some summary of the number of patients with measurement at both time-point or just one time point
+
+```{r}
+tt <- table(df_join2$SubjectID, df_join2$visit) 
+
+# Both visit
+sum(rowSums(tt) >= 2)
+# Visit 1
+sum(tt[,1] >=1 )
+# Visit 2
+sum(tt[,2] >=1 )
+```
+
+## Add exome metadata
+
+Add if the exome pass or fail QC
+
+```{r}
+t1 <- df_join %>% filter(visit == "V1") %>% select(SubjectID, filter) %>% distinct() %>%
+  rename(QC_V1 = filter)
+t2 <- df_join %>% filter(visit == "V2") %>% select(SubjectID, filter) %>% distinct() %>%
+  rename(QC_V2 = filter)
+
+d_all2 <- d_all2 %>% left_join(t1) %>% left_join(t2)
+
+writexl::write_xlsx(d_all2, file.path(wd$output, "SampleSummary_2_ori.xlsx"))
+```
+
+Add the ctDNA (liquid) concentration
+
+```{r}
+meta_l_v1 <- meta_l %>% filter(Type == "Promote1") %>%
+  select(SubjectID, ctDNA, PatientID) %>%
+  rename(ctDNA_v1 = ctDNA,
+         Patient_ID_l_v1 = PatientID)
+
+meta_l_v2 <- meta_l %>% filter(Type == "Promote2") %>%
+  select(SubjectID, ctDNA, PatientID) %>%
+  rename(ctDNA_v2 = ctDNA,
+         Patient_ID_l_v2 = PatientID)
+
+d_all3 <- d_all2 %>% left_join(meta_l_v1)
+
+d_all3 <- d_all3 %>% left_join(meta_l_v2)
+
+writexl::write_xlsx(d_all3, file.path(wd$output, "SampleSummary_2_ori.xlsx"))
+```
+
+## Add survial data
+
+Add metadata on survival an OS
+
+```{r}
+file_dir <- file.path(wd$data, "from_papers/cancers_2022_plasma/")
+# Visit 1
+os_v1 <- readxl::read_excel(file.path(file_dir, "Corrected_Table_S3.xlsx"),
+                              sheet = 2) %>%
+  select(PatientID...26:Progression) %>%
+  rename(PatientID = PatientID...26,
+         Death = 'Death (0-no death event)',
+         OS = 'OS (Days)',
+         Res = 'Response at 3-months; 0=no response (corrected)',
+         PFS = 'PFS (Days)',
+         Prog = Progression) %>%
+  # Convert to month 
+  # divide by the average day by month. 
+  mutate(OS = round(OS/30.417, digit=2),
+         PFS = round(PFS/30.417, digit=2))
+
+# Visit 2
+os_v2 <- readxl::read_excel(file.path(file_dir, "Corrected_Table_S3.xlsx"),
+                              sheet = 3) %>%
+  select(PatientID...26:Progression) %>%
+  rename(PatientID = PatientID...26,
+         Death = 'Death (0-no death event)',
+         OS = 'OS (Days)',
+         Res = 'Response at 3-months; 0=no response (corrected)',
+         PFS = 'PFS (Days)',
+         Prog = Progression) %>%
+  # Convert to month 
+  # divide by the average day by month. 
+  mutate(OS = round(OS/30.417, digit=2),
+         PFS = round(PFS/30.417, digit=2))
+```
+
+
+Now lets generate a table of the survival metadata along with ctDNA content, tumor content. 
+
+```{r}
+d_all3_sub <- d_all3 %>% 
+  select(SubjectID, l_Visit_1, l_Visit_2, Visit_1_Site, Visit_2_Site, ctDNA_v1, ctDNA_v2, Tumor_content, Tumor_content_v2,
+         Visit_1_ID, Visit_2_ID, QC_V1, QC_V2
+)
+
+# We want each visit ID in a row
+d1_v1 <- left_join(d_all3_sub, os_v1, by = c("Visit_1_ID" = "PatientID"))
+d1_v2 <- left_join(d_all3_sub, os_v2, by = c("Visit_2_ID" = "PatientID"))
+
+d_v <- rbind(d1_v1, d1_v2)
+
+writexl::write_xlsx(d_v, file.path(wd$output, "SampleSummary_3_ori.xlsx"))
+```
+
+
+## DNA purity by site
+
+Lets look at the DNA purity in all samples, by site. 
+
+```{r}
+# Generate df with the purity
+d1 <- d_v %>% select(Visit_1_ID, Tumor_content, Visit_1_Site) %>% 
+  rename(Site = Visit_1_Site,
+         PatientID = Visit_1_ID) %>% distinct() %>%
+  mutate(Visit = "V1")
+d2 <- d_v %>% select(Visit_2_ID, Tumor_content_v2, Visit_2_Site) %>% 
+  rename(Site = Visit_2_Site,
+         Tumor_content = Tumor_content_v2,
+         PatientID = Visit_2_ID) %>% distinct() %>%
+  mutate(Visit = "V2")
+
+df_tumor_p <- rbind(d1, d2) %>% filter(!is.na(Site)) %>%
+  mutate(Site = case_when(Site == "bone" ~ "Bone",
+                          TRUE ~ "non-bone"),
+         Purity = case_when(Tumor_content <=20 ~ "Low",
+                            Tumor_content >20 ~ "High")) 
+
+# Filter to those that pass exome QC
+# visit 1 that pass QC
+v1_pass <- d_all2 %>% filter(QC_V1 == "pass")
+t1 <- df_tumor_p %>% filter(PatientID %in% v1_pass$Visit_1_ID & Visit == "V1")
+
+# visit 2 that pass QC
+v2_pass <- d_all2 %>% filter(QC_V2 == "pass")
+t2 <- df_tumor_p %>% filter(PatientID %in% v2_pass$Visit_2_ID & Visit == "V2")
+
+df_tumor_p2 <- df_tumor_p %>% filter(PatientID %in% c(t1$PatientID, t2$PatientID))
+
+ggplot(df_tumor_p2, aes(x=Site, y=Tumor_content, fill=Site)) +
+  geom_boxplot(outlier.alpha = 0,  width = 0.1, fatten=3, alpha=0.6,
+               position = position_dodge(width = 0.9)) +
+  geom_quasirandom(dodge.width=0.05, colour="grey30", alpha=0.5) +
+  theme_bw() +
+  theme(legend.position = "none",
+          panel.grid.major = element_line(linetype = "blank"), 
+          panel.grid.minor = element_line(linetype = "blank")) +
+  scale_fill_manual(values=c("#8CD17D", "#FFBE7D")) +
+  geom_signif(
+    comparisons = list(
+      c("Bone", "non-bone")),
+    map_signif_level = FALSE, test = "t.test",
+    y_position=100) +
+  geom_hline(yintercept = 20, linetype="dashed", alpha=0.4) +
+  scale_y_continuous(limits=c(0,110), breaks=c(0,20,40,60,80, 100)) +
+  NULL
+
+ggsave(file=file.path(wd$output, "cDNA_bone_vs_no_all.pdf"), device = "pdf", width = 4, height = 4)
+
+table(df_tumor_p$Site, df_tumor_p$Purity)
+
+```
+For the same samples let get the liquid tumor ctDNA values
+
+```{r}
+# Generate df with the ctDNA
+d1 <- d_v %>% select(Visit_1_ID, ctDNA_v1) %>% 
+  rename(PatientID = Visit_1_ID,
+         ctDNA = ctDNA_v1) %>% distinct()
+
+d2 <- d_v %>% select(Visit_2_ID, ctDNA_v2) %>% 
+  rename(PatientID = Visit_2_ID,
+         ctDNA = ctDNA_v2) %>% distinct()
+
+df_tumor_ctDNA <- rbind(d1, d2) 
+
+# Join with the plot
+df_tumor_p3 <- df_tumor_p2 %>% left_join(df_tumor_ctDNA) 
+
+```
+
+
+Plot as histogram
+
+```{r}
+ct_vals <- summary(df_tumor_p3$ctDNA)
+ct_cutoff <- ct_vals[5] # 3 is the median, 5 is the 3rd quartile
+p_hist <-
+  ggplot(df_tumor_p3, aes(x=ctDNA)) + 
+  geom_histogram(binwidth=0.5, color="black", fill="#A53D3C") +
+    theme_bw() +
+  theme(legend.position = "none",
+          panel.grid.major = element_line(linetype = "blank"), 
+          panel.grid.minor = element_line(linetype = "blank")) +
+  geom_vline(xintercept = ct_cutoff, linetype="dashed", alpha=0.4) +
+  NULL
+
+p_hist
+
+ggsave(p_hist, file=file.path(wd$output, "ctDNA.pdf"), device = "pdf", width = 7, height = 4.5)
+
+# As a box-plot format
+p_box <- 
+  ggplot(df_tumor_p3, aes(x=1, y=ctDNA, fill="x")) +
+  geom_boxplot(outlier.alpha = 0,  width = 0.1, fatten=3, alpha=1,
+               position = position_dodge(width = 0.9)) +
+  geom_quasirandom(dodge.width=1.5, colour="grey30", alpha=0.5) +
+  theme_bw() +
+  theme(legend.position = "none",
+        panel.grid.major = element_line(linetype = "blank"), 
+        panel.grid.minor = element_line(linetype = "blank")) +
+  scale_fill_manual(values=c("#A53D3C")) +
+  geom_hline(yintercept = ct_cutoff, linetype="dashed", alpha=0.4) +
+  #scale_y_continuous(limits=c(0,110), breaks=c(0,20,40,60,80, 100)) +
+  NULL
+p_box
+
+ggsave(p_box, file=file.path(wd$output, "ctDNA_boxPlot.pdf"), device = "pdf", width = 5, height = 4.5)
+
+
+# Just for refernce, plot the V1 and V2 side by side
+p_box2 <- 
+  ggplot(df_tumor_p3, aes(x=1, y=ctDNA, fill=Visit)) +
+  geom_boxplot(outlier.alpha = 0,  width = 0.1, fatten=3, alpha=1,
+               position = position_dodge(width = 0.9)) +
+  geom_quasirandom(dodge.width=0.5, colour="grey30", alpha=0.5) +
+  theme_bw() +
+  theme(legend.position = "none",
+        panel.grid.major = element_line(linetype = "blank"), 
+        panel.grid.minor = element_line(linetype = "blank")) +
+  #scale_fill_manual(values=c("#A53D3C")) +
+  geom_hline(yintercept = ct_cutoff, linetype="dashed", alpha=0.4) +
+  #scale_y_continuous(limits=c(0,110), breaks=c(0,20,40,60,80, 100)) +
+  NULL
+p_box2
+
+# Cut-off ot x
+df_tumor_p3 <- df_tumor_p3 %>% mutate(ct_cut = 
+                                        case_when(ctDNA <=ct_cutoff ~ "Low",
+                                                  ctDNA >ct_cutoff ~ "High")) 
+```
+
+Get number of samples
+
+```{r}
+table(df_tumor_p3$ct_cut)
+```
+
+## Pie chart 
+
+Simple pie chart of the number of samples
+
+```{r}
+dv1 <- df_tumor_p %>% filter(Visit == "V1") %>% group_by(Site) %>% count() %>%
+  ungroup() %>%
+  mutate(Per = round( n/sum(n) * 100) )
+
+ggplot(dv1, aes(x="", y=n, fill=Site)) +
+  geom_bar(stat="identity", width=1) +
+  coord_polar("y", start=0) +
+  theme_void() +
+  scale_fill_manual(values=c("#8CD17D", "#FFBE7D")) +
+  NULL
+
+ggsave(file=file.path(wd$output, "Site_V1_pie.pdf"), device = "pdf", width = 4, height = 4)
+
+dv2 <- df_tumor_p %>% filter(Visit == "V2") %>% group_by(Site) %>% count() %>%
+  ungroup() %>%
+  mutate(Per = round( n/sum(n) * 100) )
+
+ggplot(dv2, aes(x="", y=n, fill=Site)) +
+  geom_bar(stat="identity", width=1) +
+  coord_polar("y", start=0) +
+  theme_void() +
+  scale_fill_manual(values=c("#8CD17D", "#FFBE7D")) +
+  NULL
+
+ggsave(file=file.path(wd$output, "Site_V2_pie.pdf"), device = "pdf", width = 4, height = 4)
+
+```
+# Objective 2
+
+**Read exome data CNA results** 
+
+The results of the CNA is in the file '.called.seg.xls'. Lets find all the results file.
+
+```{r}
+file_dir <- file.path(wd$data, "from_DavidNix/CNR_exome_analysis/pass_QC/")
+ll <- list.files(file_dir, recursive = TRUE, full.names = TRUE)
+# Only find the .xls file
+ll2 <- ll[grep(".xls", ll)]
+```
+
+
+Read an example result
+
+```{r}
+df_eg <- read.delim(ll2[4])
+```
+
+
+The copy number call is in the 'CR.Call' column, while the list of genes in the 'Genes' column. We make it so that one gene have their approriate CR value.
+
+```{r}
+gg <- df_eg$Genes
+gene_list <- str_split(gg, ",")
+names(gene_list) <- paste0("cr_", df_eg$CR.Call)
+
+pass_thresh <- df_eg$Pass.Thresholds
+lg2CNR <-  df_eg$Lg2.Mean.TN.CR.Ratios
+
+# Create data frame
+# --- Genomic positions --- #
+pos_id <- gsub(".*,", "", df_eg$X.Chr.Start.End)
+pos_id <- gsub("\\)", "", pos_id)
+head(pos_id)
+
+chr_id <- gsub(":.*", "", pos_id)
+head(chr_id)
+
+srt_id <- gsub(".*:", "", pos_id)
+srt_id <- as.numeric(gsub("-.*", "", srt_id))
+head(srt_id)
+
+end_id <- gsub(".*:", "", pos_id)
+end_id <- as.numeric(gsub(".*-", "", end_id))
+head(end_id)
+
+size_id <- end_id - srt_id
+
+# --- Make DF --- #
+df <- data.frame(
+  loc = rep(paste0(chr_id, ":", srt_id, "-", end_id),lengths(gene_list)),
+  size = rep(size_id,lengths(gene_list)),
+  All_genes = rep(df_eg$Genes,lengths(gene_list)),
+  cr = rep(names(gene_list), lengths(gene_list)),
+  Genes = unlist(gene_list),
+  pass_thresh = rep(pass_thresh, lengths(gene_list)),
+  lg2CNR = rep(lg2CNR, lengths(gene_list))
+) %>%
+  # remove the "."
+  filter(!Genes == ".")
+```
+
+We can get some summary stats of how many genes are gain or loss. Is there 37,766 genes? Seems a bit odd
+
+```{r}
+table(df$cr)
+```
+
+Now filter the df to the genes of interest
+
+```{r}
+df_sub <- df %>% filter(Genes %in% gene_panel)
+```
+
+Lets repeat for all samples, but we add an identifier for the sample name
+
+```{r}
+# Create an empty list to store the data frames
+df_list <- list()
+
+# First create a list containing all the results
+for (i in seq_along(ll2)) {
+  
+  fileName <- basename(dirname(dirname(dirname(dirname(ll2[i])))))
+  
+  df_eg <- read.delim(ll2[i])
+  
+  gg <- df_eg$Genes
+  gene_list <- str_split(gg, ",")
+  names(gene_list) <- paste0("cr_", df_eg$CR.Call)
+  
+  pass_thresh <- df_eg$Pass.Thresholds
+  lg2CNR <-  df_eg$Lg2.Mean.TN.CR.Ratios
+  
+# Create data frame
+# --- Genomic positions --- #
+pos_id <- gsub(".*,", "", df_eg$X.Chr.Start.End)
+pos_id <- gsub("\\)", "", pos_id)
+head(pos_id)
+
+chr_id <- gsub(":.*", "", pos_id)
+head(chr_id)
+
+srt_id <- gsub(".*:", "", pos_id)
+srt_id <- as.numeric(gsub("-.*", "", srt_id))
+head(srt_id)
+
+end_id <- gsub(".*:", "", pos_id)
+end_id <- as.numeric(gsub(".*-", "", end_id))
+head(end_id)
+
+size_id <- end_id - srt_id
+
+# --- Make DF --- #
+df <- data.frame(
+  file_name = fileName,
+  loc = rep(paste0(chr_id, ":", srt_id, "-", end_id),lengths(gene_list)),
+  size = rep(size_id,lengths(gene_list)),
+  All_genes = rep(df_eg$Genes,lengths(gene_list)),
+  cr = rep(names(gene_list), lengths(gene_list)),
+  Genes = unlist(gene_list),
+  pass_thresh = rep(pass_thresh, lengths(gene_list)),
+  lg2CNR = rep(lg2CNR, lengths(gene_list))
+) %>%
+  # remove the "."
+  filter(!Genes == ".")
+  
+  # Append the data frame to the list
+  df_list <- c(df_list, list(df))
+}
+```
+
+
+Combine the data frames into a single data frame
+
+```{r}
+combined_df <- bind_rows(df_list)
+```
+
+Filter to the genes of interest and make the CV call numeric
+
+```{r}
+conbined_df_sub <- combined_df %>% filter(Genes %in% gene_panel) %>%
+  # Swap CR value to -1, 0, 1
+  mutate(cr = case_when(cr == "cr_0" ~ 0,
+                        cr == "cr_-" ~ -1,
+                        cr == "cr_+" ~ 1
+                        ))
+```
+
+
+Lets add the samples name according to the paper
+
+```{r}
+conbined_df_sub <- left_join(conbined_df_sub, df_join2)  %>%
+  # Remove Exome runs not from paper
+  filter(!is.na(PatientID))
+```
+
+Check samples number
+
+```{r}
+dplyr::filter(conbined_df_sub, visit == "V1") %>% pull(SubjectID) %>% unique() %>% length()
+dplyr::filter(conbined_df_sub, visit == "V2") %>% pull(SubjectID) %>% unique() %>% length()
+```
+
+# Objective 3
+
+**Set trehsold of CNA**
+
+We set the threshold for calling CNA
+
+```{r}
+amp_thresh <- 0.5
+del_thresh <- -0.5
+```
+
+
+Now we have the results of the exome CNR workflow. Lets determine the correlation
+
+To start, we need to simplify the CNR calls. Because in the paper, Manish just classified the genes as either amplified or deleted Ie - a gene never has amplified and deleted, its always amplified or no change and alternatively deleted or no change. So we identify which genes are amplified genes and deleted genes.
+
+
+```{r}
+amp_genes <- df_gene %>% filter(Cat == "amp") %>% pull(Genes)
+del_genes <- df_gene %>% filter(Cat == "del") %>% pull(Genes)
+```
+
+Simplify the call
+
+```{r}
+df_simple <- conbined_df_sub %>% 
+  mutate(cr = case_when(
+    Genes %in% amp_genes & cr == -1 ~ 0,
+    Genes %in% amp_genes & cr == 0 ~ 0,
+    Genes %in% amp_genes & cr == 1 ~ 1,
+    
+    Genes %in% del_genes & cr == -1 ~ -1,
+    Genes %in% del_genes & cr == 0 ~ 0,
+    Genes %in% del_genes & cr == 1 ~ 0,
+  ))
+
+# Sanity check - a gene needs to have either 0 or -1 / 1
+#table(df_simple$Genes, df_simple$cr)
+
+# Save file
+writexl::write_xlsx(df_simple, file.path(wd$output, "RawCNV_calls.xlsx"))
+```
+
+
+Lets convert the results to a gene x sample format. We need to separate visit 1 and visit 2.
+
+```{r}
+df_v1 <- df_simple %>% filter(visit == "V1") %>%
+  select(Genes, PatientID, cr) %>%
+  # Convert to wide format 
+  pivot_wider(names_from = PatientID, values_from = cr)
+```
+
+Here we face a problem. It appears that a gene has muliple copy number call. For example 
+
+```{r}
+#combined_df %>% filter(file_name == "Nci_1622718_SRR4043829_SRR4043919_SRR4043972" & Genes == "AR")
+```
+
+The gene AR is called as amp and deleted This is odd. 
+
+So to overcome this, use an alternate workflow. Lets retain the genes with a "true" value, ie - the gene CV call passed a thresholding filter. Then we identify if based on this criteria, are there still genes with different CV calls.
+
+
+```{r}
+df_simple %>% filter(visit == "V1") %>%
+  filter(pass_thresh == "true") %>%
+  dplyr::group_by(Genes, SubjectID) %>%
+  distinct() %>%
+  dplyr::summarise(n = dplyr::n(), .groups = "drop") %>%
+  dplyr::filter(n > 1L)
+
+```
+
+So it seems gene **TMPRSS2** is called differently. Lets examine a bit more. 
+
+```{r}
+#df_simple %>% filter(SubjectID == "S11" & Genes == "COL22A1" & visit == "V1")
+#combined_df  %>% filter(file_name == "Nci_1622764_SRR4043872_SRR4043934_SRR4043955" & Genes == "TMPRSS2")
+```
+
+Easy solution is to take the max for genes considered amplified. And min for genes considered deleted.
+
+
+```{r}
+df_simple2 <- df_simple %>%
+  group_by(Genes, UniqID) %>%
+  mutate(lg2CNR = case_when(Genes %in% amp_genes ~ max(lg2CNR),
+                            Genes %in% del_genes ~ min(lg2CNR))) %>%
+  distinct()
+```
+
+Apply filter for the cr calls
+
+```{r}
+df_simple2 <- df_simple2 %>%
+   mutate(cr = case_when(
+    Genes %in% amp_genes & lg2CNR >= amp_thresh ~ 1,
+    Genes %in% del_genes & lg2CNR <= del_thresh~ -1,
+    TRUE ~ 0
+  )) %>%
+  select(-pass_thresh) %>% distinct()
+```
+
+
+Lets try again
+
+```{r}
+df_simple2 %>% filter(visit == "V1") %>%
+  #filter(pass_thresh == "true") %>%
+  dplyr::group_by(Genes, SubjectID) %>%
+  distinct() %>%
+  dplyr::summarise(n = dplyr::n(), .groups = "drop") %>%
+  dplyr::filter(n > 1L)
+
+
+#df_simple2 %>% filter(SubjectID == "S15" & Genes == "AR" & visit == "V1")
+```
+
+One thing to check is the sample number. We know V1 visit has 68 samples. 
+
+```{r}
+# Sample number of all files
+kk <- df_simple2 %>% ungroup() %>%
+  filter(visit == "V1") 
+length(unique(kk$PatientID))
+```
+
+Even if a sample has no call made above the filter threshold, we still retain the samples
+
+> Because we add 'distinct' while making df_simple2, this is not needed
+
+```{r,eval=FALSE}
+# The ones that pass the filter
+kk2 <- df_simple2 %>% ungroup() %>%
+  filter(visit == "V1") %>%
+  filter(pass_thresh == "true") %>%
+  dplyr::select(Genes, PatientID, cr) %>%
+  distinct()
+length(unique(kk$PatientID))
+```
+
+We need to make it the same number of samples
+
+```{r,eval=FALSE}
+# Find missing samples
+miss_samp <- kk %>% filter(!PatientID %in% kk2$PatientID) %>% pull(PatientID) %>% unique()
+
+# Missing samples were given 0
+tmp_df <- data.frame(
+  Genes = "AR",
+  PatientID = miss_samp, 
+  cr = 0
+)
+
+kk2 <- rbind(kk2, tmp_df)
+```
+
+Now generate a;  gene x sample matrix. 
+
+```{r}
+df_v1 <- df_simple2 %>%
+  ungroup() %>%
+  filter(visit == "V1") %>%
+  #filter(pass_thresh == "true") %>%
+  dplyr::select(Genes, PatientID, cr) %>%
+  distinct() %>%
+  # Convert to wide format, absent values is given 0
+  pivot_wider(names_from = PatientID, values_from = cr, values_fill = 0)
+```
+
+Repeat for visit 2. Because we adjusted the treshold, we don't get duplication. Otherwise we need to troubleshoot
+
+Example scripts to troubleshoot (NOT run)
+
+```{r,eval=FALSE}
+df_simple2 %>% filter(visit == "V2") %>%
+  filter(pass_thresh == "true") %>%
+  dplyr::group_by(Genes, SubjectID) %>%
+  distinct() %>%
+  dplyr::summarise(n = dplyr::n(), .groups = "drop") %>%
+  dplyr::filter(n > 1L)
+
+df_simple %>% filter(SubjectID == "S74" & Genes == "AR" & visit == "V2")
+
+df_simple %>% filter(Subject_ID == "S74" & Genes == "AR")
+combined_df  %>% filter(file_name == "Mayo_1622777_SRR4043883_SRR21121521_SRR21121598" & Genes == "AR")
+
+df_simple %>% filter(Subject_ID == "S63" & Genes == "NCOR1")
+combined_df  %>% filter(file_name == "Mayo_1622766_SRR4043784_SRR21121542_SRR21121616" & Genes == "NCOR1")
+
+# For now lets change these CN to just 0 because we are not sure
+df_v2 <- 
+df_simple2 %>% ungroup() %>% filter(visit == "V2") %>%
+  filter(pass_thresh == "true") %>%
+  #filter(!Genes == "TMPRSS2") %>%
+  dplyr::select(Genes, PatientID, cr, file_name) %>%
+  distinct() 
+
+# Manually edith AR and NCOR in the respective patient %>%
+df_v2 <- df_v2 %>%
+  # mutate(cr =
+  #          case_when(Genes == "AR" & file_name == "Mayo_1622777_SRR4043883_SRR21121521_SRR21121598" ~ 0,
+  #                    Genes == "NCOR1" & file_name == "Mayo_1622766_SRR4043784_SRR21121542_SRR21121616" ~ 0,
+  #                    TRUE ~ cr)) %>%
+  dplyr::select(Genes, PatientID, cr) %>%
+  distinct() %>%
+  # Convert to wide format, absent values is given 0
+  pivot_wider(names_from = PatientID, values_from = cr, values_fill = 0)
+```
+
+Make a gene x matrix (combine all steps above)
+
+```{r}
+# # Sample number of all files
+# kk <- df_simple2 %>% ungroup() %>%
+#   filter(visit == "V2") 
+# length(unique(kk$PatientID))
+# 
+# # The ones that pass the filter
+# kk2 <- df_simple2 %>% ungroup() %>%
+#   filter(visit == "V2") %>%
+#   filter(pass_thresh == "true") %>%
+#   dplyr::select(Genes, PatientID, cr) %>%
+#   distinct()
+# length(unique(kk2$PatientID))
+# 
+# # Find missing samples
+# miss_samp <- kk %>% filter(!PatientID %in% kk2$PatientID) %>% pull(PatientID) %>% unique()
+# 
+# # Missing samples were given 0
+# tmp_df <- data.frame(
+#   Genes = "AR",
+#   PatientID = miss_samp, 
+#   cr = 0
+# )
+# 
+# kk2 <- rbind(kk2, tmp_df)
+
+df_v2 <- df_simple2 %>%
+  ungroup() %>%
+  filter(visit == "V2") %>%
+  #filter(pass_thresh == "true") %>%
+  dplyr::select(Genes, PatientID, cr) %>%
+  distinct() %>%
+  # Convert to wide format, absent values is given 0
+  # Convert to wide format, absent values is given 0
+  pivot_wider(names_from = PatientID, values_from = cr, values_fill = 0)
+```
+
+# Objective 4
+
+**Comparison to public**
+
+One question we had is how representative the CNR is compared to public data. So we download some data from cBioPortal and have a look at the frequency
+
+We are just interested in Visit 1 for now.
+
+> Current sample number is 68 - correct
+
+```{r}
+# Workflow to play around with threshold 
+
+tresh_cut <- c(0.1,0.2,0.3,0.4,0.5)
+
+list_cut <- list()
+
+for (i in seq_along(tresh_cut)){
+  
+amp_thresh <- tresh_cut[i]
+del_thresh <- amp_thresh * -1
+
+df_simple3 <- df_simple %>%
+  group_by(Genes, UniqID) %>%
+  mutate(lg2CNR = case_when(Genes %in% amp_genes ~ max(lg2CNR),
+                            Genes %in% del_genes ~ min(lg2CNR))) %>%
+  distinct()
+
+
+df_simple3 <- df_simple3 %>%
+  mutate(cr = case_when(
+    Genes %in% amp_genes & lg2CNR >= amp_thresh ~ 1,
+    Genes %in% del_genes & lg2CNR <= del_thresh~ 1,
+    TRUE ~ 0
+  )) %>%
+  select(-pass_thresh) %>% distinct()
+
+# Check if this runs
+df_v1 <- df_simple3 %>%
+  ungroup() %>%
+  filter(visit == "V1") %>%
+  #filter(pass_thresh == "true") %>%
+  dplyr::select(Genes, PatientID, cr) %>%
+  distinct() %>%
+  # Convert to wide format, absent values is given 0
+  pivot_wider(names_from = PatientID, values_from = cr, values_fill = 0)
+
+cc <- rowSums(df_v1[,-1])
+list_cut[[i]] <- cc
+}
+
+```
+
+Compile list
+
+```{r}
+df_comp <- do.call(rbind, list_cut) %>% as.data.frame()
+colnames(df_comp) <- df_v1$Genes
+df_comp$Para <- c(paste0("t_", tresh_cut))
+```
+
+Get frequency in liquid
+
+```{r}
+# Visit 1
+file_dir <- file.path(wd$data, "from_papers/cancers_2022_plasma/")
+pap_v1 <- readxl::read_excel(file.path(file_dir, "Table S3.xlsx"),
+                             sheet = 2)  %>%
+  select(PatientID...1, AR, COL22A1, MYC, NCOR1, NKX3.1, NOTCH1, PIK3CA, PIK3CB, TP53, ZBTB16, TMPRSS2) %>%
+  mutate(across(AR:TMPRSS2, ~ case_when(
+    . == "NC" ~ 0,
+    . == "Amp" ~ 1,
+    . == "Del" ~ -1))) %>% as.data.frame()
+row.names(pap_v1) <- pap_v1$PatientID...1
+pap_v1 <- pap_v1[,-1]
+pap_v1 <- t(pap_v1)
+row.names(pap_v1) <- gsub("NKX3.1", "NKX3-1", row.names(pap_v1))
+
+# Calculate percentage of alteration
+ss <- colnames(df_v1)[-1] # Same sample as in exome
+# Same gene order, so we can simply r bind later
+pap_v1 <- pap_v1[,ss]
+perc_cn <- apply(abs(pap_v1), 1, sum)  %>% as.data.frame() %>% t() %>% as.data.frame()
+perc_cn$Para  <- "liq"
+perc_cn <- perc_cn[,colnames(df_comp)]
+```
+
+Combine all into one for plotting
+
+```{r}
+df_freq <- rbind(df_comp, perc_cn)
+m <- melt(df_freq) %>%
+  mutate(Perc = value / length(ss) * 100,
+         Type = case_when(variable %in% amp_genes ~ "Amp",
+                            variable %in% del_genes ~ "Del"))
+
+m_or <- m %>% filter(Para == "liq") %>% arrange(Type, desc(Perc))
+
+m <- m %>% mutate(variable = factor(variable, levels=m_or$variable))
+
+m1 <- m %>% filter(Type == "Amp")
+p1 <-
+  ggplot(m1, aes(x=Para, y=Perc, fill=Para)) +
+  geom_bar(stat = "identity", position = position_dodge2(preserve = "single")) +
+  facet_grid(~variable) +
+  theme_bw() +
+    theme(legend.position = "bottom",
+          panel.grid.major = element_line(linetype = "blank"), 
+          panel.grid.minor = element_line(linetype = "blank")) +
+  scale_fill_manual(values = c("brown", viridis::cividis(5))) +
+  NULL
+
+m2 <- m %>% filter(Type == "Del")
+p2<-
+  ggplot(m2, aes(x=Para, y=Perc, fill=Para)) +
+  geom_bar(stat = "identity", position = position_dodge2(preserve = "single")) +
+  facet_grid(~variable) +
+  theme_bw() +
+    theme(legend.position = "bottom",
+          panel.grid.major = element_line(linetype = "blank"), 
+          panel.grid.minor = element_line(linetype = "blank")) +
+  scale_fill_manual(values = c("brown", viridis::cividis(5))) +
+  NULL
+
+mm <- p1 / p2 
+
+ggsave(mm, file=file.path(wd$output, "Treshold_range.pdf"), device = "pdf", width = 9, height = 6)
+```
+
+Get some CNA from public database
+
+```{r}
+d1 <- read.delim(file.path(wd$data, "public_data/CNA_Genes_Metastatic_castration-sensitive_prostate_cancer_MSK.txt")) %>%
+  #filter(Gene %in% df_gene$Genes) %>%
+  filter(Gene %in% amp_genes & CNA == "AMP" |
+           Gene %in% del_genes & CNA == "HOMDEL") %>%
+  mutate(Study = "D1")
+
+d2 <- read.delim(file.path(wd$data, "public_data/CNA_Genes_Metastatic_Prostate_Adenocarcinoma_MCTP.txt")) %>%
+  filter(Gene %in% amp_genes & CNA == "AMP" |
+           Gene %in% del_genes & CNA == "HOMDEL") %>%
+  mutate(Study = "D2")
+
+# d3 <- read.delim(file.path(wd$data, "public_data/CNA_Genes_Metastatic_Prostate_Adenocarcinoma_SU2C_PCF_PNAS_2019.txt")) %>%
+#   filter(Gene %in% amp_genes & CNA == "AMP" |
+#            Gene %in% del_genes & CNA == "HOMDEL") %>%
+#   mutate(Study = "D3")
+
+d4 <- read.delim(file.path(wd$data, "public_data/CNA_Genes_The_Metastatic_Prostate_Cancer_Project.txt")) %>%
+  filter(Gene %in% amp_genes & CNA == "AMP" |
+           Gene %in% del_genes & CNA == "HOMDEL") %>%
+  mutate(Study = "D4")
+
+d5.1 <- read.delim(file.path(wd$data, "public_data/CNA_Genes_Metastatic_Prostate_Adenocarcinoma_SU2C_PCF_Cell_2015.txt")) %>%
+  filter(Gene %in% amp_genes & CNA == "AMP" |
+           Gene %in% del_genes & CNA == "HOMDEL") %>%
+  mutate(Study = "D5.all")
+
+# d5.2 <- read.delim(file.path(wd$data, "public_data/CNA_Genes_Metastatic_Prostate_Adenocarcinoma_SU2C_PCF_Cell_2015_preTreatment.txt")) %>%
+#   filter(Gene %in% amp_genes & CNA == "AMP" |
+#            Gene %in% del_genes & CNA == "HOMDEL") %>%
+#   mutate(Study = "D5.pre")
+
+d6 <- read.delim(file.path(wd$data, "public_data/CNA_Genes_Metastatic_Prostate_Adenocarcinoma_SU2C_PCF_PNAS_2019.txt")) %>%
+  filter(Gene %in% amp_genes & CNA == "AMP" |
+           Gene %in% del_genes & CNA == "HOMDEL") %>%
+  mutate(Study = "D6")
+
+```
+
+
+For the SU2C paper, we also wanted to get the frequency of the Naive samples. We do the script once to get the patients id so that we can put into cBioPortal.
+
+```{r}
+# Where we manually select the pre-treatment
+# We extracted the metadata from the supplemntary table of the original publication - https://www.ncbi.nlm.nih.gov/pubmed/31061129
+d6_pub <- read_xlsx(file.path(wd$data, "public_data/pnas.1902651116.sd01_filtered.xlsx")) %>%
+  # Filter to Adrenocarcioma samples and treatment Naive
+  filter(`Pathology Classification` == "Adenocarcinoma" & 
+           `Abiraterone (ABI) and Enzalutamide (ENZA) Exposure Status` == "Naive" &
+           `Taxane exposure status` == "Naïve") 
+
+# All 444 samples from cBioPortal 
+d6_sub <- read_xlsx(file.path(wd$data, "public_data/cBioPortal_prostate/02_prad_su2c_2019_clinical_data.xlsx"))  %>%
+  # Subset
+  filter(`Patient ID` %in% d6_pub$`Subject ID`) %>%
+  filter(`Abiraterone (ABI) and Enzalutamide (ENZA) Exposure Status` == "Naive") %>%
+  # Add column to be used in cBioPortal
+  mutate(Study_Sample_ID = paste(`Study ID`, `Sample ID`, sep= ":"))
+
+writexl::write_xlsx(d6_sub, file.path(wd$output, "PNAS_2019_Naive.xlsx"))
+
+```
+
+Once we get the patient IDs, we then query cBioPortal only for these patients
+
+```{r}
+# d5.1 <- read.delim(file.path(wd$data, "public_data/CNA_Genes_Metastatic_Prostate_Adenocarcinoma_SU2C_PCF_Cell_2015.txt")) %>%
+#   filter(Gene %in% amp_genes & CNA == "AMP" |
+#            Gene %in% del_genes & CNA == "HOMDEL") %>%
+#   mutate(Study = "D5.all")
+
+d6.1 <- read.delim(file.path(wd$data, "public_data/CNA_Genes_Metastatic_Prostate_Adenocarcinoma_SU2C_PCF_PNAS_2019_naive.txt")) %>%
+  filter(Gene %in% amp_genes & CNA == "AMP" |
+           Gene %in% del_genes & CNA == "HOMDEL") %>%
+  mutate(Study = "D6.1")
+
+
+
+d_all <- rbind(d1,d2,d4, d5.1, d6, d6.1) %>%
+  mutate(Perc = gsub("%", "", Freq),
+         Perc = as.numeric(Perc),
+         Type = case_when(CNA == "HOMDEL" ~ "Del",
+                          CNA == "AMP" ~ "Amp")) %>%
+  select(Gene, Type, Perc, Study)
+
+m_pub <- data.frame(
+  Para = d_all$Study,
+  variable = d_all$Gene,
+  Perc = d_all$Perc,
+  Type = d_all$Type
+)
+
+m_tmp <- m %>% select(-value)
+
+m_all <- rbind(m_tmp, m_pub) #%>% filter(!Para == "liq")
+
+# Add seperator
+t_no <- data.frame(
+  Para = c("D7", "m1"),
+  variable = rep(c("MYC", "TP53"),each=2),
+  Perc = 0,
+  Type = rep(c("Amp", "Del"),each=2)
+)
+
+m_all <- rbind(m_all, t_no)
+
+# We are not interested in liquid
+m_all <- m_all %>% filter(!Para == "liq")
+
+# Rearrange the order
+x_or <- c("t_0.1", "t_0.2", "t_0.3", "t_0.4", "t_0.5",
+          #"D7","liq", "m1",
+          "D7", "m1",
+          "D1", "D2", "D4", "D5.all", "D6", "D6.1")
+g_or <- m_all %>% filter(Para == "t_0.5")
+g_or1 <- g_or %>% filter(Type == "Amp") %>% arrange(Perc) %>% pull(variable)
+g_or2 <- g_or %>% filter(Type == "Del") %>% arrange(Perc) %>% pull(variable)
+
+m_all <- m_all %>%
+  mutate(Para = factor(Para, levels=x_or),
+         variable = factor(variable, levels=c(g_or1, g_or2)))
+
+col.bar <- c(#"#05215DFF", "#BFC8D3FF", "#E63833FF", "#5E9546FF", 
+             #"#8A8CA4FF", #"#D3EEF9FF", 
+  paletteer::paletteer_c('viridis::viridis', 5 ),           
+  "white",
+  #"red", 
+  "white",
+  "#5495CFFF", "#F5AF4DFF", "#847CA3FF", "#7C873EFF", "#B8396BFF", "#FFD1D7FF")
+             
+             
+          
+
+m1 <- m_all %>% filter(Type == "Amp") %>% filter(!variable == "TP53") %>%
+  mutate(lab = paste0(round(Perc,0), "%"))
+p1 <-
+  ggplot(m1, aes(x=Para, y=Perc, fill=Para)) +
+  geom_bar(stat = "identity", position = position_dodge2(preserve = "single")) +
+  facet_wrap(~variable, ncol=3) +
+  theme_bw() +
+    theme(legend.position = "none",
+          panel.grid.major = element_line(linetype = "blank"), 
+          panel.grid.minor = element_line(linetype = "blank"),
+          #axis.text.x = element_blank(),
+          ) +
+  geom_text(aes(label=lab, vjust=-.5), size=2.5) +
+  scale_fill_manual(values=col.bar) +
+  NULL
+
+m2 <- m_all %>% filter(Type == "Del") %>% #filter(!variable == "MYC")
+  mutate(lab = paste0(round(Perc,0), "%"))
+p2<-
+  ggplot(m2, aes(x=Para, y=Perc, fill=Para)) +
+  geom_bar(stat = "identity", position = position_dodge2(preserve = "single")) +
+  facet_wrap(~variable, ncol=3) +
+  theme_bw() +
+    theme(legend.position = "bottom",
+          panel.grid.major = element_line(linetype = "blank"), 
+          panel.grid.minor = element_line(linetype = "blank")) +
+  geom_text(aes(label=lab, vjust=-.5), size=2.5) +
+  scale_fill_manual(values=col.bar) +
+  NULL
+
+mm <- p1 / p2 
+
+ggsave(mm, file=file.path(wd$output, "Treshold_public_DB_v2.pdf"), device = "pdf", width = 12, height = 9)
+```
+
+## In treatment naive
+
+We get the percentages of each gene alteration in treatement naive
+
+```{r,eval=FALSE}
+dat_cn <- read.delim(file.path(wd$data, "public_data/cBioPortal_prostate/cna.txt"))
+
+
+d1 <- read.delim(file.path(wd$data, "public_data/cBioPortal_prostate/01_CNA_Genes.txt")) %>%
+  #filter(Gene %in% df_gene$Genes) %>%
+  filter(Gene %in% amp_genes & CNA == "AMP" |
+           Gene %in% del_genes & CNA == "HOMDEL") %>%
+  mutate(Study = "D1")
+
+d2 <- read.delim(file.path(wd$data, "public_data/cBioPortal_prostate/02_CNA_Genes.txt")) %>%
+  #filter(Gene %in% df_gene$Genes) %>%
+  filter(Gene %in% amp_genes & CNA == "AMP" |
+           Gene %in% del_genes & CNA == "HOMDEL") %>%
+  mutate(Study = "D2")
+
+
+d3 <- read.delim(file.path(wd$data, "public_data/cBioPortal_prostate/03_CNA_Genes.txt")) %>%
+  #filter(Gene %in% df_gene$Genes) %>%
+  filter(Gene %in% amp_genes & CNA == "AMP" |
+           Gene %in% del_genes & CNA == "HOMDEL") %>%
+  mutate(Study = "D3")
+
+
+
+
+
+
+d_all <- rbind(d1,d2,d3) %>%
+  mutate(Perc = gsub("%", "", Freq),
+         Perc = as.numeric(Perc),
+         Type = case_when(CNA == "HOMDEL" ~ "Del",
+                          CNA == "AMP" ~ "Amp")) %>%
+  select(Gene, Type, Perc, Study)
+
+m_pub <- data.frame(
+  Para = d_all$Study,
+  variable = d_all$Gene,
+  Perc = d_all$Perc,
+  Type = d_all$Type
+)
+
+
+
+p1 <-
+  ggplot(m_pub, aes(x=Para, y=Perc, fill=Para)) +
+  geom_bar(stat = "identity", position = position_dodge2(preserve = "single")) +
+  facet_wrap(Type~variable, ncol=6) +
+  theme_bw() +
+  theme(legend.position = "none",
+        panel.grid.major = element_line(linetype = "blank"), 
+        panel.grid.minor = element_line(linetype = "blank"),
+        #axis.text.x = element_blank(),
+  ) +
+  geom_text(aes(label=round(Perc,0)), vjust=0) +
+  scale_fill_manual(values=col.bar) +
+  NULL
+p1 
+
+```
+
+
+## Pie chart
+
+For one of the publication generat a pie-chart as well
+
+```{r}
+# Where we manually select the pre-treatment
+# We extracted the metadata from the supplemntary table of the original publication - https://www.ncbi.nlm.nih.gov/pubmed/31061129
+d6_pub <- read_xlsx(file.path(wd$data, "public_data/pnas.1902651116.sd01_filtered.xlsx")) %>% 
+  rename(Sample_ID = 'Sample ID',
+         Sample_type = 'Sample Type')
+
+d6_pub_naive <- d6_pub %>%
+  # Filter to Adrenocarcioma samples and treatment Naive
+  filter(#`Pathology Classification` == "Adenocarcinoma" & 
+           `Abiraterone (ABI) and Enzalutamide (ENZA) Exposure Status` == "Naive" &
+           `Taxane exposure status` == "Naïve") 
+
+
+d6_pub_not_naive <- d6_pub %>%
+  filter(!Sample_ID %in% d6_pub_naive$Sample_ID)
+
+```
+
+Simple pie chart of the number of samples
+
+```{r}
+dv1 <- d6_pub_naive %>% 
+  mutate(Site = case_when(!Sample_type == "Bone" ~ "non_bone",
+                          TRUE ~ Sample_type)) %>% 
+  group_by(Site) %>% count() %>%
+  ungroup() %>%
+  mutate(Per = round( n/sum(n) * 100) )
+
+ggplot(dv1, aes(x="", y=n, fill=Site)) +
+  geom_bar(stat="identity", width=1) +
+  coord_polar("y", start=0) +
+  theme_void() +
+  scale_fill_manual(values=c("#8CD17D", "#FFBE7D")) +
+  NULL
+
+ggsave(file=file.path(wd$output, "CBio_Site_pre_pie.pdf"), device = "pdf", width = 4, height = 4)
+
+dv2 <- d6_pub_not_naive %>% 
+    mutate(Site = case_when(!Sample_type == "Bone" ~ "non_bone",
+                          TRUE ~ Sample_type)) %>% 
+  group_by(Site) %>% count() %>%
+  ungroup() %>%
+  mutate(Per = round( n/sum(n) * 100) )
+
+ggplot(dv2, aes(x="", y=n, fill=Site)) +
+  geom_bar(stat="identity", width=1) +
+  coord_polar("y", start=0) +
+  theme_void() +
+  scale_fill_manual(values=c("#8CD17D", "#FFBE7D")) +
+  NULL
+
+ggsave(file=file.path(wd$output, "CBio_Site_post_pie.pdf"), device = "pdf", width = 4, height = 4)
+
+```
+
+
+# Objective 5
+
+Generate correlation between the number of genes called gain or loss with DNA purity and ctDNA content. 
+
+Modified to include all samples
+
+```{r}
+# Get call
+df_simple2 <- df_simple %>%
+  group_by(Genes, UniqID) %>%
+  mutate(lg2CNR = case_when(Genes %in% amp_genes ~ max(lg2CNR),
+                            Genes %in% del_genes ~ min(lg2CNR))) %>%
+  distinct()
+
+
+df_simple2 <- df_simple2 %>%
+  mutate(cr = case_when(
+    Genes %in% amp_genes & lg2CNR >= amp_thresh ~ 1,
+    Genes %in% del_genes & lg2CNR <= del_thresh ~ 1,
+    TRUE ~ 0
+  )) %>%
+  select(-pass_thresh) %>% distinct()
+
+# Check if this runs
+df_v1 <- df_simple2 %>%
+  ungroup() %>%
+  filter(visit == "V1") %>%
+  #filter(pass_thresh == "true") %>%
+  dplyr::select(Genes, PatientID, cr) %>%
+  distinct() %>%
+  # Convert to wide format, absent values is given 0
+  pivot_wider(names_from = PatientID, values_from = cr, values_fill = 0)
+
+# Running on all samples
+df_v1 <- df_simple2 %>%
+  ungroup() %>%
+  #filter(visit == "V1") %>%
+  #filter(pass_thresh == "true") %>%
+  dplyr::select(Genes, PatientID, cr) %>%
+  distinct() %>%
+  # Convert to wide format, absent values is given 0
+  pivot_wider(names_from = PatientID, values_from = cr, values_fill = 0)
+
+
+sum_solid <- as.data.frame(colSums(df_v1[,-1]))
+colnames(sum_solid) <- "NumGene"
+sum_solid$PatientID <- rownames(sum_solid)
+```
+
+Combine with meta data of tumor purity. 
+
+```{r}
+df_p <- df_tumor_p2 %>% 
+  left_join(sum_solid) %>%
+  #left_join(sum_solid_amp) %>%
+  #left_join(sum_solid_del) %>%
+  mutate(Tumor_cut = case_when(Tumor_content <=10 ~ "low",
+                               TRUE ~ "high"))
+
+ggplot(df_p, aes(x=Tumor_content, y=NumGene)) +
+  geom_point() +
+  stat_cor(method = "pearson")
+
+
+
+sp1.1 <- 
+  df_p %>% filter(Site == "Bone") %>%
+  ggscatter(x = "Tumor_content", y = "NumGene",
+   add = "reg.line",  # Add regressin line
+   #facet.by = "Body_Site",
+   #color = "Tumor_cut",
+   add.params = list(color = "#8CD17D", fill = "lightgray"), # Customize reg. line
+   conf.int = TRUE # Add confidence interval
+   )  +
+  geom_vline(xintercept = 20, linetype="dashed") +
+  scale_x_continuous(limits=c(0,100), breaks=c(0,20,40,60,80, 100)) +
+  scale_y_continuous(limits=c(0,9), breaks=c(0,2,4,6,8)) +
+  stat_cor(method = "pearson") +
+  ggtitle("Correlation in Solid, bone")
+
+
+sp1.2 <- 
+  df_p %>% filter(Site == "non-bone") %>%
+  ggscatter(x = "Tumor_content", y = "NumGene",
+   add = "reg.line",  # Add regressin line
+   #facet.by = "Body_Site",
+   #color = "Tumor_cut",
+   add.params = list(color = "#FFBE7D", fill = "lightgray"), # Customize reg. line
+   conf.int = TRUE # Add confidence interval
+   )  +
+  geom_vline(xintercept = 20, linetype="dashed") +
+  scale_x_continuous(limits=c(0,100), breaks=c(0,20,40,60,80, 100)) +
+  scale_y_continuous(limits=c(0,9), breaks=c(0,2,4,6,8)) +
+  stat_cor(method = "pearson") +
+  ggtitle("Correlation in Solid, non-bone")
+
+
+```
+
+
+Combine with meta data of ct DNA fraction.
+
+```{r,eval=FALSE}
+# Visit 1
+file_dir <- file.path(wd$data, "from_papers/cancers_2022_plasma/")
+pap_v1 <- readxl::read_excel(file.path(file_dir, "Table S3.xlsx"),
+                             sheet = 2)  %>%
+  select(PatientID...1, AR, COL22A1, MYC, NCOR1, NKX3.1, NOTCH1, PIK3CA, PIK3CB, TP53, ZBTB16, TMPRSS2) %>%
+  mutate(across(AR:TMPRSS2, ~ case_when(
+    . == "NC" ~ 0,
+    . == "Amp" ~ 1,
+    . == "Del" ~ 1))) %>% as.data.frame()
+row.names(pap_v1) <- pap_v1$PatientID...1
+pap_v1 <- pap_v1[,-1]
+pap_v1 <- t(pap_v1)
+row.names(pap_v1) <- gsub("NKX3.1", "NKX3-1", row.names(pap_v1))
+
+sum_liquid <- as.data.frame(colSums(pap_v1))
+colnames(sum_liquid) <- "NumGene"
+sum_liquid$PatientID <- rownames(sum_liquid)
+
+# Visit 2
+file_dir <- file.path(wd$data, "from_papers/cancers_2022_plasma/")
+pap_v1 <- readxl::read_excel(file.path(file_dir, "Table S3.xlsx"),
+                             sheet = 3)  %>%
+  select(PatientID...1, AR, COL22A1, MYC, NCOR1, NKX3.1, NOTCH1, PIK3CA, PIK3CB, TP53, ZBTB16, TMPRSS2) %>%
+  mutate(across(AR:TMPRSS2, ~ case_when(
+    . == "NC" ~ 0,
+    . == "Amp" ~ 1,
+    . == "Del" ~ 1))) %>% as.data.frame()
+row.names(pap_v1) <- pap_v1$PatientID...1
+pap_v1 <- pap_v1[,-1]
+pap_v1 <- t(pap_v1)
+row.names(pap_v1) <- gsub("NKX3.1", "NKX3-1", row.names(pap_v1))
+
+sum_liquid_v2 <- as.data.frame(colSums(pap_v1))
+colnames(sum_liquid_v2) <- "NumGene"
+sum_liquid_v2$PatientID <- rownames(sum_liquid_v2)
+
+# Combine
+sum_liquid_all <- rbind(sum_liquid, sum_liquid_v2)
+
+
+df_l <- df_tumor_p3 %>% left_join(sum_liquid_all)
+
+sp2 <- ggscatter(df_l, x = "ctDNA", y = "NumGene",
+   add = "reg.line",  # Add regressin line
+   add.params = list(color = "#A53D3C", fill = "lightgray"), # Customize reg. line
+   conf.int = TRUE # Add confidence interval
+   )  +
+  geom_vline(xintercept = ct_cutoff, linetype="dashed") +
+  stat_cor(method = "pearson") +
+  #facet_wrap(~Visit, ncol=1) +
+  ggtitle("Correlation in liquid")
+
+ggsave(sp2, file=file.path(wd$output, "Correlation_with_ctDNA.pdf"), device = "pdf", width = 7, height = 2.5)
+```
+
+Save the plots
+
+```{r}
+pp <- sp1.1 / sp1.2 
+
+ggsave(pp, file=file.path(wd$output, "Correlation_with_DNA_3.pdf"), device = "pdf", width = 8, height = 4.5)
+```
+
+# Save output
+
+Save the copy number raw values, and simplified calls. 
+
+First get how the genes are ordered, from most frequent to least frequent
+
+```{r}
+# Workflow to play around with threshold 
+amp_thresh <- 0.5
+del_thresh <- -0.5
+
+df_simple2 <- df_simple %>%
+  group_by(Genes, UniqID) %>%
+  mutate(lg2CNR = case_when(Genes %in% amp_genes ~ max(lg2CNR),
+                            Genes %in% del_genes ~ min(lg2CNR))) %>%
+  distinct()
+
+
+df_simple2 <- df_simple2 %>%
+  mutate(cr = case_when(
+    Genes %in% amp_genes & lg2CNR >= amp_thresh ~ 1,
+    Genes %in% del_genes & lg2CNR <= del_thresh~ -1,
+    TRUE ~ 0
+  )) %>%
+  select(-pass_thresh) %>% distinct()
+
+# Check if this runs
+df_v1 <- df_simple2 %>%
+  ungroup() %>%
+  filter(visit == "V1") %>%
+  #filter(pass_thresh == "true") %>%
+  dplyr::select(Genes, PatientID, cr) %>%
+  distinct() %>%
+  # Convert to wide format, absent values is given 0
+  pivot_wider(names_from = PatientID, values_from = cr, values_fill = 0)
+
+mat_v1 <- df_v1 %>% as.data.frame()
+row.names(mat_v1) <- df_v1$Genes
+mat_v1 <- mat_v1[,-1] %>% as.matrix()
+
+#Heatmap(mat_v1)
+
+gene_or <- sort(apply(mat_v1, 1, sum)) %>% names() %>% rev()
+```
+
+Now lets save the output 
+
+```{r}
+df_simple2 <- df_simple %>%
+  group_by(Genes, UniqID) %>%
+  mutate(lg2CNR = case_when(Genes %in% amp_genes ~ max(lg2CNR),
+                            Genes %in% del_genes ~ min(lg2CNR))) %>%
+  distinct()
+
+
+# --- Save the raw CNV value
+df_simple_raw <- df_simple2 %>%
+  select(-pass_thresh) %>% distinct() %>%
+  ungroup() %>%
+  filter(visit == "V1") %>%
+  dplyr::select(Genes, PatientID, lg2CNR) %>%
+  distinct() %>%
+  # Convert to wide format, absent values is given 0
+  pivot_wider(names_from = PatientID, values_from = lg2CNR) %>%
+  mutate(Genes = factor(Genes, levels=gene_or)) %>%
+  arrange(Genes)
+
+write.csv(df_simple_raw, file.path(wd$output, "CNR_visit_1_raw.csv"))
+
+df_simple_raw <- df_simple2 %>%
+  select(-pass_thresh) %>% distinct() %>%
+  ungroup() %>%
+  filter(visit == "V2") %>%
+  dplyr::select(Genes, PatientID, lg2CNR) %>%
+  distinct() %>%
+  # Convert to wide format, absent values is given 0
+  pivot_wider(names_from = PatientID, values_from = lg2CNR) %>%
+  mutate(Genes = factor(Genes, levels=gene_or)) %>%
+  arrange(Genes)
+
+write.csv(df_simple_raw, file.path(wd$output, "CNR_visit_2_raw.csv"))
+
+
+# ---- Save the binary CN value
+
+df_simple2 <- df_simple2 %>%
+  mutate(cr = case_when(
+    Genes %in% amp_genes & lg2CNR >= amp_thresh ~ 1,
+    Genes %in% del_genes & lg2CNR <= del_thresh~ -1,
+    TRUE ~ 0
+  )) %>%
+  select(-pass_thresh) %>% distinct()
+
+# Check if this runs
+df_simple_bin <- df_simple2 %>%
+  ungroup() %>%
+  filter(visit == "V1") %>%
+  #filter(pass_thresh == "true") %>%
+  dplyr::select(Genes, PatientID, cr) %>%
+  distinct() %>%
+  # Convert to wide format, absent values is given 0
+  pivot_wider(names_from = PatientID, values_from = cr, values_fill = 0) %>%
+  mutate(Genes = factor(Genes, levels=gene_or)) %>%
+  arrange(Genes)
+
+write.csv(df_simple_bin, file.path(wd$output, "CNR_visit_1_bin.csv"))
+
+
+df_simple_bin <- df_simple2 %>%
+  ungroup() %>%
+  filter(visit == "V2") %>%
+  #filter(pass_thresh == "true") %>%
+  dplyr::select(Genes, PatientID, cr) %>%
+  distinct() %>%
+  # Convert to wide format, absent values is given 0
+  pivot_wider(names_from = PatientID, values_from = cr, values_fill = 0) %>%
+  mutate(Genes = factor(Genes, levels=gene_or)) %>%
+  arrange(Genes)
+
+write.csv(df_simple_bin, file.path(wd$output, "CNR_visit_2_bin.csv"))
+
+```
+
+
+
+
+
+## Save objects 
+
+Save objects for future analysis
+
+```{r}
+#save.image(file.path(wd$outputData, "Section_01.Rdata"))
+
+save(df_simple, wd, df_link2, df_tumor_p3, meta_l, gene_or,
+     file = file.path(wd$outputData, "Section_01.RData"))
+```
+
+
+# Session Info
+
+```{r}
+sessionInfo()
+```
+
