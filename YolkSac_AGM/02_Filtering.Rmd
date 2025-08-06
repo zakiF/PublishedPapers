@@ -1,0 +1,2597 @@
+# Creating object
+
+
+## Objective
+
+Create a single cell / Seurat object for analysis
+
+## Conclusion
+
+
+
+
+## Set-up
+
+Load required library
+
+```{r, warning=FALSE, message=FALSE}
+library(scater)
+library(DropletUtils)
+library(Seurat)
+library(patchwork)
+library(ggplot2)
+library(dplyr)
+library(reshape2)
+library(ggbeeswarm)
+library(gghighlight)
+library(Matrix)
+library(paletteer)
+#library(schex)
+```
+
+Specify the work space
+
+```{r}
+workDir <- getwd()
+workDir <- gsub("/scripts", "", workDir)
+dataDir <- file.path(workDir, "data")
+outDir <- file.path(workDir, "output")
+
+# out data
+outData_dir <- file.path(outDir, "out_data")
+
+outDir_cur <- file.path(outDir, "Chapter_02_Filtering")
+dir.create(outDir_cur)
+set.seed(100)
+
+source(file.path(workDir, "functions.R"))
+```
+
+Load list of CC genes
+
+```{r}
+s.genes <- cc.genes.updated.2019$s.genes
+g2m.genes <- cc.genes.updated.2019$g2m.genes
+```
+
+
+
+## In-house Nova
+
+Create sc object (NovaSeq)
+
+Generate the single cell object
+
+```{r}
+nova.sce <- DropletUtils::read10xCounts(file.path(dataDir, "pheonix/NovaSeq/filtered"))
+se <- nova.sce
+```
+
+
+To annotate the genes further, we import the GTF file
+
+```{r}
+simple_gtf <- read.delim(file.path(outDir, "out_data/simple_gtf.txt"))
+
+# Combine GTF with sc object
+simple_gtf_sub <- simple_gtf %>%
+  dplyr::select(gene_id, gene_type, seqnames)
+rD <- rowData(se) %>%
+  as.data.frame() %>%
+  dplyr::left_join(simple_gtf_sub, by = c("ID" = "gene_id"))
+```
+
+
+Add cell metaData
+
+```{r}
+mData_full <- read.csv(file.path(outDir, "Chapter_01_Preprocessing/NovaSeq_full.csv"))
+mData <- read.csv(file.path(outDir, "Chapter_01_Preprocessing/NovaSeq_selected.csv")) %>%
+  dplyr::select(-X, -V1)
+
+# Combine with cell annotation
+cD <- colData(se) %>%
+  as.data.frame() %>%
+  left_join(mData, by = c("Barcode" = "CellID")) %>%
+  dplyr::select(-Sample)
+```
+
+
+There will be some NA generated. These are from cells that we have excluded in our analysis, but we quantified them anyway
+
+```{r}
+nacells <- cD[is.na(cD$condition), ] %>%
+  pull(Barcode)
+
+mData_full_sub <- mData_full %>%
+  filter(CellID %in% nacells)
+table(mData_full_sub$condition)
+```
+
+Add new colData and rowData to se object
+
+```{r}
+colData(se) <- DataFrame(cD)
+rowData(se) <- DataFrame(rD)
+```
+
+Remove the un-interested population
+
+```{r}
+se <- se[,!is.na(se$condition)]
+```
+
+Convert the population (condition) as factors
+
+```{r}
+se$condition <- factor(se$condition, levels=nova_popFac)
+```
+
+
+> After doing the analysis, we noted that FACS-ENDO sorted from double reporter was not included as a factor level As such this population was labelled NA. So we will exclude this
+
+We save the final number of cells in the main manuscript
+
+```{r}
+se_nova_save <- se[,!is.na(se$condition)]
+# Extract the cell metadata
+cD_nova_save <- cD %>% filter(Barcode %in% se_nova_save$Barcode)
+write.csv(cD_nova_save, file.path(outDir_cur, "Nova_all_sequenced_cells_manuscript.csv"))
+```
+
+
+
+
+### Filtering low-quality cells
+
+Our first aim is to remove low-quality cells. For all of the run, we apply a threshold to filter the cells. We will use the follwoing 
+
+* Number of genes detected
+* Percentage of Mitochondira reads
+* Percentage of Hemoglobin (Hbb) genes
+
+
+
+Find the QC of specific genes
+
+```{r}
+# Specific the location
+MT_gene <- rD$seqnames == "chrM"
+Hbbs <- rD[grepl("Hb[a-b]", rD$Symbol),] %>% pull(Symbol)
+Hbbs <- c(Hbbs, "Gypa")
+#Hbbs <- c("Hba-x", "Hbb-bh1", "Hbb-y", "Hba-a1")
+
+# Get the Ens ID
+Hb_ens <- rD %>%
+  dplyr::filter(Symbol %in% Hbbs)
+Hbb_gene <- rowData(se)$ID %in% Hb_ens$ID
+```
+
+We examine the distibution of the data in all the run
+
+```{r}
+df_cData <- 
+  perCellQCMetrics(se,
+                   subsets=list(Mito=MT_gene,
+                                Hbb=Hbb_gene)) %>%
+  cbind(as.data.frame(colData(se))) %>%
+  as.data.frame() %>%
+  dplyr::mutate(Cell = colnames(se))
+
+df_cData_nova <- df_cData
+
+# To plot select a subset of columns
+df_cData_sub <- as.data.frame(df_cData) %>%
+  #tibble::rownames_to_column(var = "Cell") %>%
+  dplyr::select(Barcode, sum, detected, subsets_Mito_percent, subsets_Hbb_percent, condition)
+
+
+
+m <- melt(df_cData_sub)
+```
+
+Lets see how many cells were sequenced, excluding the technical replicates. To identify tech replicate we create a unique ID based on the plate layout. We also create an ID for how it was sequenced. Note that GL69 had 4 instance of sequencing done (due to sample mix-up and errors);
+
+1) /mnt/gpfs2/facilities/sequencers/seq.08/201002_A01065_0017_BHT2VKDRXX/Unaligned_GL69 (Cells 1 - 767)
+2) /mnt/gpfs2/facilities/sequencers/seq.08/201023_A01065_0020_AHTJWMDRXX/Unaligned_GL69 (Cells 769 - 1091)
+3) /mnt/gpfs2/facilities/sequencers/seq.08/201216_A01065_0028_AHWMLMDRXX/Unaligned_GL69 (Cells 1092 - 1475)
+4) /mnt/gpfs2/facilities/sequencers/seq.08/210505_A01065_0052_AHY72HDRXX/Unaligned_GL69 (Cells 1476 - 1858)
+
+
+```{r}
+# GL69 sequenced cells
+df_seq <- df_cData_nova %>%
+  #dplyr::filter(!condition %in% c("AGM_E10.5_Endo","AGM_E10.5_HE_Runx1", "AGM_E10.5_HE_Gfi1", "AGM_E10.5_ACE_pos")) %>% # If we want to just look at YS
+  # Column to Identify tech rep
+  dplyr::mutate(
+    # Create the Uniq ID
+    Plate_Well = paste(SC_project, SC_plate, FACS_well, sep="_"))
+
+# Identify tech Reqp
+df_com_twice <- as_tibble(df_seq) %>%
+  dplyr::count(Plate_Well) %>% dplyr::filter(n > 1)
+
+df_seq_noTechRep <- df_seq %>%
+  arrange(desc(detected)) %>%
+  distinct(Plate_Well,.keep_all = TRUE)
+
+write.csv(table(df_seq_noTechRep$condition), file.path(outDir_cur, "NovaSeq_numCells_seq_noTechRep.csv"))
+
+```
+
+
+
+Plot the distribution 
+
+```{r}
+ggplot(m, aes(x=condition, y=value, colour=condition)) +
+  geom_boxplot(aes(),fill=NA) +
+  geom_quasirandom(dodge.width=0.75) +
+  theme_bw()  +
+  facet_wrap(~variable, scales = "free_y") +
+  theme(axis.text.x = element_text(angle = 45)) +
+  NULL
+```
+
+Lets apply a cut-off
+
+```{r}
+df_cData_fil <- df_cData_sub %>%
+  dplyr::filter(
+    detected > 2000,
+    subsets_Mito_percent < 15,
+    subsets_Hbb_percent < 10)
+```
+
+
+
+#### Final count of cells
+
+```{r}
+# Number of cells sequenced (exclude the NA population, which is the ENDO double (Endo cells from Gfi1 and Runx1 reporter) )
+count_1 <- df_cData_sub %>% filter(!is.na(condition))
+print(nrow(count_1))
+
+# Cells filtered and pass trehsold
+count_2 <- df_cData_fil %>% filter(!is.na(condition))
+print(nrow(count_2))
+```
+
+
+
+Subset the sc object
+
+```{r}
+se <- se[,se$Barcode %in% df_cData_fil$Barcode]
+```
+
+Save the nova seq data
+
+```{r}
+saveRDS(se, file.path(outData_dir, "Se_Nova_allGenes_ENSID.RDS"))
+```
+
+
+
+### Filtering lowly-expressed genes
+
+> To do, there is no filtering of lowly-expresed genes in Seurat?
+
+### Convert to gene symbol 
+
+To enable a user-friendly analysis, it is convenient to exchange the ENSEMBL IDs with the name of the genes. 
+
+For duplicated gene names, we merge them with the ENSEMBL IDs to avoid confusion.
+
+
+```{r}
+new.row.names <- uniquifyFeatureNames(
+    rowData(se)$ID,
+    rowData(se)$Symbol
+)
+
+rownames(se) <- new.row.names
+head(rownames(se), 5)
+
+se_nova <- se
+```
+
+
+### Quick seurat
+
+```{r}
+colnames(se) <- se$Barcode
+seu <- 
+  Seurat::CreateSeuratObject(counts = assay(se, "counts"), 
+                     project = "NovaSeq", 
+                     meta.data = as.data.frame(colData(se)),
+                     min.cells = 3, min.features = 200)
+# Colour scheme
+#pal.pop2_sub <- df_pal_pop2 %>%
+#  dplyr::filter(Population %in% se2$condition) %>% pull(Col)
+
+
+seuset <- NormalizeData(
+  object = seu, 
+  normalization.method = "LogNormalize", 
+  scale.factor = 10000
+)
+# Feature selections
+seuset <- 
+  FindVariableFeatures(object = seuset, selection.method = "vst", nfeatures = 2500)
+# Scaling the data
+all.genes <- rownames(x = seuset)
+seuset <- ScaleData(object = seuset, features = all.genes)
+seuset <- CellCycleScoring(seuset, s.features = s.genes, g2m.features = g2m.genes, set.ident = FALSE)
+
+# These are now standard steps in the Seurat workflow for visualization and clustering
+seuset <- RunPCA(seuset, verbose = FALSE)
+ElbowPlot(object = seuset, ndims = 30)
+seuset <- RunUMAP(seuset, dims = 1:30, verbose = FALSE)
+
+seuset <- FindNeighbors(seuset, dims = 1:30, verbose = FALSE)
+seuset <- FindClusters(seuset, verbose = FALSE)
+
+seuset_nova <- seuset
+```
+
+#### UMAP visualisation
+
+Extract the UMAP dimension
+
+```{r}
+umap.df <- as.data.frame(Embeddings(object = seuset, reduction = "umap")) %>%
+  tibble::rownames_to_column(var="Cell") %>%
+  cbind(seuset[[]]) 
+
+
+# Subset based on sorted population
+p1 <- 
+  ggplot(umap.df, aes(x=UMAP_1, y=UMAP_2, colour=condition)) +
+  geom_point() +
+  gghighlight(use_direct_label = FALSE) +
+  theme(legend.position = "right") +
+  facet_wrap(~condition) +
+  theme_bw() +
+  #scale_colour_manual(values=pal.pop2_sub) + 
+  labs(title="Highlighting the FACS clusters in combined data")
+
+png(file.path(outDir_cur, "Nova_UMAP.png"), width=1200, height=900)
+p1
+dev.off()
+```
+
+
+## In-house Next
+
+Generate the single cell object
+
+```{r}
+next.sce <- DropletUtils::read10xCounts(file.path(dataDir, "pheonix/NextSeq/filtered"))
+se <- next.sce
+```
+
+
+To annotate the genes further, we import the GTF file
+
+```{r}
+# Combine GTF with sc object
+simple_gtf_sub <- simple_gtf %>%
+  select(gene_id, gene_type, seqnames)
+rD <- rowData(se) %>%
+  as.data.frame() %>%
+  left_join(simple_gtf_sub, by = c("ID" = "gene_id"))
+```
+
+
+Add cell metaData
+
+```{r}
+mData_full <- read.csv(file.path(outDir, "Chapter_01_Preprocessing/NextSeq_full.csv"))
+mData <- read.csv(file.path(outDir, "Chapter_01_Preprocessing/NextSeq_selected.csv")) %>%
+  dplyr::select(-X)
+
+# Combine with cell annotation
+cD <- colData(se) %>%
+  as.data.frame() %>%
+  left_join(mData, by = c("Barcode" = "CellID")) %>%
+  dplyr::select(-Sample)
+```
+
+
+There will be some NA generated. These are from cells that we have excluded in our analysis, but we quantified them anyway
+
+```{r}
+nacells <- cD[is.na(cD$condition), ] %>%
+  pull(Barcode)
+
+mData_full_sub <- mData_full %>%
+  filter(CellID %in% nacells)
+table(mData_full_sub$condition)
+```
+
+Add new colData and rowData to se object
+
+```{r}
+colData(se) <- DataFrame(cD)
+rowData(se) <- DataFrame(rD)
+```
+
+Remove the un-interested population
+
+```{r}
+se <- se[,!is.na(se$condition)]
+```
+
+
+Convert the population (condition) as factors
+
+```{r}
+se$condition <- factor(se$condition, levels=next_popFac)
+```
+
+> Also remove the Gfi1/1b YS double KO
+
+We save the final number of cells in the main manuscript
+
+```{r}
+se_next_save <- se[,!se$condition == "YS_E9.5_HE_Gfi1s_KO" ]
+# Extract the cell metadata
+cD_next_save <- cD %>% filter(Barcode %in% se_next_save$Barcode)
+write.csv(cD_next_save, file.path(outDir_cur, "Next_all_sequenced_cells_manuscript.csv"))
+```
+
+### Filtering low-quality cells
+
+Our first aim is to remove low-quality cells. For all of the run, we apply a threshold to filter the cells. We will use the follwoing 
+
+* Number of genes detected
+* Percentage of Mitochondira reads
+* Percentage of Hemoglobin (Hbb) genes
+
+
+Find the QC of specific genes
+
+```{r}
+# Specific the location
+MT_gene <- rD$seqnames == "chrM"
+Hbbs <- rD[grepl("Hb[a-b]", rD$Symbol),] %>% pull(Symbol)
+Hbbs <- c(Hbbs, "Gypa")
+#Hbbs <- c("Hba-x", "Hbb-bh1", "Hbb-y", "Hba-a1")
+
+# Get the Ens ID
+Hb_ens <- rD %>%
+  dplyr::filter(Symbol %in% Hbbs)
+Hbb_gene <- rowData(se)$ID %in% Hb_ens$ID
+```
+
+We examine the distibution of the data in all the run
+
+```{r}
+df_cData <- 
+  perCellQCMetrics(se,
+                   subsets=list(Mito=MT_gene,
+                                Hbb=Hbb_gene)) %>%
+  cbind(as.data.frame(colData(se))) %>%
+  as.data.frame() %>%
+  dplyr::mutate(Cell = colnames(se))
+
+
+# To plot select a subset of columns
+df_cData_sub <- as.data.frame(df_cData) %>%
+  #tibble::rownames_to_column(var = "Cell") %>%
+  dplyr::select(Barcode, sum, detected, subsets_Mito_percent, subsets_Hbb_percent, condition)
+
+m <- melt(df_cData_sub)
+```
+Plot the distribution 
+
+```{r}
+ggplot(m, aes(x=condition, y=value, colour=condition)) +
+  geom_boxplot(aes(),fill=NA) +
+  geom_quasirandom(dodge.width=0.75) +
+  theme_bw()  +
+  facet_wrap(~variable, scales = "free_y") +
+  theme(axis.text.x = element_text(angle = 45)) +
+  NULL
+```
+
+Lets apply a cut-off
+
+```{r}
+df_cData_fil <- df_cData_sub %>%
+  dplyr::filter(
+    detected > 2000,
+    subsets_Mito_percent < 15,
+    subsets_Hbb_percent < 10)
+```
+
+#### Final count of cells
+
+```{r}
+# Number of cells sequenced (exclude the the Gfi1 KO, since we are not using this)
+count_1 <- df_cData_sub %>% filter(!condition == "YS_E9.5_HE_Gfi1s_KO")
+print(nrow(count_1))
+
+# Cells filtered and pass trehsold
+count_2 <- df_cData_fil %>% filter(!condition == "YS_E9.5_HE_Gfi1s_KO")
+print(nrow(count_2))
+```
+
+
+
+Subset the sc object
+
+```{r}
+se <- se[,se$Barcode %in% df_cData_fil$Barcode]
+```
+
+Save the object
+
+```{r}
+saveRDS(se, file.path(outData_dir, "Se_Next_allGenes_ENSID.RDS"))
+```
+
+
+
+### Filtering lowly-expressed genes
+
+> To do, there is no filtering of lowly-expresed genes in Seurat?
+
+### Convert to gene symbol 
+
+To enable a user-friendly analysis, it is convenient to exchange the ENSEMBL IDs with the name of the genes. 
+
+For duplicated gene names, we merge them with the ENSEMBL IDs to avoid confusion.
+
+
+```{r}
+new.row.names <- uniquifyFeatureNames(
+    rowData(se)$ID,
+    rowData(se)$Symbol
+)
+
+rownames(se) <- new.row.names
+head(rownames(se), 5)
+
+se_next <- se
+```
+
+### Quick seurat
+
+```{r}
+colnames(se) <- se$Barcode
+seu <- 
+  Seurat::CreateSeuratObject(counts = assay(se, "counts"), 
+                     project = "NextSeq", 
+                     meta.data = as.data.frame(colData(se)),
+                     min.cells = 3, min.features = 200)
+# Colour scheme
+#pal.pop2_sub <- df_pal_pop2 %>%
+#  dplyr::filter(Population %in% se2$condition) %>% pull(Col)
+
+
+seuset <- NormalizeData(
+  object = seu, 
+  normalization.method = "LogNormalize", 
+  scale.factor = 10000
+)
+# Feature selections
+seuset <- 
+  FindVariableFeatures(object = seuset, selection.method = "vst", nfeatures = 2500)
+# Scaling the data
+all.genes <- rownames(x = seuset)
+seuset <- ScaleData(object = seuset, features = all.genes)
+seuset <- CellCycleScoring(seuset, s.features = s.genes, g2m.features = g2m.genes, set.ident = FALSE)
+
+# These are now standard steps in the Seurat workflow for visualization and clustering
+seuset <- RunPCA(seuset, verbose = FALSE)
+ElbowPlot(object = seuset, ndims = 30)
+seuset <- RunUMAP(seuset, dims = 1:30, verbose = FALSE)
+
+seuset <- FindNeighbors(seuset, dims = 1:30, verbose = FALSE)
+seuset <- FindClusters(seuset, verbose = FALSE)
+
+seuset_next <- seuset
+```
+
+#### UMAP visualisation
+
+Extract the UMAP dimension
+
+```{r}
+umap.df <- as.data.frame(Embeddings(object = seuset, reduction = "umap")) %>%
+  tibble::rownames_to_column(var="Cell") %>%
+  cbind(seuset[[]]) 
+
+
+# Subset based on sorted population
+p1 <- 
+  ggplot(umap.df, aes(x=UMAP_1, y=UMAP_2, colour=condition)) +
+  geom_point() +
+  gghighlight(use_direct_label = FALSE) +
+  theme(legend.position = "right") +
+  facet_wrap(~condition) +
+  theme_bw() +
+  #scale_colour_manual(values=pal.pop2_sub) + 
+  labs(title="Highlighting the FACS clusters in combined data")
+
+
+png(file.path(outDir_cur, "Next_UMAP.png"), width=1200, height=900)
+p1
+dev.off()
+```
+
+
+## Process public data
+
+## Nancy data
+
+```{r}
+outDir_nancy <- file.path(outDir_cur, "Nancy_2020")
+dir.create(outDir_nancy)
+```
+
+
+To obtain a more comprehensive representation of E10.5 time-point, lets also use Nancy 10x E10.5 data/ We process Nancy's data from GEO
+
+We want to only obtain a subset of Nancy's data. The initial data has 46,048 cells. We need the E10.5 pre-He, HE, and IAC. We do the following cell subset just once and save the output file to conserve RAM memory. The result will leave us with fewer cells
+
+
+```{r,eval=FALSE}
+dat <- readMM(file.path(dataDir, "publicData/GEO_dowload/Nancy_2020/GSE137116_gene_by_cell_count_matrix.txt"))
+
+g.anno <-read.csv(file.path(dataDir, "publicData/GEO_dowload/Nancy_2020/GSE137116_gene_annotation.csv"))
+c.anno <- read.csv(file.path(dataDir, "publicData/GEO_dowload/Nancy_2020/GSE137116_cell_annotation.csv"))
+
+colnames(dat) <- c.anno$X
+rownames(dat) <- g.anno$id
+
+nancy.sce <- 
+  SingleCellExperiment(
+  assays = list(counts = dat),
+  colData = c.anno,
+  rowData = g.anno)
+
+
+# Remove ENS genes that is present in Nancy data that is not present in our data
+ourGenes <- row.names(nova.sce)
+nancyGenes <- row.names(nancy.sce)
+
+nancyGenes_sub <- nancyGenes[nancyGenes %in% ourGenes]
+
+
+nancy.sce <- nancy.sce[row.names(nancy.sce) %in% nancyGenes_sub,]
+
+
+new.row.names <- uniquifyFeatureNames(
+    rowData(nancy.sce)$id,
+    rowData(nancy.sce)$symbol
+)
+rownames(nancy.sce) <- new.row.names
+
+
+# We need to do some filtering to select the population of interest
+## Remove NA from the population tab
+nancy.sce <- nancy.sce[,!is.na(nancy.sce$Cell_type_refined) ]
+nancy.sce_ori <- nancy.sce
+
+# Select interested cells from E11.5
+df_cell <- as.data.frame(colData(nancy.sce))
+## Randomly select 100 from IAC
+set.seed(123)
+df_E11 <- df_cell %>%
+  dplyr::filter(Dataset == "E11.5_CD45+CD27+IAC" & Cell_type_refined == "IAC") %>%
+  group_by(Cell_type_refined) %>% slice_sample(n = 100)
+
+
+# Select interested cells from E10.5
+dataInt <- as.character(unique( c.anno$Combined_Dataset[grep("E10.5", c.anno$Combined_Dataset)]))
+scATAC_loc <- grep("scATAC", dataInt)
+dataInt <- dataInt[-scATAC_loc]
+nancy.sce <- nancy.sce[,nancy.sce$Combined_Dataset %in% dataInt]
+## Select the populations we are interested in
+popInterest <- c("HE", "IAC", "Pre-HE [AE]", "Conflux endo [AE]")
+nancy.sce <- nancy.sce[,nancy.sce$Cell_type_refined %in% popInterest]
+
+## We subset cells based on thier sorting gate (Combined Dataset column)
+## Randomly select 150 from IAC, 100 cells from Pre-HE and HE and 50 cells from Pre-HE
+set.seed(123)
+# Remove cells with no pseudotime
+df_cell <- as.data.frame(colData(nancy.sce)) %>%
+  filter(!is.na(pseudotime_slingshot))
+df_cell_1.1  <- df_cell %>%
+  filter(Cell_type_refined %in% c("HE") & Combined_Dataset == "E10.5 HE") %>%
+  group_by(Cell_type_refined) %>% slice_sample(n = 60) %>%
+  pull(X)
+
+df_cell_1.2  <- df_cell %>%
+  filter(Cell_type_refined %in% c("HE") & Combined_Dataset == "E10.5 E+HE+IAC") %>%
+  group_by(Cell_type_refined) %>% slice_sample(n = 40) %>%
+  pull(X)
+
+df_cell_2  <- df_cell %>%
+  filter(Cell_type_refined %in% c("Pre-HE [AE]")) %>% #& Combined_Dataset == "E10.5 E+HE+IAC") %>%
+  group_by(Cell_type_refined) %>% slice_sample(n = 100) %>%
+  pull(X)
+
+
+df_cell_3  <- df_cell %>%
+  filter(Cell_type_refined %in% c("IAC"))  %>%
+  group_by(Cell_type_refined) %>% slice_sample(n = 150) %>%
+  pull(X)
+
+
+#df_cell_3.1  <- df_cell %>%
+#  filter(Cell_type_refined %in% c("IAC") & Combined_Dataset == "E10.5 E+HE+IAC") %>%
+#  group_by(Cell_type_refined) %>% slice_sample(n = 75) %>%
+#  pull(X)
+
+
+#df_cell_3.2  <- df_cell %>%
+#  filter(Cell_type_refined %in% c("IAC") & Combined_Dataset == "E10.5 IAC") %>%
+#  group_by(Cell_type_refined) %>% slice_sample(n = 75) %>%
+#  pull(X)
+
+df_cell_4  <- df_cell %>%
+  filter(Cell_type_refined %in% c("Conflux endo [AE]")) %>% #& Combined_Dataset == "E10.5 E+HE+IAC") %>%
+  group_by(Cell_type_refined) %>% slice_sample(n = 50) %>%
+  pull(X)
+
+interestedCells <- c(df_cell_1.1, df_cell_1.2, df_cell_2,df_cell_3,df_cell_4)
+# Subset
+nancy.sce <- nancy.sce_ori[,nancy.sce_ori$X %in% c(interestedCells, df_E11$X)]
+
+
+# Save this object so we need not do the integration again
+saveRDS(nancy.sce, file=file.path(outData_dir, "Nancy_filtered.RDS"))
+```
+
+#### Normalise
+
+First create Seurat object
+
+```{r}
+se <- readRDS(file.path(outData_dir, "Nancy_filtered.RDS"))
+seu <- 
+  Seurat::CreateSeuratObject(counts = assay(se, "counts"), 
+                     project = "Nancy", 
+                     meta.data = as.data.frame(colData(se)),
+                     min.cells = 3, min.features = 200)
+seuset <- NormalizeData(
+  object = seu, 
+  normalization.method = "LogNormalize", 
+  scale.factor = 10000
+)
+# Feature selections
+seuset <- 
+  FindVariableFeatures(object = seuset, selection.method = "vst", nfeatures = 2500)
+# Scaling the data
+all.genes <- rownames(x = seuset)
+seuset <- ScaleData(object = seuset, features = all.genes)
+
+# Cell cycle
+s.genes <- cc.genes.updated.2019$s.genes
+g2m.genes <- cc.genes.updated.2019$g2m.genes
+
+seuset <- CellCycleScoring(seuset, s.features = s.genes, g2m.features = g2m.genes, set.ident = FALSE)
+
+# These are now standard steps in the Seurat workflow for visualization and clustering
+seuset <- RunPCA(seuset, verbose = FALSE)
+ElbowPlot(object = seuset, ndims = 30)
+seuset <- RunUMAP(seuset, dims = 1:30, verbose = FALSE)
+
+seuset <- FindNeighbors(seuset, dims = 1:30, verbose = FALSE)
+seuset <- FindClusters(seuset, verbose = FALSE,resolution = 1)
+
+seu_nancy <- seuset
+```
+
+
+#### UMAP visualisation
+
+Extract the UMAP dimension
+
+```{r}
+umap.df <- as.data.frame(Embeddings(object = seuset, reduction = "umap")) %>%
+  #tibble::rownames_to_column(var="Cell") %>%
+  cbind(seuset[[]]) 
+
+
+# Subset based on sorted population
+p1 <- 
+  ggplot(umap.df, aes(x=UMAP_1, y=UMAP_2, colour=Combined_Dataset)) +
+  geom_point() +
+  gghighlight(use_direct_label = FALSE) +
+  theme(legend.position = "right") +
+  facet_wrap(~Cell_type_refined) +
+  theme_bw() +
+  #scale_colour_manual(values=pal.pop2_sub) + 
+  labs(title="Highlighting the cell type population")
+
+p2 <- 
+  ggplot(umap.df, aes(x=UMAP_1, y=UMAP_2, colour=seurat_clusters)) +
+  geom_point() +
+  gghighlight(use_direct_label = FALSE) +
+  theme(legend.position = "right") +
+  facet_wrap(~seurat_clusters) +
+  theme_bw() +
+  #scale_colour_manual(values=pal.pop2_sub) + 
+  labs(title="Highlighting the in silico clusters")
+
+png(file.path(outDir_nancy, "UMAP_condition.png"), width=1200, height=900)
+p1
+dev.off()
+
+png(file.path(outDir_nancy, "UMAP_cluster.png"), width=1200, height=900)
+p2
+dev.off()
+
+```
+
+
+## Mouse gastrulation data
+
+```{r}
+outDir_Pijuan <- file.path(outDir_cur, "Pijuan_2019")
+dir.create(outDir_Pijuan)
+```
+
+
+The orignal publication of this paper is from https://www.nature.com/articles/s41586-019-0933-9. However we downloaded this data from http://tome.gs.washington.edu/
+
+
+### E8.25 Smart Seq
+
+In the paper they also did Smart-seq2 of 288 Flk1+ cells, from allantions, embyro propoer and yolk sac. We downloaded the fastq files from https://www.ebi.ac.uk/arrayexpress/experiments/E-MTAB-6970/. We processed the fastq files as described in the sections below (Zhou 2016 and Hou 2020 section)
+
+```{r}
+pijuan.sce <- DropletUtils::read10xCounts(file.path(dataDir, "publicData/Pijuan_STARsolo/filtered"))
+se <- pijuan.sce
+
+
+simple_gtf <- read.delim(file.path(outDir, "out_data/simple_gtf.txt"))
+
+# Combine GTF with sc object
+simple_gtf_sub <- simple_gtf %>%
+  select(gene_id, gene_type, seqnames)
+rD <- rowData(se) %>%
+  as.data.frame() %>%
+  left_join(simple_gtf_sub, by = c("ID" = "gene_id"))
+```
+
+
+Add cell metaData
+
+```{r}
+# Read the file accompanying the sequencing fastq
+mData_ebi <- read.delim(file.path(dataDir, "publicData/GEO_dowload/PijuanSala_2019/E-MTAB-6970.sdrf.txt"))
+# Read the manifest file used as input to STAR solo
+mData_starSolo <- read.delim(file.path(dataDir, "publicData/GEO_dowload/PijuanSala_2019/manifest_PijuanSala.txt"),header=FALSE)
+
+# We need to link the SRA name with the population identifier (eg T1 pre-HSC, T2 pre-HSC) with the name of the cells as named by STARsolo during mapping
+mData_1 <- mData_ebi %>%
+  dplyr::select(Comment.ENA_RUN., Characteristics.organism.part.) %>%
+  dplyr::rename(Site = 'Characteristics.organism.part.',
+                Run = 'Comment.ENA_RUN.')
+mData_2 <- mData_starSolo %>%
+  mutate(Run = gsub(".fastq", "", V1),
+         Run = gsub(".*_2019/", "", Run)) %>%
+  dplyr::rename(Barcode = V3) %>%
+  dplyr::select(Run, Barcode)
+mData_comb <- left_join(mData_1, mData_2)
+
+
+# Combine with cell annotation
+cD <- colData(se) %>%
+  as.data.frame() %>%
+  left_join(mData_comb, by = c("Barcode" = "Barcode")) %>%
+  dplyr::select(-Sample) %>%
+  dplyr::rename(condition = Site)
+
+# Renomae
+NewName <- cD$condition
+NewName <- dplyr::case_when(
+  NewName == 'yolk sac' ~ "YS_E8.25_Flk_pos",
+  NewName == 'embryo' ~ "WE_E8.25_Flk_pos",
+  NewName == 'allantois' ~ "Alan_E8.25_Flk_pos"
+  
+)
+cD$condition <- NewName
+```
+
+Add new colData and rowData to se object
+
+```{r}
+colData(se) <- DataFrame(cD)
+rowData(se) <- DataFrame(rD)
+```
+
+Remove un interesting population
+
+```{r}
+se <- se[,se$condition %in% c("YS_E8.25_Flk_pos", "WE_E8.25_Flk_pos")]
+```
+
+
+
+Find the QC of specific genes
+
+```{r}
+# Specific the location
+MT_gene <- rD$seqnames == "chrM"
+Hbbs <- rD[grepl("Hb[a-b]", rD$Symbol),] %>% pull(Symbol)
+Hbbs <- c(Hbbs, "Gypa")
+#Hbbs <- c("Hba-x", "Hbb-bh1", "Hbb-y", "Hba-a1")
+
+# Get the Ens ID
+Hb_ens <- rD %>%
+  dplyr::filter(Symbol %in% Hbbs)
+Hbb_gene <- rowData(se)$ID %in% Hb_ens$ID
+```
+
+We examine the distibution of the data in all the run
+
+```{r}
+df_cData <- 
+  perCellQCMetrics(se,
+                   subsets=list(Mito=MT_gene,
+                                Hbb=Hbb_gene)) %>%
+  cbind(as.data.frame(colData(se))) %>%
+  as.data.frame() %>%
+  dplyr::mutate(Cell = colnames(se))
+
+
+# To plot select a subset of columns
+df_cData_sub <- as.data.frame(df_cData) %>%
+  #tibble::rownames_to_column(var = "Cell") %>%
+  dplyr::select(Barcode, sum, detected, subsets_Mito_percent, subsets_Hbb_percent, condition)
+
+m <- melt(df_cData_sub)
+```
+Plot the distribution 
+
+```{r}
+ggplot(m, aes(x=condition, y=value, colour=condition)) +
+  geom_boxplot(aes(),fill=NA) +
+  geom_quasirandom(dodge.width=0.75) +
+  theme_bw()  +
+  facet_wrap(~variable, scales = "free_y") +
+  theme(axis.text.x = element_text(angle = 45)) +
+  NULL
+```
+
+#### Filtering lowly-expressed genes
+
+> To do, there is no filtering of lowly-expresed genes in Seurat?
+
+#### Convert to gene symbol 
+
+To enable a user-friendly analysis, it is convenient to exchange the ENSEMBL IDs with the name of the genes. 
+
+For duplicated gene names, we merge them with the ENSEMBL IDs to avoid confusion.
+
+
+```{r}
+new.row.names <- uniquifyFeatureNames(
+    rowData(se)$ID,
+    rowData(se)$Symbol
+)
+
+rownames(se) <- new.row.names
+head(rownames(se), 5)
+
+se_Pijuan <- se
+```
+
+
+#### Quick seurat
+
+```{r}
+colnames(se) <- se$Barcode
+seu <- 
+  Seurat::CreateSeuratObject(counts = assay(se, "counts"), 
+                     project = "Pijuan", 
+                     meta.data = as.data.frame(colData(se)),
+                     min.cells = 3, min.features = 200)
+# Colour scheme
+#pal.pop2_sub <- df_pal_pop2 %>%
+#  dplyr::filter(Population %in% se2$condition) %>% pull(Col)
+
+
+seuset <- NormalizeData(
+  object = seu, 
+  normalization.method = "LogNormalize", 
+  scale.factor = 10000
+)
+# Feature selections
+seuset <- 
+  FindVariableFeatures(object = seuset, selection.method = "vst", nfeatures = 2500)
+# Scaling the data
+all.genes <- rownames(x = seuset)
+seuset <- ScaleData(object = seuset, features = all.genes)
+seuset <- CellCycleScoring(seuset, s.features = s.genes, g2m.features = g2m.genes, set.ident = FALSE)
+
+
+# These are now standard steps in the Seurat workflow for visualization and clustering
+seuset <- RunPCA(seuset, verbose = FALSE)
+ElbowPlot(object = seuset, ndims = 30)
+seuset <- RunUMAP(seuset, dims = 1:30, verbose = FALSE)
+
+seuset <- FindNeighbors(seuset, dims = 1:30, verbose = FALSE)
+seuset <- FindClusters(seuset, verbose = FALSE,resolution = 1)
+
+seuset_pijuan <- seuset
+```
+
+#### UMAP visualisation
+
+Extract the UMAP dimension
+
+```{r}
+umap.df <- as.data.frame(Embeddings(object = seuset, reduction = "umap")) %>%
+  tibble::rownames_to_column(var="Cell") %>%
+  cbind(seuset[[]]) 
+
+
+# Subset based on sorted population
+p1 <- 
+  ggplot(umap.df, aes(x=UMAP_1, y=UMAP_2, colour=condition)) +
+  geom_point() +
+  gghighlight(use_direct_label = FALSE) +
+  theme(legend.position = "right") +
+  facet_wrap(~condition) +
+  theme_bw() +
+  #scale_colour_manual(values=pal.pop2_sub) + 
+  labs(title="Highlighting the FACS population")
+
+p2 <- 
+  ggplot(umap.df, aes(x=UMAP_1, y=UMAP_2, colour=seurat_clusters)) +
+  geom_point() +
+  gghighlight(use_direct_label = FALSE) +
+  theme(legend.position = "right") +
+  facet_wrap(~seurat_clusters) +
+  theme_bw() +
+  #scale_colour_manual(values=pal.pop2_sub) + 
+  labs(title="Highlighting the in silico clusters")
+
+png(file.path(outDir_Pijuan, "E8.25_SmartSeq_UMAP_condition.png"), width=1200, height=900)
+p1
+dev.off()
+
+png(file.path(outDir_Pijuan, "E8.25_SmartSeq_UMAP_cluster.png"), width=1200, height=900)
+p2
+dev.off()
+```
+
+
+
+
+### E8 
+
+ > To do E8 data if required
+
+```{r}
+
+```
+
+
+### E8.25 
+
+```{r}
+set.seed(123)
+seu_8.25 <- readRDS(file.path(dataDir, "publicData/obj_E8.25_exp.rds"))
+dat_E8.25 <- seu_8.25[[]]
+
+# ------ Select interested population ------ #
+# Subset cells from the endothelial lineage 
+tmp <- filter(dat_E8.25, Anno == "E8.25:Endothelium")  %>%
+  filter(pre_celltype %in% c("Endothelium", "Haematoendothelial progenitors"))
+table(tmp$pre_celltype)
+# Limit the ell number of the endothelium to 50 and select all Haematoendothelial
+tmp <- stratified(tmp, group="pre_celltype",
+                  size = c(Endothelium = 50, 'Haematoendothelial progenitors' = 50))
+                  #size = c(Endothelium = 50)
+
+# Subset cells from Haematoendothelial progenitors
+tmp2 <- filter(dat_E8.25, Anno == "E8.25:Haematoendothelial progenitors")  %>%
+  filter(pre_celltype %in% c("Haematoendothelial progenitors"))
+table(tmp2$pre_celltype)
+# Limit the ell number of the Haematoendothelial to 100
+tmp2 <- stratified(tmp2, group="pre_celltype",
+                   size = c('Haematoendothelial progenitors' = 100))
+
+# Subset cells from blood progenitor
+tmp3 <- filter(dat_E8.25, Anno == "E8.25:Blood progenitors")  %>%
+  filter(pre_celltype %in% c("Blood progenitors 1", "Blood progenitors 2"))
+table(tmp3$pre_celltype)
+
+
+selcells <- unique(c(row.names(tmp), row.names(tmp2), row.names(tmp3)))
+
+seu_8.25_sub  <- seu_8.25[,colnames(seu_8.25) %in% selcells]
+table(seu_8.25_sub$pre_celltype)
+```
+
+
+
+### E8.5 
+
+```{r}
+set.seed(123)
+seu_8.5 <- readRDS(file.path(dataDir, "publicData/obj_E8.5_exp.rds"))
+dat_E8.5 <- seu_8.5[[]]
+
+# ------ Select interested population ------ #
+# Subset cells from the endothelial lineage 
+tmp <- filter(dat_E8.5, Anno == "E8.5:Endothelium")  %>%
+  filter(pre_celltype %in% c("Endothelium", "Haematoendothelial progenitors"))
+table(tmp$pre_celltype)
+# Limit the ell number of the endothelium to 50
+tmp <- stratified(tmp, group="pre_celltype",
+                  size = c(Endothelium = 50, 'Haematoendothelial progenitors' = 100))
+
+# Subset cells from Haematoendothelial progenitors
+tmp2 <- filter(dat_E8.5, Anno == "E8.5:Haematoendothelial progenitors")  %>%
+  filter(pre_celltype %in% c("Haematoendothelial progenitors"))
+table(tmp2$pre_celltype)
+tmp2 <- stratified(tmp2, group="pre_celltype",
+                  size = ('Haematoendothelial progenitors' = 100))
+
+# Subset cells from blood progenitor
+tmp3 <- filter(dat_E8.5, Anno == "E8.5:Blood progenitors")  %>%
+  filter(pre_celltype %in% c("Blood progenitors 1", "Blood progenitors 2"))
+table(tmp3$pre_celltype)
+
+selcells <- c(row.names(tmp), row.names(tmp2), row.names(tmp3))
+
+seu_8.5_sub  <- seu_8.5[,colnames(seu_8.5) %in% selcells]
+table(seu_8.5_sub$pre_celltype)
+```
+
+
+### Normalize 
+
+```{r}
+# -------- E8.25 ----------- #
+seuset <- seu_8.25_sub
+# Convert ENS ID to symbol
+## Remove ENS genes that is present in the gastrilation data that is not present in our data
+rD <- rowData((nova.sce)) %>%
+  as.data.frame()
+ourGenes <- rD %>% pull(ID)
+gastGene <- row.names(seuset)
+gastGene_sub <- gastGene[gastGene %in% ourGenes]
+seuset <- seuset[row.names(seuset) %in% gastGene_sub,]
+## Converting gene names
+rD_sub <- rD[row.names(seuset),]
+identical(rD_sub$ID, row.names(seuset))
+new.row.names <- uniquifyFeatureNames(
+    rD_sub$ID,
+    rD_sub$Symbol
+)
+# No easy way to rename Seurat objects https://github.com/satijalab/seurat/issues/1049
+# So convert it to sce object, then create seurat object
+se.tmp <- as.SingleCellExperiment(seuset)
+row.names(se.tmp) <- new.row.names
+seuset <- 
+  Seurat::CreateSeuratObject(counts = assay(se.tmp, "counts"), 
+                     project = "E8.25", 
+                     meta.data = as.data.frame(colData(se.tmp)),
+                     min.cells = 3, min.features = 200)
+
+# Normalize
+seuset <- NormalizeData(
+  object = seuset, 
+  normalization.method = "LogNormalize", 
+  scale.factor = 10000
+)
+# Feature selections
+seuset <- 
+  FindVariableFeatures(object = seuset, selection.method = "vst", nfeatures = 2500)
+# Scaling the data
+all.genes <- rownames(x = seuset)
+seuset <- ScaleData(object = seuset, features = all.genes)
+# Cell cycle
+seuset <- CellCycleScoring(seuset, s.features = s.genes, g2m.features = g2m.genes, set.ident = FALSE)
+seuset <- RunPCA(seuset, verbose = FALSE)
+seuset <- RunUMAP(seuset, dims = 1:30, verbose = FALSE)
+
+seuset <- FindNeighbors(seuset, dims = 1:30, verbose = FALSE)
+seuset <- FindClusters(seuset, verbose = FALSE,resolution = 1)
+
+# SAve
+seu_8.25_sub <- seuset
+
+
+
+# -------- E8.5 ----------- #
+seuset <- seu_8.5_sub
+# Convert ENS ID to symbol
+## Remove ENS genes that is present in the gastrilation data that is not present in our data
+rD <- rowData((nova.sce)) %>%
+  as.data.frame()
+ourGenes <- rD %>% pull(ID)
+gastGene <- row.names(seuset)
+gastGene_sub <- gastGene[gastGene %in% ourGenes]
+seuset <- seuset[row.names(seuset) %in% gastGene_sub,]
+## Converting gene names
+rD_sub <- rD[row.names(seuset),]
+identical(rD_sub$ID, row.names(seuset))
+new.row.names <- uniquifyFeatureNames(
+    rD_sub$ID,
+    rD_sub$Symbol
+)
+# No easy way to rename Seurat objects https://github.com/satijalab/seurat/issues/1049
+# So convert it to sce object, then create seurat object
+se.tmp <- as.SingleCellExperiment(seuset)
+row.names(se.tmp) <- new.row.names
+seuset <- 
+  Seurat::CreateSeuratObject(counts = assay(se.tmp, "counts"), 
+                     project = "E8.5", 
+                     meta.data = as.data.frame(colData(se.tmp)),
+                     min.cells = 3, min.features = 200)
+
+# Normalize
+seuset <- NormalizeData(
+  object = seuset, 
+  normalization.method = "LogNormalize", 
+  scale.factor = 10000
+)
+# Feature selections
+seuset <- 
+  FindVariableFeatures(object = seuset, selection.method = "vst", nfeatures = 2500)
+# Scaling the data
+all.genes <- rownames(x = seuset)
+seuset <- ScaleData(object = seuset, features = all.genes)
+
+# Cell cycle
+seuset <- CellCycleScoring(seuset, s.features = s.genes, g2m.features = g2m.genes, set.ident = FALSE)
+seuset <- RunPCA(seuset, verbose = FALSE)
+seuset <- RunUMAP(seuset, dims = 1:30, verbose = FALSE)
+
+seuset <- FindNeighbors(seuset, dims = 1:30, verbose = FALSE)
+seuset <- FindClusters(seuset, verbose = FALSE,resolution = 1)
+
+seu_8.5_sub <- seuset
+```
+
+
+
+#### UMAP visualisation
+
+Extract the UMAP dimension
+
+```{r}
+umap.df <- as.data.frame(Embeddings(object = seu_8.5_sub, reduction = "umap")) %>%
+  tibble::rownames_to_column(var="Cell") %>%
+  cbind(seu_8.5_sub[[]]) 
+
+
+# Subset based on sorted population
+p1 <- 
+  ggplot(umap.df, aes(x=UMAP_1, y=UMAP_2, colour=pre_celltype)) +
+  geom_point() +
+  gghighlight(use_direct_label = FALSE) +
+  theme(legend.position = "right") +
+  facet_wrap(~pre_celltype) +
+  theme_bw() +
+  #scale_colour_manual(values=pal.pop2_sub) + 
+  labs(title="Highlighting the cell annotation")
+
+p2 <- 
+  ggplot(umap.df, aes(x=UMAP_1, y=UMAP_2, colour=seurat_clusters)) +
+  geom_point() +
+  gghighlight(use_direct_label = FALSE) +
+  theme(legend.position = "right") +
+  facet_wrap(~seurat_clusters) +
+  theme_bw() +
+  #scale_colour_manual(values=pal.pop2_sub) + 
+  labs(title="Highlighting the in silico clusters")
+
+png(file.path(outDir_Pijuan, "E8.5_10x_UMAP_condition.png"), width=1200, height=900)
+p1
+dev.off()
+
+png(file.path(outDir_Pijuan, "E8.5_10x_UMAP_cluster.png"), width=1200, height=900)
+p2
+dev.off()
+
+umap.df <- as.data.frame(Embeddings(object = seu_8.25_sub, reduction = "umap")) %>%
+  tibble::rownames_to_column(var="Cell") %>%
+  cbind(seu_8.25_sub[[]]) 
+
+
+# Subset based on sorted population
+p1 <- 
+  ggplot(umap.df, aes(x=UMAP_1, y=UMAP_2, colour=pre_celltype)) +
+  geom_point() +
+  gghighlight(use_direct_label = FALSE) +
+  theme(legend.position = "right") +
+  facet_wrap(~pre_celltype) +
+  theme_bw() +
+  #scale_colour_manual(values=pal.pop2_sub) + 
+  labs(title="Highlighting the cell annotation")
+
+p2 <- 
+  ggplot(umap.df, aes(x=UMAP_1, y=UMAP_2, colour=seurat_clusters)) +
+  geom_point() +
+  gghighlight(use_direct_label = FALSE) +
+  theme(legend.position = "right") +
+  facet_wrap(~seurat_clusters) +
+  theme_bw() +
+  #scale_colour_manual(values=pal.pop2_sub) + 
+  labs(title="Highlighting the in silico clusters")
+
+png(file.path(outDir_Pijuan, "E8.25_10x_UMAP_condition.png"), width=1200, height=900)
+p1
+dev.off()
+
+png(file.path(outDir_Pijuan, "E8.25_10x_UMAP_cluster.png"), width=1200, height=900)
+p2
+dev.off()
+```
+
+
+### Mouse atlas data
+
+```{r}
+outDir_atlas <- file.path(outDir_cur, "Cao_2019")
+dir.create(outDir_atlas)
+```
+
+
+The original publication of this paper is from https://pubmed.ncbi.nlm.nih.gov/30787437/. However we downloaded this data from http://tome.gs.washington.edu/
+
+```{r}
+seu_9.5 <- readRDS(file.path(dataDir, "publicData/obj_E9.5_exp.rds"))
+dat_E9.5 <- seu_9.5[[]]
+
+# ------ Select interested population ------ #
+# Subset to cells from the endothelial lineage 
+tmp <- filter(dat_E9.5, Anno == "E9.5:Endothelium")  %>%
+  filter(sub_trajectory %in% c("Arterial endothelial trajectory", "Venous and capillary endothelial trajectory"))
+table(tmp$sub_trajectory)
+tmp <- stratified(tmp, group="sub_trajectory",
+                  size = c('Arterial endothelial trajectory' = 50, 'Venous and capillary endothelial trajectory' = 50))
+
+
+#Cells from blood progenitor
+tmp2 <- filter(dat_E9.5, Anno == "E9.5:Blood progenitors") %>% # Only 138 cells so we dont do further filtering
+  filter(!sub_trajectory %in%  c("Definitive erythroid trajectory", "Venous and capillary endothelial trajectory")) %>% # Only 10 cells in here, so we remove it
+  filter(!pre_celltype %in%  c("Definitive erythrocyte lineage")) # Only 10 cells in here, so we remove it
+  
+table(tmp2$sub_trajectory)
+
+tmp3 <- filter(dat_E9.5, main_trajectory == "Haematopoiesis trajectory") %>% # Only 138 cells so we dont do further filtering
+  filter(pre_celltype %in%  c("Definitive erythrocyte lineage", "Primitive erythroid lineage")) %>%
+  filter(!Anno %in%  c("E9.5:Stromal cells"))
+
+tmp3 <- stratified(tmp3, group="pre_celltype",
+                  size = c('Primitive erythroid lineage' = 50, 'Definitive erythrocyte lineage' = 20))
+
+selcells <- unique(c(row.names(tmp), row.names(tmp2), row.names(tmp3)))
+
+seu_9.5_sub  <- seu_9.5[,colnames(seu_9.5) %in% selcells]
+table(seu_9.5_sub$pre_celltype)
+
+```
+
+#### Normalise
+
+```{r}
+# -------- E9.5 ----------- #
+seuset <- seu_9.5_sub
+# Convert ENS ID to symbol
+## Remove ENS genes that is present in the gastrilation data that is not present in our data
+rD <- rowData((nova.sce)) %>%
+  as.data.frame()
+ourGenes <- rD %>% pull(ID)
+gastGene <- row.names(seuset)
+gastGene_sub <- gastGene[gastGene %in% ourGenes]
+seuset <- seuset[row.names(seuset) %in% gastGene_sub,]
+## Converting gene names
+rD_sub <- rD[row.names(seuset),]
+identical(rD_sub$ID, row.names(seuset))
+new.row.names <- uniquifyFeatureNames(
+    rD_sub$ID,
+    rD_sub$Symbol
+)
+# No easy way to rename Seurat objects https://github.com/satijalab/seurat/issues/1049
+# So convert it to sce object, then create seurat object
+se.tmp <- 
+  SingleCellExperiment(
+    assays = list(counts = GetAssayData(object = seuset, slot = "counts")),
+    colData = seuset[[]],
+    rowData = rD_sub)
+row.names(se.tmp) <- new.row.names
+seuset <- 
+  Seurat::CreateSeuratObject(counts = assay(se.tmp, "counts"), 
+                     project = "E9.5", 
+                     meta.data = as.data.frame(colData(se.tmp)),
+                     min.cells = 3, min.features = 200)
+
+# Normalize
+seuset <- NormalizeData(
+  object = seuset, 
+  normalization.method = "LogNormalize", 
+  scale.factor = 10000
+)
+# Feature selections
+seuset <- 
+  FindVariableFeatures(object = seuset, selection.method = "vst", nfeatures = 2500)
+# Scaling the data
+all.genes <- rownames(x = seuset)
+seuset <- ScaleData(object = seuset, features = all.genes)
+
+# Cell cycle
+seuset <- CellCycleScoring(seuset, s.features = s.genes, g2m.features = g2m.genes, set.ident = FALSE)
+
+seuset <- RunPCA(seuset, verbose = FALSE)
+seuset <- RunUMAP(seuset, dims = 1:30, verbose = FALSE)
+
+seuset <- FindNeighbors(seuset, dims = 1:30, verbose = FALSE)
+seuset <- FindClusters(seuset, verbose = FALSE,resolution = 1)
+
+seu_9.5_sub <- seuset
+```
+
+#### UMAP visualisation
+
+Extract the UMAP dimension
+
+```{r}
+umap.df <- as.data.frame(Embeddings(object = seu_9.5_sub, reduction = "umap")) %>%
+  tibble::rownames_to_column(var="Cell") %>%
+  cbind(seu_9.5_sub[[]]) 
+
+
+# Subset based on sorted population
+p1 <- 
+  ggplot(umap.df, aes(x=UMAP_1, y=UMAP_2, colour=pre_celltype)) +
+  geom_point() +
+  gghighlight(use_direct_label = FALSE) +
+  theme(legend.position = "right") +
+  facet_wrap(~pre_celltype) +
+  theme_bw() +
+  #scale_colour_manual(values=pal.pop2_sub) + 
+  labs(title="Highlighting the cell annotation")
+
+p2 <- 
+  ggplot(umap.df, aes(x=UMAP_1, y=UMAP_2, colour=seurat_clusters)) +
+  geom_point() +
+  gghighlight(use_direct_label = FALSE) +
+  theme(legend.position = "right") +
+  facet_wrap(~seurat_clusters) +
+  theme_bw() +
+  #scale_colour_manual(values=pal.pop2_sub) + 
+  labs(title="Highlighting the in silico clusters")
+
+png(file.path(outDir_atlas, "E9.5_UMAP_condition.png"), width=900, height=550)
+p1
+dev.off()
+
+png(file.path(outDir_atlas, "E9.5_UMAP_cluster.png"), width=900, height=450)
+p2
+dev.off()
+```
+
+## Zhou 2016 
+
+
+The original publication of this paper is from https://www.nature.com/articles/nature17997. However we downloaded this data from SRA
+
+
+```{r}
+outDir_Zhou <- file.path(outDir_cur, "Zhou_2016")
+dir.create(outDir_Zhou)
+```
+
+
+
+There was no processed data provided, so we download the data from GEO
+
+```{bash, eval=FALSE}
+# 1) Donaload the list of SRA files
+# 2) Use the sratoolkit module in cluster to download the SRA files
+#  A table of files we want to download is in the data folder
+prefetch --option-file SraAccList.txt
+
+# Once data is downloaded by prefetch, we need to process using fasstq-dump convert SRA file to fasta file
+fastq-dump --split-e  SRR1922583.sra
+
+# Then we map the data with STAR solo, as we have done with the Next-seq and Smart-Seq2 data
+# To map with star solo, we need to supply the manifest file ls -1 $PWD/* > ../tmp.list.txt
+```
+
+
+Generate the single cell object
+
+```{r}
+zhou.sce <- DropletUtils::read10xCounts(file.path(dataDir, "publicData/Zhou_STARsolo/filtered"))
+se <- zhou.sce
+```
+
+
+To annotate the genes further, we import the GTF file
+
+```{r}
+simple_gtf <- read.delim(file.path(outDir, "out_data/simple_gtf.txt"))
+
+# Combine GTF with sc object
+simple_gtf_sub <- simple_gtf %>%
+  select(gene_id, gene_type, seqnames)
+rD <- rowData(se) %>%
+  as.data.frame() %>%
+  left_join(simple_gtf_sub, by = c("ID" = "gene_id"))
+```
+
+
+Add cell metaData
+
+```{r}
+# Read the file accompanying the SRA file
+mData_SRA <- read.csv(file.path(dataDir, "publicData/GEO_dowload/Zhou_2016/SraRunTable_Zhou2016.csv"))
+# Read the manifest file used as input to STAR solo
+mData_starSolo <- read.delim(file.path(dataDir, "publicData/GEO_dowload/Zhou_2016/manifest_Zhou.txt"),header=FALSE)
+
+# We need to link the SRA name with the population identifier (eg T1 pre-HSC, T2 pre-HSC) with the name of the cells as named by STARsolo during mapping
+mData_1<- mData_SRA %>%
+  dplyr::select(Run, cell_type)
+mData_2 <- mData_starSolo %>%
+  mutate(Run = gsub("_1.fastq", "", V1),
+         Run = gsub(".*fastq/", "", Run)) %>%
+  dplyr::rename(Barcode = V3) %>%
+  dplyr::select(Run, Barcode)
+mData_comb <- left_join(mData_1, mData_2)
+
+
+# Combine with cell annotation
+cD <- colData(se) %>%
+  as.data.frame() %>%
+  left_join(mData_comb, by = c("Barcode" = "Barcode")) %>%
+  dplyr::select(-Sample) %>%
+  dplyr::rename(condition = cell_type)
+```
+
+Rename the populations in the Zhou data
+
+```{r}
+table(cD$condition)
+```
+
+
+New names
+
+
+```{r}
+NewName <- cD$condition
+NewName <- dplyr::case_when(
+  NewName == 'endothelial cells' ~ "AGM_E11.0_Endo",
+  NewName == 'T1 CD201-: CD31+CD45-CD41low c-Kit+CD201low/-' ~ "AGM_E11.0_T1_preHSC_CD201neg",
+  NewName == 'Type1 pre-HSCs' ~ "AGM_E11.0_T1_preHSC_CD201hig",
+  
+  NewName == 'T2 pre-HSCs' ~ "AGM_E11.0_T2_preHSC_CD201hig",
+  NewName == 'Type2 pre-HSCs' ~ "AGM_E11.0_T2_preHSC",
+  
+  NewName == 'E12 HSCs' ~ "FL_E12.0_HSC",
+  NewName == 'E14 HSCs' ~ "FL_E14.0_HSC",
+  NewName == 'Haematopoietic stem cells' ~ "BM_Adult_HSC",
+  
+)
+NewName <- factor(NewName, levels=Zhou_lvl)
+
+cD$condition <- NewName
+```
+
+
+
+
+Add new colData and rowData to se object
+
+```{r}
+colData(se) <- DataFrame(cD)
+rowData(se) <- DataFrame(rD)
+```
+
+Remove the un-interested population. From the Zhou study they have the following populations
+
+```{r}
+# table(cD$condition)
+```
+Convert the population (condition) as factors
+
+```{r}
+#se$condition <- factor(se$condition, levels=nova_popFac)
+```
+
+
+We are interested in the following populations
+
+```{r}
+#popInterest <- c("endothelial cells", "Type1 pre-HSCs", "Type2 pre-HSCs", "E12 HSCs", "E14 HSCs")
+#se <- se[,se$condition %in% popInterest]
+```
+
+
+
+
+### Filtering low-quality cells
+
+Our first aim is to remove low-quality cells. For all of the run, we apply a threshold to filter the cells. We will use the follwoing 
+
+* Number of genes detected
+* Percentage of Mitochondira reads
+* Percentage of Hemoglobin (Hbb) genes
+
+
+
+Find the QC of specific genes
+
+```{r}
+# Specific the location
+MT_gene <- rD$seqnames == "chrM"
+Hbbs <- rD[grepl("Hb[a-b]", rD$Symbol),] %>% pull(Symbol)
+Hbbs <- c(Hbbs, "Gypa")
+#Hbbs <- c("Hba-x", "Hbb-bh1", "Hbb-y", "Hba-a1")
+
+# Get the Ens ID
+Hb_ens <- rD %>%
+  dplyr::filter(Symbol %in% Hbbs)
+Hbb_gene <- rowData(se)$ID %in% Hb_ens$ID
+```
+
+We examine the distibution of the data in all the run
+
+```{r}
+df_cData <- 
+  perCellQCMetrics(se,
+                   subsets=list(Mito=MT_gene,
+                                Hbb=Hbb_gene)) %>%
+  cbind(as.data.frame(colData(se))) %>%
+  as.data.frame() %>%
+  dplyr::mutate(Cell = colnames(se))
+
+
+# To plot select a subset of columns
+df_cData_sub <- as.data.frame(df_cData) %>%
+  #tibble::rownames_to_column(var = "Cell") %>%
+  dplyr::select(Barcode, sum, detected, subsets_Mito_percent, subsets_Hbb_percent, condition)
+
+
+
+m <- melt(df_cData_sub)
+```
+Plot the distribution 
+
+```{r}
+ggplot(m, aes(x=condition, y=value, colour=condition)) +
+  geom_boxplot(aes(),fill=NA) +
+  geom_quasirandom(dodge.width=0.75) +
+  theme_bw()  +
+  facet_wrap(~variable, scales = "free_y") +
+  theme(axis.text.x = element_text(angle = 45)) +
+  NULL
+```
+
+
+Lets apply a cut-off
+
+```{r}
+df_cData_fil <- df_cData_sub %>%
+  dplyr::filter(
+    detected > 2000,
+    subsets_Mito_percent < 15,
+    subsets_Hbb_percent < 10)
+```
+
+
+Subset the sc object
+
+```{r}
+se <- se[,se$Barcode %in% df_cData_fil$Barcode]
+```
+
+
+### Filtering lowly-expressed genes
+
+> To do, there is no filtering of lowly-expresed genes in Seurat?
+
+#### Convert to gene symbol 
+
+To enable a user-friendly analysis, it is convenient to exchange the ENSEMBL IDs with the name of the genes. 
+
+For duplicated gene names, we merge them with the ENSEMBL IDs to avoid confusion.
+
+
+```{r}
+new.row.names <- uniquifyFeatureNames(
+    rowData(se)$ID,
+    rowData(se)$Symbol
+)
+
+rownames(se) <- new.row.names
+head(rownames(se), 5)
+
+se_Zhou <- se
+```
+
+
+### Quick seurat
+
+```{r}
+colnames(se) <- se$Barcode
+seu <- 
+  Seurat::CreateSeuratObject(counts = assay(se, "counts"), 
+                     project = "Zhou", 
+                     meta.data = as.data.frame(colData(se)),
+                     min.cells = 3, min.features = 200)
+# Colour scheme
+#pal.pop2_sub <- df_pal_pop2 %>%
+#  dplyr::filter(Population %in% se2$condition) %>% pull(Col)
+
+
+seuset <- NormalizeData(
+  object = seu, 
+  normalization.method = "LogNormalize", 
+  scale.factor = 10000
+)
+# Feature selections
+seuset <- 
+  FindVariableFeatures(object = seuset, selection.method = "vst", nfeatures = 2500)
+# Scaling the data
+all.genes <- rownames(x = seuset)
+seuset <- ScaleData(object = seuset, features = all.genes)
+seuset <- CellCycleScoring(seuset, s.features = s.genes, g2m.features = g2m.genes, set.ident = FALSE)
+
+
+# These are now standard steps in the Seurat workflow for visualization and clustering
+seuset <- RunPCA(seuset, verbose = FALSE)
+#ElbowPlot(object = seuset, ndims = 30)
+seuset <- RunUMAP(seuset, dims = 1:30, verbose = FALSE)
+
+seuset <- FindNeighbors(seuset, dims = 1:30, verbose = FALSE)
+seuset <- FindClusters(seuset, verbose = FALSE,resolution = 1)
+
+seuset_zhou <- seuset
+```
+
+#### UMAP visualisation
+
+Extract the UMAP dimension
+
+```{r}
+umap.df <- as.data.frame(Embeddings(object = seuset, reduction = "umap")) %>%
+  tibble::rownames_to_column(var="Cell") %>%
+  cbind(seuset[[]]) 
+
+
+# Subset based on sorted population
+p1 <- 
+  ggplot(umap.df, aes(x=UMAP_1, y=UMAP_2, colour=condition)) +
+  geom_point() +
+  gghighlight(use_direct_label = FALSE) +
+  theme(legend.position = "right") +
+  facet_wrap(~condition) +
+  theme_bw() +
+  #scale_colour_manual(values=pal.pop2_sub) + 
+  labs(title="Highlighting the FACS population")
+
+p2 <- 
+  ggplot(umap.df, aes(x=UMAP_1, y=UMAP_2, colour=seurat_clusters)) +
+  geom_point() +
+  gghighlight(use_direct_label = FALSE) +
+  theme(legend.position = "right") +
+  facet_wrap(~seurat_clusters) +
+  theme_bw() +
+  #scale_colour_manual(values=pal.pop2_sub) + 
+  labs(title="Highlighting the in silico clusters")
+
+png(file.path(outDir_Zhou, "Zhou_UMAP_condition.png"), width=1200, height=900)
+p1
+dev.off()
+
+png(file.path(outDir_Zhou, "Zhou_UMAP_cluster.png"), width=1200, height=900)
+p2
+dev.off()
+
+su.markers <- 
+  FindAllMarkers(seuset, only.pos = TRUE, min.pct = 0.25, logfc.threshold = 0.25)
+write.csv(su.markers, file.path(outDir_Zhou, "MarkerGenes.csv"))
+```
+
+#### Filtering clusters
+
+
+Cluster 5 showed no expression of CD27 and very high expression of Macrophage (Fcr gene family) expression. So we remove all cluster 5
+
+```{r}
+seuset <- seuset[,!seuset$seurat_clusters == "5"]
+```
+
+Re-run clustering and variable genes
+
+```{r}
+# Feature selections
+seuset <- 
+  FindVariableFeatures(object = seuset, selection.method = "vst", nfeatures = 2500)
+# Scaling the data
+all.genes <- rownames(x = seuset)
+seuset <- ScaleData(object = seuset, features = all.genes)
+
+
+# These are now standard steps in the Seurat workflow for visualization and clustering
+seuset <- RunPCA(seuset, verbose = FALSE)
+ElbowPlot(object = seuset, ndims = 30)
+seuset <- RunUMAP(seuset, dims = 1:30, verbose = FALSE)
+
+seuset <- FindNeighbors(seuset, dims = 1:30, verbose = FALSE)
+seuset <- FindClusters(seuset, verbose = FALSE,resolution = 1)
+
+seuset_zhou <- seuset
+
+
+umap.df <- as.data.frame(Embeddings(object = seuset, reduction = "umap")) %>%
+  tibble::rownames_to_column(var="Cell") %>%
+  cbind(seuset[[]]) 
+
+
+# Subset based on sorted population
+p1 <- 
+  ggplot(umap.df, aes(x=UMAP_1, y=UMAP_2, colour=condition)) +
+  geom_point() +
+  gghighlight(use_direct_label = FALSE) +
+  theme(legend.position = "right") +
+  facet_wrap(~condition) +
+  theme_bw() +
+  #scale_colour_manual(values=pal.pop2_sub) + 
+  labs(title="Highlighting the FACS population")
+
+p1
+```
+
+
+## Hou 2020 
+
+
+```{r}
+outDir_Hou <- file.path(outDir_cur, "Hou_2020")
+dir.create(outDir_Hou)
+```
+
+
+The original publication of this paper is from https://www.nature.com/articles/s41422-020-0300-2. We downloaded this data from [GEO](https://www.ncbi.nlm.nih.gov/geo/query/acc.cgi?acc=GSE139389) where the raw count is provided. So we process the provided file 
+
+```{r}
+dat1 <- read.delim(file.path(dataDir, "publicData/GEO_dowload/Hou_2020/GSM4140378_E11.0_AGM_T1_EC81.txt"))
+dat2 <- read.delim(file.path(dataDir, "publicData/GEO_dowload/Hou_2020/GSM4140379_E11.0_AGM_T1_EC82.txt"))
+dat3 <- read.delim(file.path(dataDir, "publicData/GEO_dowload/Hou_2020/GSM4140374_E10.0_AGM_PK44_EC73.txt"))
+dat4 <- read.delim(file.path(dataDir, "publicData/GEO_dowload/Hou_2020/GSM4140375_E10.0_AGM_PK44_EC74.txt"))
+
+dat <- cbind(dat1,dat2,dat3,dat4)
+
+c.anno <- 
+  data.frame(
+    Cell = c(colnames(dat1), colnames(dat2), colnames(dat3), colnames(dat4)),
+    condition = c(rep("AGM_E11.0_T1_preHSC", ncol(dat1)),
+             rep("AGM_E11.0_T1_preHSC", ncol(dat2)),
+             rep("AGM_E11.0_PK44", ncol(dat3)),
+             rep("AGM_E11.0_PK44", ncol(dat4)))
+  )
+
+
+hou.sce <- 
+  SingleCellExperiment(
+  assays = list(counts = dat),
+  colData = c.anno)
+
+
+# Remove genes symbol that is present in Nancy data that is not present in our data
+ourGenes <- rowData(nova.sce)$Symbol
+houGenes <- row.names(hou.sce)
+
+houGenes_sub <- houGenes[houGenes %in% ourGenes]
+
+
+hou.sce <- hou.sce[row.names(hou.sce) %in% houGenes_sub,]
+
+se <- hou.sce
+```
+
+### Filtering low-quality cells
+
+Our first aim is to remove low-quality cells. For all of the run, we apply a threshold to filter the cells. We will use the follwoing 
+
+* Number of genes detected
+* Percentage of Hemoglobin (Hbb) genes
+
+
+
+Find the QC of specific genes
+
+```{r}
+Hbb_gene <- row.names(se) %in% Hb_ens$Symbol
+```
+
+We examine the distibution of the data in all the run
+
+```{r}
+df_cData <- 
+  perCellQCMetrics(se,
+                   subsets=list(#Mito=MT_gene,
+                                Hbb=Hbb_gene)) %>%
+  cbind(as.data.frame(colData(se))) %>%
+  as.data.frame() %>%
+  dplyr::mutate(Cell = colnames(se))
+
+
+# To plot select a subset of columns
+df_cData_sub <- as.data.frame(df_cData) %>%
+  #tibble::rownames_to_column(var = "Cell") %>%
+  dplyr::select(Cell, sum, detected, subsets_Hbb_percent, condition)
+
+m <- melt(df_cData_sub)
+```
+Plot the distribution 
+
+```{r}
+ggplot(m, aes(x=condition, y=value, colour=condition)) +
+  geom_boxplot(aes(),fill=NA) +
+  geom_quasirandom(dodge.width=0.75) +
+  theme_bw()  +
+  facet_wrap(~variable, scales = "free_y") +
+  theme(axis.text.x = element_text(angle = 45)) +
+  NULL
+```
+
+
+
+Lets apply a cut-off
+
+```{r}
+df_cData_fil <- df_cData_sub %>%
+  dplyr::filter(
+    detected > 2000,
+    #subsets_Mito_percent < 15,
+    subsets_Hbb_percent < 10)
+```
+
+
+Subset the sc object
+
+```{r}
+se <- se[,se$Cell %in% df_cData_fil$Cell]
+```
+
+
+### Filtering lowly-expressed genes
+
+> To do, there is no filtering of lowly-expresed genes in Seurat?
+
+#### Convert to gene symbol 
+
+To enable a user-friendly analysis, it is convenient to exchange the ENSEMBL IDs with the name of the genes. 
+
+For duplicated gene names, we merge them with the ENSEMBL IDs to avoid confusion.
+
+We dont need to do this as this data already has the gene symbol annotated
+
+### Quick seurat
+
+```{r}
+seu <- 
+  Seurat::CreateSeuratObject(counts = assay(se, "counts"), 
+                     project = "Hou", 
+                     meta.data = as.data.frame(colData(se)),
+                     min.cells = 3, min.features = 200)
+
+seuset <- NormalizeData(
+  object = seu, 
+  normalization.method = "LogNormalize", 
+  scale.factor = 10000
+)
+# Feature selections
+seuset <- 
+  FindVariableFeatures(object = seuset, selection.method = "vst", nfeatures = 2500)
+# Scaling the data
+all.genes <- rownames(x = seuset)
+seuset <- ScaleData(object = seuset, features = all.genes)
+seuset <- CellCycleScoring(seuset, s.features = s.genes, g2m.features = g2m.genes, set.ident = FALSE)
+
+
+# These are now standard steps in the Seurat workflow for visualization and clustering
+seuset <- RunPCA(seuset, verbose = FALSE)
+ElbowPlot(object = seuset, ndims = 30)
+seuset <- RunUMAP(seuset, dims = 1:30, verbose = FALSE)
+
+seuset <- FindNeighbors(seuset, dims = 1:30, verbose = FALSE)
+seuset <- FindClusters(seuset, verbose = FALSE,resolution = 1)
+
+seuset_hou <- seuset
+```
+
+#### UMAP visualisation
+
+Extract the UMAP dimension
+
+```{r}
+umap.df <- as.data.frame(Embeddings(object = seuset, reduction = "umap")) %>%
+  #tibble::rownames_to_column(var="Cell") %>%
+  cbind(seuset[[]]) 
+
+
+# Subset based on sorted population
+p1 <- 
+  ggplot(umap.df, aes(x=UMAP_1, y=UMAP_2, colour=condition)) +
+  geom_point() +
+  gghighlight(use_direct_label = FALSE) +
+  theme(legend.position = "right") +
+  facet_wrap(~condition) +
+  theme_bw() +
+  #scale_colour_manual(values=pal.pop2_sub) + 
+  labs(title="Highlighting the FACS population")
+
+p2 <- 
+  ggplot(umap.df, aes(x=UMAP_1, y=UMAP_2, colour=seurat_clusters)) +
+  geom_point() +
+  gghighlight(use_direct_label = FALSE) +
+  theme(legend.position = "right") +
+  facet_wrap(~seurat_clusters) +
+  theme_bw() +
+  #scale_colour_manual(values=pal.pop2_sub) + 
+  labs(title="Highlighting the in silico clusters")
+
+png(file.path(outDir_Hou, "UMAP_condition.png"), width=1200, height=900)
+p1
+dev.off()
+
+png(file.path(outDir_Hou, "UMAP_cluster.png"), width=1200, height=900)
+p2
+dev.off()
+
+```
+
+## Vink 2020 
+
+
+The original publication of this paper is from https://pubmed.ncbi.nlm.nih.gov/32402290/. However we downloaded this data from SRA
+
+
+```{r}
+outDir_Vink <- file.path(outDir_cur, "Vink_2020")
+dir.create(outDir_Vink)
+```
+
+
+
+There was no processed data provided, so we download the data from GEO
+
+```{bash, eval=FALSE}
+# 1) Donaload the list of SRA files
+# 2) Use the sratoolkit module in cluster to download the SRA files
+#  A table of files we want to download is in the data folder
+prefetch --option-file SraAccList.txt
+
+# Once data is downloaded by prefetch, we need to process using fasstq-dump convert SRA file to fasta file
+fastq-dump --split-e  SRR1922583.sra
+
+# Then we map the data with STAR solo, as we have done with the Next-seq and Smart-Seq2 data
+# To map with star solo, we need to supply the manifest file ls -1 $PWD/* > ../tmp.list.txt
+```
+
+
+Generate the single cell object
+
+```{r}
+vink.sce <- DropletUtils::read10xCounts(file.path(dataDir, "publicData/Vink_STARsolo/filtered"))
+se <- vink.sce
+```
+
+
+To annotate the genes further, we import the GTF file
+
+```{r}
+simple_gtf <- read.delim(file.path(outDir, "out_data/simple_gtf.txt"))
+
+# Combine GTF with sc object
+simple_gtf_sub <- simple_gtf %>%
+  select(gene_id, gene_type, seqnames)
+rD <- rowData(se) %>%
+  as.data.frame() %>%
+  left_join(simple_gtf_sub, by = c("ID" = "gene_id"))
+```
+
+
+Add cell metaData
+
+```{r}
+# Read the file accompanying the SRA file
+mData_SRA <- read.csv(file.path(dataDir, "publicData/GEO_dowload/Vink_2020/SraRunTable_Vink_2020.csv"))
+# Read the manifest file used as input to STAR solo
+mData_starSolo <- read.delim(file.path(dataDir, "publicData/GEO_dowload/Vink_2020/manifest_Vink.txt"),header=FALSE)
+
+# We need to link the SRA name with the population identifier (eg T1 pre-HSC, T2 pre-HSC) with the name of the cells as named by STARsolo during mapping
+mData_1<- mData_SRA %>%
+  dplyr::select(Run, condition, Days)
+mData_2 <- mData_starSolo %>%
+  mutate(Run = gsub(".fastq", "", V1),
+         Run = gsub(".*Vink_2020/", "", Run)) %>%
+  dplyr::rename(Barcode = V3) %>%
+  dplyr::select(Run, Barcode)
+mData_comb <- left_join(mData_1, mData_2)
+
+
+# Combine with cell annotation
+cD <- colData(se) %>%
+  as.data.frame() %>%
+  left_join(mData_comb, by = c("Barcode" = "Barcode")) %>%
+  dplyr::select(-Sample) #%>%
+  #dplyr::rename(condition = cell_type)
+```
+
+Not of the populations in the Vink data. G2V: Gata2IRESVenus reporter
+
+  * G2VInt - Intermediate
+  * G2VLo - Low
+  * CD27+ - CD27 pos cells
+
+```{r}
+table(cD$condition)
+```
+
+
+Add new colData and rowData to se object
+
+```{r}
+colData(se) <- DataFrame(cD)
+rowData(se) <- DataFrame(rD)
+```
+
+
+### Filtering low-quality cells
+
+Our first aim is to remove low-quality cells. For all of the run, we apply a threshold to filter the cells. We will use the follwoing 
+
+* Number of genes detected
+* Percentage of Mitochondira reads
+* Percentage of Hemoglobin (Hbb) genes
+
+
+
+Find the QC of specific genes
+
+```{r}
+# Specific the location
+MT_gene <- rD$seqnames == "chrM"
+Hbbs <- rD[grepl("Hb[a-b]", rD$Symbol),] %>% pull(Symbol)
+Hbbs <- c(Hbbs, "Gypa")
+#Hbbs <- c("Hba-x", "Hbb-bh1", "Hbb-y", "Hba-a1")
+
+# Get the Ens ID
+Hb_ens <- rD %>%
+  dplyr::filter(Symbol %in% Hbbs)
+Hbb_gene <- rowData(se)$ID %in% Hb_ens$ID
+```
+
+We examine the distibution of the data in all the run
+
+```{r}
+df_cData <- 
+  perCellQCMetrics(se,
+                   subsets=list(Mito=MT_gene,
+                                Hbb=Hbb_gene)) %>%
+  cbind(as.data.frame(colData(se))) %>%
+  as.data.frame() %>%
+  dplyr::mutate(Cell = colnames(se))
+
+
+# To plot select a subset of columns
+df_cData_sub <- as.data.frame(df_cData) %>%
+  #tibble::rownames_to_column(var = "Cell") %>%
+  dplyr::select(Barcode, sum, detected, subsets_Mito_percent, subsets_Hbb_percent, condition)
+
+m <- melt(df_cData_sub)
+```
+Plot the distribution 
+
+```{r}
+ggplot(m, aes(x=condition, y=value, colour=condition)) +
+  geom_boxplot(aes(),fill=NA) +
+  geom_quasirandom(dodge.width=0.75) +
+  theme_bw()  +
+  facet_wrap(~variable, scales = "free_y") +
+  theme(axis.text.x = element_text(angle = 45)) +
+  NULL
+```
+
+
+Lets apply a cut-off
+
+```{r}
+df_cData_fil <- df_cData_sub %>%
+  dplyr::filter(
+    detected > 2000,
+    subsets_Mito_percent < 15,
+    subsets_Hbb_percent < 10)
+```
+
+
+Subset the sc object
+
+```{r}
+se <- se[,se$Barcode %in% df_cData_fil$Barcode]
+```
+
+
+### Filtering lowly-expressed genes
+
+> To do, there is no filtering of lowly-expresed genes in Seurat?
+
+#### Convert to gene symbol 
+
+To enable a user-friendly analysis, it is convenient to exchange the ENSEMBL IDs with the name of the genes. 
+
+For duplicated gene names, we merge them with the ENSEMBL IDs to avoid confusion.
+
+
+```{r}
+new.row.names <- uniquifyFeatureNames(
+    rowData(se)$ID,
+    rowData(se)$Symbol
+)
+
+rownames(se) <- new.row.names
+head(rownames(se), 5)
+
+se_Vink <- se
+```
+
+
+### Quick seurat
+
+```{r}
+colnames(se) <- se$Barcode
+seu <- 
+  Seurat::CreateSeuratObject(counts = assay(se, "counts"), 
+                     project = "Vink", 
+                     meta.data = as.data.frame(colData(se)),
+                     min.cells = 3, min.features = 200)
+# Colour scheme
+#pal.pop2_sub <- df_pal_pop2 %>%
+#  dplyr::filter(Population %in% se2$condition) %>% pull(Col)
+
+
+seuset <- NormalizeData(
+  object = seu, 
+  normalization.method = "LogNormalize", 
+  scale.factor = 10000
+)
+# Feature selections
+seuset <- 
+  FindVariableFeatures(object = seuset, selection.method = "vst", nfeatures = 2500)
+# Scaling the data
+all.genes <- rownames(x = seuset)
+seuset <- ScaleData(object = seuset, features = all.genes)
+seuset <- CellCycleScoring(seuset, s.features = s.genes, g2m.features = g2m.genes, set.ident = FALSE)
+
+
+# These are now standard steps in the Seurat workflow for visualization and clustering
+seuset <- RunPCA(seuset, verbose = FALSE)
+ElbowPlot(object = seuset, ndims = 30)
+seuset <- RunUMAP(seuset, dims = 1:30, verbose = FALSE)
+
+seuset <- FindNeighbors(seuset, dims = 1:30, verbose = FALSE)
+seuset <- FindClusters(seuset, verbose = FALSE)
+
+seuset_vink <- seuset
+```
+
+#### UMAP visualisation
+
+Extract the UMAP dimension
+
+```{r}
+umap.df <- as.data.frame(Embeddings(object = seuset, reduction = "umap")) %>%
+  tibble::rownames_to_column(var="Cell") %>%
+  cbind(seuset[[]]) 
+
+umap.df_full <- umap.df
+
+# Subset based on sorted population
+p1 <- 
+  ggplot(umap.df, aes(x=UMAP_1, y=UMAP_2, colour=condition)) +
+  geom_point() +
+  gghighlight(use_direct_label = FALSE) +
+  theme(legend.position = "right") +
+  facet_wrap(~condition) +
+  theme_bw() +
+  #scale_colour_manual(values=pal.pop2_sub) + 
+  labs(title="Highlighting the FACS population")
+
+p1.1 <- 
+  ggplot(umap.df, aes(x=UMAP_1, y=UMAP_2, colour=Days)) +
+  geom_point() +
+  gghighlight(use_direct_label = FALSE) +
+  theme(legend.position = "right") +
+  facet_wrap(~condition) +
+  theme_bw() +
+  #scale_colour_manual(values=pal.pop2_sub) + 
+  labs(title="Highlighting the FACS population")
+
+p1.2 <- 
+  ggplot(umap.df, aes(x=UMAP_1, y=UMAP_2, colour=Phase)) +
+  geom_point() +
+  gghighlight(use_direct_label = FALSE) +
+  theme(legend.position = "right") +
+  facet_wrap(~condition) +
+  theme_bw() +
+  #scale_colour_manual(values=pal.pop2_sub) + 
+  labs(title="Highlighting the FACS population")
+
+p2 <- 
+  ggplot(umap.df, aes(x=UMAP_1, y=UMAP_2, colour=seurat_clusters)) +
+  geom_point() +
+  gghighlight(use_direct_label = FALSE) +
+  theme(legend.position = "right") +
+  facet_wrap(~seurat_clusters) +
+  theme_bw() +
+  #scale_colour_manual(values=pal.pop2_sub) + 
+  labs(title="Highlighting the in silico clusters")
+
+png(file.path(outDir_Vink, "UMAP_condition.png"), width=900, height=450)
+p1
+dev.off()
+
+png(file.path(outDir_Vink, "UMAP_conditionDays.png"), width=900, height=450)
+p1.1
+dev.off()
+
+png(file.path(outDir_Vink, "UMAP_conditionCC.png"), width=900, height=450)
+p1.2
+dev.off()
+
+png(file.path(outDir_Vink, "UMAP_cluster.png"), width=1200, height=900)
+p2
+dev.off()
+```
+
+
+#### Filtering clusters
+
+
+```{r}
+outDir_Vink_fil <- file.path(outDir_Vink, "filtered")
+dir.create(outDir_Vink_fil)
+```
+
+Find marker genes
+
+```{r}
+su.markers <- 
+  FindAllMarkers(seuset, only.pos = TRUE, min.pct = 0.25, logfc.threshold = 0.25)
+write.csv(su.markers, file.path(outDir_Vink, "MarkerGenes.csv"))
+```
+
+Plot some genes
+
+```{r}
+png(file.path(outDir_Vink, "EgGenes_Set1.png"), height = 1000, width = 1400)
+FeaturePlot(seuset, features = gg1, pt.size = 1, ncol = 3)
+dev.off()
+
+png(file.path(outDir_Vink, "EgGenes_Set2.png"), height = 1000, width = 1400)
+FeaturePlot(seuset, features = gg2, pt.size = 1, ncol = 3)
+dev.off()
+
+png(file.path(outDir_Vink, "EgGenes_Set3.png"), height = 1000, width = 1400)
+FeaturePlot(seuset, features = gg3, pt.size = 1, ncol = 3)
+dev.off()
+
+png(file.path(outDir_Vink, "EgGenes_Set4.png"), height = 800, width = 1400)
+FeaturePlot(seuset, features = gg4, pt.size = 1, ncol = 3)
+dev.off()
+```
+
+
+Cluster 5 showed no expression of CD27 and very high expression of Macrophage (Fcr gene family) expression. So we remove all cluster 5
+
+```{r}
+seuset <- seuset[,!seuset$seurat_clusters == "5"]
+```
+
+Also filter to only retain CD27+ cells
+
+```{r}
+umap.df_sub <- umap.df %>%
+  dplyr::filter(UMAP_1 < 0) %>%
+  dplyr::filter(condition == "CD27+")
+
+
+seuset <- seuset[, seuset$Barcode %in% umap.df_sub$Barcode]
+```
+
+
+Re-run clustering and variable genes
+
+```{r}
+# Feature selections
+seuset <- 
+  FindVariableFeatures(object = seuset, selection.method = "vst", nfeatures = 2500)
+# Scaling the data
+all.genes <- rownames(x = seuset)
+seuset <- ScaleData(object = seuset, features = all.genes)
+
+
+# These are now standard steps in the Seurat workflow for visualization and clustering
+seuset <- RunPCA(seuset, verbose = FALSE)
+ElbowPlot(object = seuset, ndims = 30)
+seuset <- RunUMAP(seuset, dims = 1:30, verbose = FALSE)
+
+seuset <- FindNeighbors(seuset, dims = 1:30, verbose = FALSE)
+seuset <- FindClusters(seuset, verbose = FALSE, resolution = 1)
+
+seuset_vink <- seuset
+
+
+umap.df <- as.data.frame(Embeddings(object = seuset, reduction = "umap")) %>%
+  tibble::rownames_to_column(var="Cell") %>%
+  cbind(seuset[[]]) 
+
+# Subset based on sorted population
+p1 <- 
+  ggplot(umap.df, aes(x=UMAP_1, y=UMAP_2, colour=condition)) +
+  geom_point() +
+  gghighlight(use_direct_label = FALSE) +
+  theme(legend.position = "right") +
+  facet_wrap(~condition) +
+  theme_bw() +
+  #scale_colour_manual(values=pal.pop2_sub) + 
+  labs(title="Highlighting the FACS population")
+
+p1.1 <- 
+  ggplot(umap.df, aes(x=UMAP_1, y=UMAP_2, colour=Days)) +
+  geom_point() +
+  gghighlight(use_direct_label = FALSE) +
+  theme(legend.position = "right") +
+  facet_wrap(~condition) +
+  theme_bw() +
+  #scale_colour_manual(values=pal.pop2_sub) + 
+  labs(title="Highlighting the FACS population")
+
+p1.2 <- 
+  ggplot(umap.df, aes(x=UMAP_1, y=UMAP_2, colour=Phase)) +
+  geom_point() +
+  gghighlight(use_direct_label = FALSE) +
+  theme(legend.position = "right") +
+  facet_wrap(~condition) +
+  theme_bw() +
+  #scale_colour_manual(values=pal.pop2_sub) + 
+  labs(title="Highlighting the FACS population")
+
+p2 <- 
+  ggplot(umap.df, aes(x=UMAP_1, y=UMAP_2, colour=seurat_clusters)) +
+  geom_point() +
+  gghighlight(use_direct_label = FALSE) +
+  theme(legend.position = "right") +
+  facet_wrap(~seurat_clusters) +
+  theme_bw() +
+  #scale_colour_manual(values=pal.pop2_sub) + 
+  labs(title="Highlighting the in silico clusters")
+
+png(file.path(outDir_Vink_fil, "UMAP_condition_afterFilter_01.png"), width=900, height=450)
+p1
+dev.off()
+
+png(file.path(outDir_Vink_fil, "UMAP_conditionDays_afterFilter_01.png"), width=900, height=450)
+p1.1
+dev.off()
+
+png(file.path(outDir_Vink_fil, "UMAP_conditionCC_afterFilter_01.png"), width=900, height=450)
+p1.2
+dev.off()
+
+png(file.path(outDir_Vink_fil, "UMAP_cluster_afterFilter_01.png"), width=1200, height=900)
+p2
+dev.off()
+
+
+png(file.path(outDir_Vink_fil, "EgGenes_Set1.png"), height = 1000, width = 1400)
+FeaturePlot(seuset, features = gg1, pt.size = 1, ncol = 3)
+dev.off()
+
+png(file.path(outDir_Vink_fil, "EgGenes_Set2.png"), height = 1000, width = 1400)
+FeaturePlot(seuset, features = gg2, pt.size = 1, ncol = 3)
+dev.off()
+
+png(file.path(outDir_Vink_fil, "EgGenes_Set3.png"), height = 1000, width = 1400)
+FeaturePlot(seuset, features = gg3, pt.size = 1, ncol = 3)
+dev.off()
+
+png(file.path(outDir_Vink_fil, "EgGenes_Set4.png"), height = 800, width = 1400)
+FeaturePlot(seuset, features = gg4, pt.size = 1, ncol = 3)
+dev.off()
+```
+#### Filtering cont
+
+
+
+Re-run cluster
+
+```{r}
+su.markers <- 
+  FindAllMarkers(seuset, only.pos = TRUE, min.pct = 0.25, logfc.threshold = 0.25)
+write.csv(su.markers, file.path(outDir_Vink_fil, "MarkerGenes_filtered_01.csv"))
+
+su.markers %>%
+    group_by(cluster) %>%
+    top_n(n = 10, wt = avg_log2FC) %>%
+  pull(gene) %>% unique() -> top10
+
+
+png(file.path(outDir_Vink_fil, "Top_ClusterDEG_DotPlot.png"), height = 700, width = 1500)
+DotPlot(seuset, features = (top10), dot.scale = 6) + RotatedAxis() +
+  scale_colour_gradient2(low = "#FF00FF", mid = "#000000", high = "#FFFF00") 
+dev.off()
+```
+
+Plot final sleection
+
+```{r}
+umap.df_full <- umap.df_full %>%
+  mutate(isSel = if_else(Barcode %in% umap.df$Barcode, "Selected", "Discard"))
+
+#SelCells <- umap.df %>%
+#  dplyr::filter(UMAP_1 <=0 ) %>%
+#  pull(Cell)
+
+p2 <- 
+  ggplot(umap.df_full, aes(x=UMAP_1, y=UMAP_2, colour=isSel)) +
+  geom_point() +
+  #gghighlight(use_direct_label = FALSE) +
+  theme(legend.position = "right") +
+  #facet_wrap(~seurat_clusters) +
+  theme_bw() +
+  #scale_colour_manual(values=pal.pop2_sub) + 
+  labs(title="Highlighting the in silico clusters")
+
+png(file.path(outDir_Vink_fil, "UMAP_cluster_Selected.png"), width=450, height=450)
+p2
+dev.off()
+
+#seuset_vink <- seuset[, seuset$Barcode %in% SelCells]
+
+#seuset_vink <- 
+#  FindVariableFeatures(object = seuset_vink, selection.method = "vst", nfeatures = 2500)
+# Scaling the data
+#all.genes <- rownames(x = seuset_vink)
+#seuset_vink <- ScaleData(object = seuset_vink, features = all.genes)
+
+seuset_vink <- seuset
+
+```
+
+## Clean up
+
+
+## Save 
+
+Now we have to exit the R-session due to memory limit. The integration will be performed in the next Rmarkdown file
+
+Save all the filtered publicly availble data for future integration use
+
+```{r,eval=TRUE}
+save(seuset_nova, seuset_next, seu_nancy, seu_8.25_sub, seu_8.5_sub, seu_9.5_sub, 
+     seuset_zhou, seuset_hou, seuset_vink, seuset_pijuan,
+     file=file.path(outData_dir, "ForIntegration_InHouse_Public.Rdata"))
+saveRDS(seuset_pijuan, file.path(outData_dir, "seuset_pijuan.RDS"))
+saveRDS(df_cData_nova, file.path(outData_dir, "cellQC_NovaSeq.RDS"))
+#load(file.path(outData_dir, "ForIntegration_InHouse_Public.Rdata"))
+```
+
+
+
+## Session Info
+
+```{r}
+sessionInfo()
+```

@@ -1,0 +1,3507 @@
+---
+title: "Finalise paper"
+author: "Zaki"
+output:
+  html_document:
+    self_contained: yes
+    toc: true
+    toc_float: true
+    df_print: paged
+    number_sections: false
+editor_options: 
+  chunk_output_type: console
+---
+```{r setup, echo=FALSE, message=FALSE, results='hide'}
+library(knitr)
+knitr::opts_chunk$set(cache=TRUE, error=FALSE, cache.lazy = TRUE)
+```
+
+# Introduction 
+
+Michael is looking to finalize th YS and AGM paper. We need some extra analysis done. 
+
+
+# Objective
+
+1) Cell metrics 
+2) Unique HE signature
+3) Consensus HE signature
+4) Compile HE signature
+
+## Prepare the environment
+
+```{r , warning=FALSE, message=FALSE}
+# Data wrangling
+library(tidyverse)
+library(readxl)
+library(reshape2)
+
+# Plots
+library(ggplot2)
+library(patchwork)
+library(gghighlight)
+library(ggbeeswarm)
+library(gghighlight)
+library(ggside)
+library(ggsignif)
+
+# sc
+library(scater)
+library(UCell)
+
+# Palettes
+library(paletteer)
+
+# DE
+library(limma)
+library(edgeR)
+
+# Read nancy
+library(Matrix)
+
+# Heatmap
+library(ComplexHeatmap)
+
+```
+
+
+Specify the work directory
+
+```{r}
+wd <- list()
+set.seed(123)
+wd$main <- getwd()
+wd$main <- "/Users/zakiwilmot/Library/CloudStorage/Box-Box/Projects/_non_HCI/NanoPore/2021_06_01_MZ_016/" # Problem when running r markdown - manual fix, just specify the full path
+
+
+
+
+print(wd$main)
+wd$data <- file.path(wd$main, "data")
+wd$out <- file.path(wd$main, "output")
+wd$shiny <- file.path(wd$data, "shiny/AGM_YS_dataset_2/data")
+
+# out data (location to save future data)
+wd$outData <- file.path(wd$out, "out_data")
+
+wd$cur <- file.path(wd$out, "Chapter_10_ForPaper")
+dir.create(wd$cur)
+
+```
+
+Load functions
+
+```{r}
+source(file.path(wd$main, "functions.R"))
+
+pal.cl <-  c(
+        # AGM
+      '#C7F0F6', # AGM arterial endo
+      "#A5AA99", "#A8786E", "#848484", "#5B5043", # Runx1:pre-HE, Gfi1:HE, EHT, IAHC
+      
+      # MIDDLE ARM (YS similar to AGM)
+      '#4CB8E0', "#F1BA88", '#FA8775',
+      
+      # RIGHT ARM (YS ARM)
+      '#898ace', # YS endo
+      '#00794F','#8CD17D', 
+      
+      # Progenitor 
+      "#D4A6C8", "#631879")
+
+
+# Cluster
+df_pal_cl = data.frame(
+  Meta =c(
+    "AGM_VE",
+    "AGM_1", "AGM_2", "AGM_3", "AGM_4", "AGM_5",
+    "mix", 
+    "YS_m1", "YS_m2",
+    "YS_b1", "YS_b2", "YS_b3",
+    "YS_p1", "YS_p2",
+    "YS_EMP", "YS_LMP"),
+  Col = c(
+    
+    # AGM ARM
+    '#4E79A7', # AGM Venous
+    
+    '#87afb5', # AGM ACE
+    #"#A5AA99", "#A8786E", "#848484", "#5B5043", # Runx1:pre-HE, Gfi1:HE, EHT, IAHC
+    'grey70', 'grey30', '#A8786E', 'black',
+    
+    # MIX
+    '#4CB8E0',
+    
+    # MIDDLE middle arm (YS similar to AGM)
+    "#F1BA88", '#FA8775',
+    
+    # RIGHT ARM (YS ARM)
+    '#898ace', # YS endo
+    '#00794F','#8CD17D', 
+    
+    # Progenitor 
+    "#D4A6C8", "#631879",
+    
+    # EMP & LMP
+    #"#702F7D", "#F148D0"))
+    "#f6b26b", "#f66d6b"))
+
+pal.full <- df_pal_cl %>% pull(Col)
+```
+
+### Genes categories
+
+We download the list of transcription factors from two site http://fantom.gsc.riken.jp/5/sstar/Browse_Transcription_Factors_mm9 and http://genome.gsc.riken.jp/TFdb/tf_list.html. The list of cell surfurce marker from here http://wlab.ethz.ch/cspa/#downloads (CSPA validated surfaceome proteins). We read the following file into R.
+
+
+Read list of cell surface genes
+
+```{r}
+df_cs <- read.delim(file.path(wd$data, "Others/RM_cur_CS_mouse.txt"), stringsAsFactors = FALSE)
+```
+
+Read list of transcription factors
+
+```{r}
+tf_dat <- read.csv(file.path(wd$data, "Others/TF_listRiken.csv"))
+tf_dat2 <- read.delim(file.path(wd$data, "Others/TF_list.txt"))
+
+tf_dat$Symbol <- toupper(tf_dat$Symbol)
+tf_dat2$Symbol <- toupper(tf_dat2$Symbol)
+tf_all <- unique(c(tf_dat$Symbol, tf_dat2$Symbol))
+# Lower case
+tf_all2 <- tolower(tf_all)
+tf_all2 <- as.character(mapply(simpleCap, tf_all2))
+```
+
+Dowload list of secreted factors from [here](http://proteomics.ysu.edu/secretomes/animal/index.php). We compile the genes considered as: Curated secreted, highly likely secreted, likely secreted. As the list were downloaded based on UniPort ID, we convert to Gene symbol. 
+
+```{r,eval=FALSE}
+# Just do this once
+s1 <- read.delim(file.path(wd$data, "Others/funseckb2_curated_secreted.txt"), stringsAsFactors = FALSE, header=F)
+s2 <- read.delim(file.path(wd$data, "Others/funseckb2_highly_likely_secreted.txt"), stringsAsFactors = FALSE, header=F)
+s3 <- read.delim(file.path(wd$data, "Others/funseckb2_likely_secreted.txt"), stringsAsFactors = FALSE, header=F)
+
+s_all <- unique(c(s1$V1, s2$V1, s3$V1))
+
+# Convert to gene symbol
+library(biomaRt)
+ensembl <- useEnsembl(biomart = "genes")
+ensembl <- useEnsembl(biomart = "genes", dataset = "mmusculus_gene_ensembl")
+df_mart <-
+  biomaRt::getBM(attributes = c('uniprotswissprot','external_gene_name'), 
+      filters = 'uniprotswissprot', 
+      values = s_all,
+      mart = ensembl)
+
+write.csv(df_mart, file=file.path(wd$data, "Others/Secreted.csv"))
+```
+
+
+Load the processed secreted factor list 
+
+```{r}
+df_sec <- read.csv(file.path(wd$data, "Others/Secreted.csv")) 
+sec_g <- df_sec %>% pull(external_gene_name) %>% unique() %>% 
+  as.character(mapply(simpleCap, .))
+```
+
+
+
+# Objective 1
+
+* **Consensus HE signature**
+
+To recap how the data looks like we re-plot the UMAP layout. 
+
+
+```{r}
+# Load the UMAP data and the single cell object
+se <- readRDS(file.path(wd$outData, "se_YS_AGM_final.RDS"))
+df_dim <- readRDS(file.path(wd$outData, "MetaData_YS_AGM_final.RDS"))
+```
+
+Load full scRNA-seq data, with venous and EMP + LMP
+
+```{r}
+se.full <- readRDS(file.path(wd$shiny, "se_shiny.RDS"))
+```
+
+
+Re-plot the UMAP
+
+
+```{r}
+pUMAP <- 
+ggplot(df_dim, aes(x=UMAP_2_sub, y=UMAP_1_sub, colour=ComFinal)) +
+  geom_point(size=0.5) +
+  gghighlight(use_direct_label = FALSE) +
+  theme(legend.position = "right") +
+  theme_custom +
+  scale_colour_manual(values=pal.cl) + 
+  labs(title="Highlighting the in_silico_clusters")
+pUMAP
+
+ggsave(pUMAP, filename = file.path(wd$cur, "UMAP_clusters.pdf"), device = "pdf", 
+       width = 6, height = 4, dpi = 300)
+```
+
+## Cell QC metrics
+
+First we look at some metrics of the cells in each population. 
+
+- Sequencing depth  
+- Number of genes per-cell  
+
+Generate qc metrics
+
+
+```{r}
+qc_cell <-  perCellQCMetrics(se.full)
+df_plot <- cbind(qc_cell, colData(se.full)) %>% as.data.frame()
+```
+
+## Sequencing depth
+
+Read the number of sequencing reads per-cell
+
+```{r}
+gl34 <- read_xlsx(file.path(wd$data, "fromMBCF/run_summary/090217_0228_GL34_run_summary.xlsx"),
+                sheet=1, skip=55) %>%
+  dplyr::rename(Cell = 'Sample ID', TotalReads = 'Total Reads PF (M)') %>%
+  select(Cell, TotalReads)
+gl36 <- read_xlsx(file.path(wd$data, "fromMBCF/run_summary/130917_0263_GL36_run_summary.xlsx"),
+                sheet=1, skip=52)  %>%
+  dplyr::rename(Cell = 'Sample ID', TotalReads = 'Total Reads PF (M)') %>%
+  select(Cell, TotalReads)
+gl37 <- read_xlsx(file.path(wd$data, "fromMBCF/run_summary/050917_0260_GL37_run_summary.xlsx"),
+                sheet=1, skip=52) %>%
+    dplyr::rename(Cell = 'Sample ID', TotalReads = 'Total Reads PF (M)') %>%
+  select(Cell, TotalReads)
+gl43 <- read_xlsx(file.path(wd$data, "fromMBCF/run_summary/080219_0405_GL43_run_summary.xlsx"),
+                sheet=1, skip=52) %>%
+    dplyr::rename(Cell = 'Sample ID', TotalReads = 'Total reads PF (M)') %>%
+  select(Cell, TotalReads)
+# GL69 has multiple runs
+gl69_1 <- read_xlsx(file.path(wd$data, "fromMBCF/run_summary/AHWMLMDRXX_201216_0028_GL69_run_summary.xlsx"),
+                sheet=2, skip=6) %>%
+    dplyr::rename(Cell = 'Sample ID', TotalReads = 'Reads PF (M)') %>%
+  select(Cell, TotalReads)
+gl69_2 <- read_xlsx(file.path(wd$data, "fromMBCF/run_summary/AHY72HDRXX_10505_0052_GL69_run_summary.xlsx"),
+                sheet=2, skip=6) %>%
+    dplyr::rename(Cell = 'Sample ID', TotalReads = 'Reads PF (M)') %>%
+  select(Cell, TotalReads)
+gl69_3 <- read_xlsx(file.path(wd$data, "fromMBCF/run_summary/BHT2VKDRXX_201002_0017_GL69_run_summary.xlsx"),
+                sheet=1, skip=43) %>%
+    dplyr::rename(Cell = 'Sample ID', TotalReads = 'Reads PF(M)') %>%
+  select(Cell, TotalReads)
+gl69_4 <- read_xlsx(file.path(wd$data, "fromMBCF/run_summary/AHTJWMDRXX_201023_0020_GL69_run_summary.xlsx"),
+                sheet=1, skip=46) %>%
+    dplyr::rename(Cell = 'Sample ID', TotalReads = 'Reads PF(M)') %>%
+  select(Cell, TotalReads)
+
+gl_all <- rbind(gl34,gl36,gl37,gl43,
+                gl69_1, gl69_2, gl69_3, gl69_4)
+```
+
+Make a matching name between our current data and the name of the Cells from the sequencing depth data
+
+```{r}
+gl_all <- gl_all %>%
+  mutate(
+    NewName =gsub("_GL.*", "", Cell),
+    NewName =gsub("_WN.*", "", NewName),
+    NewName =gsub("_SN.*", "", NewName),
+    NewName =gsub("_plate.*", "", NewName),
+    NewName =gsub("_Plate.*", "", NewName)
+    
+    )
+
+df_plot <- df_plot %>%
+  mutate(
+    NewName =gsub("_GL.*", "", FullName),
+    NewName =gsub("_WN.*", "", NewName),
+    NewName =gsub("_SN.*", "", NewName),
+    NewName =gsub("_plate.*", "", NewName),
+    NewName =gsub("_Plate.*", "", NewName)
+    )
+
+df_plot <- df_plot %>% left_join(gl_all) %>%
+  mutate(TotalReads = as.numeric(TotalReads))
+#write.csv(df_plot2, "~/Desktop/tmp.csv")
+```
+
+
+Plot number of sequencing reads
+
+```{r}
+p0 <-
+  ggplot(df_plot, aes(x = in_silico_clusters, y = TotalReads, fill = in_silico_clusters)) +
+  geom_quasirandom(groupOnX=TRUE, size = 0.8, alpha = 0.5, width = 0.4) +
+  geom_violin(alpha = 0.5, scale = "width", position = position_dodge(width = 0.9)) +
+  geom_boxplot(alpha = 0.5, width = 0.2, position = position_dodge(width = 0.9),
+               outlier.shape=NA) +
+  scale_fill_manual(values=unique(pal.full)) +
+  theme_bw() +
+  theme(legend.position = "none",
+        panel.grid.major = element_line(linetype = "blank"), 
+        panel.grid.minor = element_line(linetype = "blank"),
+        axis.text.x = element_text(angle = 45, hjust = 1)) +
+  xlab("") +
+  ylab("# Sequencing reads (Millions)") +
+  #scale_y_continuous(labels = scales::comma) +
+  ggtitle("Number of sequencing reads") +
+  NULL
+```
+
+
+## Number of genes per-cell
+
+Lets plot the number of genes per-cell in each cluster
+
+```{r}
+p1 <-
+  ggplot(df_plot, aes(x = in_silico_clusters, y = detected, fill = in_silico_clusters)) +
+  geom_quasirandom(groupOnX=TRUE, size = 0.8, alpha = 0.5, width = 0.4) +
+  geom_violin(alpha = 0.5, scale = "width", position = position_dodge(width = 0.9)) +
+  geom_boxplot(alpha = 0.5, width = 0.2, position = position_dodge(width = 0.9),
+               outlier.shape=NA) +
+  scale_fill_manual(values=unique(pal.full)) +
+  theme_bw() +
+  theme(legend.position = "none",
+        panel.grid.major = element_line(linetype = "blank"), 
+        panel.grid.minor = element_line(linetype = "blank"),
+        axis.text.x = element_text(angle = 45, hjust = 1)) +
+  xlab("") +
+  ylab("# Genes detected") +
+  scale_y_continuous(labels = scales::comma) +
+  ggtitle("Number of genes detected") +
+  NULL
+
+
+```
+
+Now plot the number of reads in each cell. 
+
+```{r}
+p2 <-
+  ggplot(df_plot, aes(x = in_silico_clusters, y = total, fill = in_silico_clusters)) +
+  geom_quasirandom(groupOnX=TRUE, size = 0.8, alpha = 0.5, width = 0.4) +
+  geom_violin(alpha = 0.5, scale = "width", position = position_dodge(width = 0.9)) +
+  geom_boxplot(alpha = 0.5, width = 0.2, position = position_dodge(width = 0.9),
+               outlier.shape=NA) +
+  scale_fill_manual(values=unique(pal.full)) +
+  theme_bw() +
+  theme(legend.position = "none",
+        panel.grid.major = element_line(linetype = "blank"), 
+        panel.grid.minor = element_line(linetype = "blank"),
+        axis.text.x = element_text(angle = 45, hjust = 1)) +
+  xlab("") +
+  ylab("# of reads") +
+  scale_y_continuous(labels = scales::comma) +
+  ggtitle("Number of reads quantified") +
+  NULL
+```
+
+Save the plot
+
+```{r}
+p_com <- p1 / p0 / p2
+
+ggsave(p_com, filename = file.path(wd$cur, "Sequence_Metrics_full.pdf"), device = "pdf", 
+       width = 9, height = 12, dpi = 300)
+```
+
+
+# Objective 2
+
+* **Unique HE signature**
+
+```{r}
+# Set treshold for significance
+up_thresh <- 1.5
+dwn_thresh <- -1.5
+FDR_thresh <- 0.05
+```
+
+To get the HE signature, we perform differential expression in a few different ways 
+
+1) Run DE between main population
+2) Run DE between individual population
+
+## Gene detection
+
+We generate a data frame that shows the detection rate in all cell populations and also individual populations. We wanted to include venous endo and EMP and LMP in our calculataion. So lets get these clusters
+
+
+ > TO DO: to add venous and EMP, LMP
+
+```{r}
+sde <- se.full
+# Calculate the dropout rate in the overall single cell object
+drp_all <- scater::perFeatureQCMetrics(sde) %>%
+  as.data.frame() %>%
+  tibble::rownames_to_column(var = "UniqGeneID") %>%
+  dplyr::rename(pct_detect_all = detected,
+                MeanExp_all = mean)
+
+# In individual population
+
+p_list <- levels(sde$FinalCat)
+#p_list <- levels(p_list)
+
+
+dpt_list <- list()
+
+# Find the percentage expressing gene per-cluster
+for (i in seq_along(p_list)){
+  x <- dropOut_FinalCat(sde, p_list[i])
+  dpt_list[[i]] <- x
+}
+
+
+dpt_df <- as.data.frame(do.call(cbind, dpt_list))
+colnames(dpt_df) <- paste0("pct_detect_", p_list)
+dpt_df$UniqGeneID <- row.names(sde)
+
+rr <- as.data.frame(rowData(sde)) %>%
+  tibble::rownames_to_column(var = "UniqGeneID") %>%
+  dplyr::inner_join(dpt_df) %>%
+  dplyr::inner_join(drp_all)
+
+write.csv(rr, file.path(wd$cur, "GeneDetection.csv"))
+```
+
+Retain genes which are detected at more than x% in any (or all) of the populatons
+
+```{r}
+var_perc <- 10
+rr_sub <- rr %>% 
+  dplyr::filter_at(vars(starts_with("pct_detect")), any_vars(. >=var_perc))
+```
+
+
+## Main population
+
+```{r}
+outDir_DE_1 <- file.path(wd$cur, "Main_pop_full")
+dir.create(outDir_DE_1)
+```
+
+Here we create a limma object of the main trajectory population. 
+
+When we want to compare AGM with YS, we want to maintain the ratio of cell number in each population constant. Eg YS_m1 (n=98) and YS_m2 (n=100) is a bout 1:1. But in AGM_3 (n=41) and AGM_4 (n=23) 2:1. So generate new object where the ratio of the populations are similar. 
+
+
+```{r}
+table(se.full$FinalCat)
+
+# Randomly sample 23 cells from AGM_3
+se_AGM_3 <- se.full[,se.full$FinalCat == "AGM_3"]
+set.seed(123)
+indices <- sample(1:ncol(se_AGM_3), 18) # 41 - 23 (we want to remove 18 cells)
+se_AGM_3 <- se_AGM_3[,indices] # These are cells we would like removed
+Barcode_se_AGM_3 <- se_AGM_3$Barcode
+
+# EMP and LMP are also disproportionate
+se_EMP <- se.full[,se.full$FinalCat == "YS_EMP"]
+set.seed(123)
+indices <- sample(1:ncol(se_EMP), 21) # 108 - 87 (we want to remove 21 cells)
+se_EMP <- se_EMP[,indices] # These are cells we would like removed
+Barcode_se_EMP <- se_EMP$Barcode
+
+# Cells to remove
+rm_cell <- c(Barcode_se_AGM_3, Barcode_se_EMP)
+
+
+# Re-create object for DE
+# Subet to selected genes based on drop-out and selected cells based on the ratio
+sde <- se.full[row.names(se.full) %in% rr_sub$UniqGeneID, !se.full$Barcode %in% rm_cell]
+```
+
+
+
+Generate limma object. The grouping is based on which trajectory arm
+
+```{r}
+# Do the DE
+cD <- as.data.frame(colData(sde))
+group <- as.character(cD$FinalCat)
+
+# Refine the group
+group <- case_when(
+                   #group == "AGM_1" ~ "non_trajectory",
+                   #group == "AGM_2" ~ "non_trajectory",
+                   group == "AGM_3" ~ "AGM_arm",
+                   group == "AGM_4" ~ "AGM_arm",
+                   #group == "AGM_5" ~ "non_trajectory",
+                   
+                   #group == "mix" ~ "non_trajectory",
+                   
+                   group == "YS_m1" ~ "YS_m",
+                   group == "YS_m2" ~ "YS_m",
+                   
+                   #group == "YS_b1" ~ "non_trajectory",
+                   group == "YS_b2" ~ "YS_b",
+                   group == "YS_b3" ~ "YS_b",
+                   
+                   #group == "YS_p1" ~ "non_trajectory",
+                   #group == "YS_p2" ~ "non_trajectory")
+                   
+                   group == "YS_EMP" ~ "progenitors",
+                   group == "YS_LMP" ~ "progenitors",
+                   
+                   TRUE ~ group)
+
+
+cts <- as.matrix(assay(sde, "counts"))
+colnames(cts) <- sde$Barcode
+
+
+dge <- DGEList(counts = cts, group =group)
+dge <- calcNormFactors(dge)
+
+# Do the DE
+design <- model.matrix(~0 + group)
+vm <- voom(dge, design = design, plot = TRUE, span = 0.1)
+fit <- lmFit(vm, design)
+```
+
+
+### YS_b vs YS_m
+
+```{r}
+contrast.matrix <- makeContrasts(groupYS_b-groupYS_m, levels=design)
+fit2 <- contrasts.fit(fit, contrast.matrix)
+fit2 <- eBayes(fit2)
+# We extract the DE genes in each comparison.
+dge_m1 <- 
+  topTable(fit2, n = Inf, adjust.method = "BH", coef=1) %>%
+  tibble::rownames_to_column(var = "UniqGeneID") %>%
+  dplyr::mutate(isTF = ifelse(UniqGeneID %in% tf_all2, "TF", " "),
+                isCS = ifelse(UniqGeneID %in% df_cs$symbol, "CS", " "),
+                isSec = ifelse(UniqGeneID %in% sec_g, "Sec", " ")) 
+
+# Highlight sig genes
+Sig_genes <- dge_m1 %>% 
+  filter(adj.P.Val <= FDR_thresh) %>%
+  filter(logFC >= up_thresh | logFC <= dwn_thresh) %>%
+  pull(UniqGeneID)
+
+# Make a significant col or not
+dge_m1 <- dge_m1 %>%
+    dplyr::mutate(
+      # Convert to -log p val
+      LogpValue = -log10(adj.P.Val),
+      LogpValue = case_when(
+        is.infinite(LogpValue) ~ max(LogpValue),
+        TRUE ~ LogpValue),
+      Sig = case_when(UniqGeneID %in% Sig_genes ~ "TRUE",
+                      TRUE ~ "FALSE"))
+```
+
+### YS_b vs ENDO
+
+We compare to Endo population
+
+**Endo (YS b1) vs HE (YS b2 + b3)**
+
+```{r}
+contrast.matrix <- makeContrasts(groupYS_b-groupYS_b1, levels=design)
+fit2 <- contrasts.fit(fit, contrast.matrix)
+fit2 <- eBayes(fit2)
+# We extract the DE genes in each comparison.
+dge_endo_YSb <- 
+  topTable(fit2, n = Inf, adjust.method = "BH", coef=1) %>%
+  tibble::rownames_to_column(var = "UniqGeneID") %>%
+  dplyr::mutate(isTF = ifelse(UniqGeneID %in% tf_all2, "TF", " "),
+                isCS = ifelse(UniqGeneID %in% df_cs$symbol, "CS", " "),
+                isSec = ifelse(UniqGeneID %in% sec_g, "Sec", " ")) 
+
+# Highlight sig genes
+Sig_genes <- dge_endo_YSb %>% 
+  filter(adj.P.Val <= FDR_thresh) %>%
+  filter(logFC >= up_thresh | logFC <= dwn_thresh) %>%
+  pull(UniqGeneID)
+
+# Make a significant col or not
+dge_endo_YSb <- dge_endo_YSb %>%
+    dplyr::mutate(
+      # Convert to -log p val
+      LogpValue = -log10(adj.P.Val),
+      LogpValue = case_when(
+        is.infinite(LogpValue) ~ max(LogpValue),
+        TRUE ~ LogpValue),
+      Sig = case_when(UniqGeneID %in% Sig_genes ~ "TRUE",
+                      TRUE ~ "FALSE"))
+```
+
+
+### YS_m vs ENDO
+
+We compare to Endo population
+
+**Endo (Mix) vs HE (YS m1 + m2)**
+
+```{r}
+contrast.matrix <- makeContrasts(groupYS_m-groupmix, levels=design)
+fit2 <- contrasts.fit(fit, contrast.matrix)
+fit2 <- eBayes(fit2)
+# We extract the DE genes in each comparison.
+dge_endo_YSM <- 
+  topTable(fit2, n = Inf, adjust.method = "BH", coef=1) %>%
+  tibble::rownames_to_column(var = "UniqGeneID") %>%
+  dplyr::mutate(isTF = ifelse(UniqGeneID %in% tf_all2, "TF", " "),
+                isCS = ifelse(UniqGeneID %in% df_cs$symbol, "CS", " "),
+                isSec = ifelse(UniqGeneID %in% sec_g, "Sec", " ")) 
+
+# Highlight sig genes
+Sig_genes <- dge_endo_YSM %>% 
+  filter(adj.P.Val <= FDR_thresh) %>%
+  filter(logFC >= up_thresh | logFC <= dwn_thresh) %>%
+  pull(UniqGeneID)
+
+# Make a significant col or not
+dge_endo_YSM <- dge_endo_YSM %>%
+    dplyr::mutate(
+      # Convert to -log p val
+      LogpValue = -log10(adj.P.Val),
+      LogpValue = case_when(
+        is.infinite(LogpValue) ~ max(LogpValue),
+        TRUE ~ LogpValue),
+      Sig = case_when(UniqGeneID %in% Sig_genes ~ "TRUE",
+                      TRUE ~ "FALSE"))
+```
+
+### YS_b HE vs EMP + LMP
+
+We compare HE to EMP + LMP population
+
+**HE (YS b2 + b3) vs EMP + LMP**
+
+```{r}
+contrast.matrix <- makeContrasts(groupYS_b-groupprogenitors, levels=design)
+fit2 <- contrasts.fit(fit, contrast.matrix)
+fit2 <- eBayes(fit2)
+# We extract the DE genes in each comparison.
+dge_prog_YSb <- 
+  topTable(fit2, n = Inf, adjust.method = "BH", coef=1) %>%
+  tibble::rownames_to_column(var = "UniqGeneID") %>%
+  dplyr::mutate(isTF = ifelse(UniqGeneID %in% tf_all2, "TF", " "),
+                isCS = ifelse(UniqGeneID %in% df_cs$symbol, "CS", " "),
+                isSec = ifelse(UniqGeneID %in% sec_g, "Sec", " ")) 
+
+# Highlight sig genes
+Sig_genes <- dge_prog_YSb %>% 
+  filter(adj.P.Val <= FDR_thresh) %>%
+  filter(logFC >= up_thresh | logFC <= dwn_thresh) %>%
+  pull(UniqGeneID)
+
+# Make a significant col or not
+dge_prog_YSb <- dge_prog_YSb %>%
+    dplyr::mutate(
+      # Convert to -log p val
+      LogpValue = -log10(adj.P.Val),
+      LogpValue = case_when(
+        is.infinite(LogpValue) ~ max(LogpValue),
+        TRUE ~ LogpValue),
+      Sig = case_when(UniqGeneID %in% Sig_genes ~ "TRUE",
+                      TRUE ~ "FALSE"))
+```
+
+
+
+### YS_m  HE vs EMP + LMP
+
+We compare HE to EMP + LMP population
+
+**HE (YS m1 + m2) vs EMP + LMP**
+
+```{r}
+contrast.matrix <- makeContrasts(groupYS_m-groupprogenitors, levels=design)
+fit2 <- contrasts.fit(fit, contrast.matrix)
+fit2 <- eBayes(fit2)
+# We extract the DE genes in each comparison.
+dge_prog_YSm <- 
+  topTable(fit2, n = Inf, adjust.method = "BH", coef=1) %>%
+  tibble::rownames_to_column(var = "UniqGeneID") %>%
+  dplyr::mutate(isTF = ifelse(UniqGeneID %in% tf_all2, "TF", " "),
+                isCS = ifelse(UniqGeneID %in% df_cs$symbol, "CS", " "),
+                isSec = ifelse(UniqGeneID %in% sec_g, "Sec", " ")) 
+
+# Highlight sig genes
+Sig_genes <- dge_prog_YSm %>% 
+  filter(adj.P.Val <= FDR_thresh) %>%
+  filter(logFC >= up_thresh | logFC <= dwn_thresh) %>%
+  pull(UniqGeneID)
+
+# Make a significant col or not
+dge_prog_YSm <- dge_prog_YSm %>%
+    dplyr::mutate(
+      # Convert to -log p val
+      LogpValue = -log10(adj.P.Val),
+      LogpValue = case_when(
+        is.infinite(LogpValue) ~ max(LogpValue),
+        TRUE ~ LogpValue),
+      Sig = case_when(UniqGeneID %in% Sig_genes ~ "TRUE",
+                      TRUE ~ "FALSE"))
+```
+
+
+
+### YS_b vs AGM
+
+**Compare YS_b HE (YS b2 + b3) to AGM HE (AGM 3 + 4)**
+
+Run the DE of AGM
+
+```{r}
+contrast.matrix <- makeContrasts(groupYS_b-groupAGM_arm, levels=design)
+fit2 <- contrasts.fit(fit, contrast.matrix)
+fit2 <- eBayes(fit2)
+# We extract the DE genes in each comparison.
+dge_m2 <- 
+  topTable(fit2, n = Inf, adjust.method = "BH", coef=1) %>%
+  tibble::rownames_to_column(var = "UniqGeneID") %>%
+  dplyr::mutate(isTF = ifelse(UniqGeneID %in% tf_all2, "TF", " "),
+                isCS = ifelse(UniqGeneID %in% df_cs$symbol, "CS", " "),
+                isSec = ifelse(UniqGeneID %in% sec_g, "Sec", " ")) 
+
+# Highlight sig genes
+Sig_genes <- dge_m2 %>% 
+  filter(adj.P.Val <= FDR_thresh) %>%
+  filter(logFC >= up_thresh | logFC <= dwn_thresh) %>%
+  pull(UniqGeneID)
+
+# Make a significant col or not
+dge_m2 <- dge_m2 %>%
+    dplyr::mutate(
+      # Convert to -log p val
+      LogpValue = -log10(adj.P.Val),
+      LogpValue = case_when(
+        is.infinite(LogpValue) ~ max(LogpValue),
+        TRUE ~ LogpValue),
+      Sig = case_when(UniqGeneID %in% Sig_genes ~ "TRUE",
+                      TRUE ~ "FALSE"))
+```
+
+### AGM vs Endo
+
+**Endo (AGM 1) vs HE (AGM 3 + 4)**
+
+We use the same design matrix 
+
+```{r}
+contrast.matrix <- makeContrasts(groupAGM_arm-groupAGM_1, levels=design)
+fit2 <- contrasts.fit(fit, contrast.matrix)
+fit2 <- eBayes(fit2)
+# We extract the DE genes in each comparison.
+dge_endo_agm <- 
+  topTable(fit2, n = Inf, adjust.method = "BH", coef=1) %>%
+  tibble::rownames_to_column(var = "UniqGeneID") %>%
+  dplyr::mutate(isTF = ifelse(UniqGeneID %in% tf_all2, "TF", " "),
+                isCS = ifelse(UniqGeneID %in% df_cs$symbol, "CS", " "),
+                isSec = ifelse(UniqGeneID %in% sec_g, "Sec", " ")) 
+
+# Highlight sig genes
+Sig_genes <- dge_endo_agm %>% 
+  filter(adj.P.Val <= FDR_thresh) %>%
+  filter(logFC >= up_thresh | logFC <= dwn_thresh) %>%
+  pull(UniqGeneID)
+
+# Make a significant col or not
+dge_endo_agm <- dge_endo_agm %>%
+    dplyr::mutate(
+      # Convert to -log p val
+      LogpValue = -log10(adj.P.Val),
+      LogpValue = case_when(
+        is.infinite(LogpValue) ~ max(LogpValue),
+        TRUE ~ LogpValue),
+      Sig = case_when(UniqGeneID %in% Sig_genes ~ "TRUE",
+                      TRUE ~ "FALSE"))
+```
+
+
+### YS_m vs AGM
+
+```{r}
+contrast.matrix <- makeContrasts(groupYS_m-groupAGM_arm, levels=design)
+fit2 <- contrasts.fit(fit, contrast.matrix)
+fit2 <- eBayes(fit2)
+# We extract the DE genes in each comparison.
+dge_m3 <- 
+  topTable(fit2, n = Inf, adjust.method = "BH", coef=1) %>%
+  tibble::rownames_to_column(var = "UniqGeneID") %>%
+  dplyr::mutate(isTF = ifelse(UniqGeneID %in% tf_all2, "TF", " "),
+                isCS = ifelse(UniqGeneID %in% df_cs$symbol, "CS", " "),
+                isSec = ifelse(UniqGeneID %in% sec_g, "Sec", " ")) 
+
+# Highlight sig genes
+Sig_genes <- dge_m3 %>% 
+  filter(adj.P.Val <= FDR_thresh) %>%
+  filter(logFC >= up_thresh | logFC <= dwn_thresh) %>%
+  pull(UniqGeneID)
+
+# Make a significant col or not
+dge_m3 <- dge_m3 %>%
+    dplyr::mutate(
+      # Convert to -log p val
+      LogpValue = -log10(adj.P.Val),
+      LogpValue = case_when(
+        is.infinite(LogpValue) ~ max(LogpValue),
+        TRUE ~ LogpValue),
+      Sig = case_when(UniqGeneID %in% Sig_genes ~ "TRUE",
+                      TRUE ~ "FALSE"))
+```
+
+
+### AGM HE vs EMP + LMP 
+
+**HE (AGM 3 + 4) vs EMP + LMP**
+
+```{r}
+contrast.matrix <- makeContrasts(groupAGM_arm-groupprogenitors, levels=design)
+fit2 <- contrasts.fit(fit, contrast.matrix)
+fit2 <- eBayes(fit2)
+# We extract the DE genes in each comparison.
+dge_prog_AGM <- 
+  topTable(fit2, n = Inf, adjust.method = "BH", coef=1) %>%
+  tibble::rownames_to_column(var = "UniqGeneID") %>%
+  dplyr::mutate(isTF = ifelse(UniqGeneID %in% tf_all2, "TF", " "),
+                isCS = ifelse(UniqGeneID %in% df_cs$symbol, "CS", " "),
+                isSec = ifelse(UniqGeneID %in% sec_g, "Sec", " ")) 
+
+# Highlight sig genes
+Sig_genes <- dge_prog_AGM %>% 
+  filter(adj.P.Val <= FDR_thresh) %>%
+  filter(logFC >= up_thresh | logFC <= dwn_thresh) %>%
+  pull(UniqGeneID)
+
+# Make a significant col or not
+dge_prog_AGM <- dge_prog_AGM %>%
+    dplyr::mutate(
+      # Convert to -log p val
+      LogpValue = -log10(adj.P.Val),
+      LogpValue = case_when(
+        is.infinite(LogpValue) ~ max(LogpValue),
+        TRUE ~ LogpValue),
+      Sig = case_when(UniqGeneID %in% Sig_genes ~ "TRUE",
+                      TRUE ~ "FALSE"))
+```
+
+
+
+## Conclusion
+
+Lets make a master table of all these comparison. We also wish to indicate which genes are 'marker' of which cluster To do this, we do the following ;
+
+1) DE between two groups > 1.5 logFC & FDR <0.05
+2) NOT expressed in another population by more than 60% 
+
+
+Lets compile the list
+
+```{r}
+dge_m1_sub <- dge_m1 %>% 
+  dplyr::select(UniqGeneID, logFC, adj.P.Val, isTF, isCS, isSec) %>%
+  dplyr::rename(logFC_YSb_vs_YSm = logFC,
+                FDR_YSb_vs_YSm = adj.P.Val)
+
+dge_m2_sub <- dge_m2 %>% 
+  dplyr::select(UniqGeneID, logFC, adj.P.Val) %>%
+  dplyr::rename(logFC_YSb_vs_AGM = logFC,
+                FDR_YSb_vs_AGM = adj.P.Val)
+
+dge_m3_sub <- dge_m3 %>% 
+  dplyr::select(UniqGeneID, logFC, adj.P.Val) %>%
+  dplyr::rename(logFC_YSm_vs_AGM = logFC,
+                FDR_YSm_vs_AGM = adj.P.Val)
+
+
+# Combine with the dropout info 
+rr_sub2 <- rr_sub %>%
+  dplyr::select(pct_detect_all, pct_detect_AGM_VE:pct_detect_YS_LMP) %>%
+  round() %>%
+  dplyr::mutate(UniqGeneID = rr_sub$UniqGeneID)
+
+dge_m <- rr_sub2 %>%
+  dplyr::left_join(dge_m1_sub) %>%
+  dplyr::left_join(dge_m2_sub) %>%
+  dplyr::left_join(dge_m3_sub)
+
+# Add gene annotations
+rD <- as.data.frame(rowData(se.full))
+
+dge_m <- dge_m %>% mutate(Symbol = gsub("_.*", "", UniqGeneID))
+
+dge_m <- dge_m %>% left_join(rD)
+```
+
+### Categorization
+
+Now make the category, consider detection rate and fold change
+
+```{r}
+# Individual category
+dge_m <- dge_m %>%
+  dplyr::mutate(Cat_YSb =
+                  # High in YS_b 
+                  case_when(
+                    logFC_YSb_vs_YSm >= up_thresh & FDR_YSb_vs_YSm <= FDR_thresh  &
+                      #pct_detect_AGM_3 <= 60 & pct_detect_AGM_4 <= 60 & 
+                      pct_detect_YS_m1 <= 60 & pct_detect_YS_m2 <= 60 
+                    | 
+                      logFC_YSb_vs_AGM >= up_thresh & FDR_YSb_vs_AGM <= FDR_thresh &
+                      #pct_detect_AGM_3 <= 60 & pct_detect_AGM_4 <= 60 & 
+                      pct_detect_YS_m1 <= 60 & pct_detect_YS_m2 <= 60 ~ "YS_b",
+                    TRUE ~ " "),
+                
+                # High in YS_m 
+                Cat_YSm = 
+                  case_when(
+                    logFC_YSb_vs_YSm <= dwn_thresh & FDR_YSb_vs_YSm <= FDR_thresh &
+                      #pct_detect_AGM_3 <= 60 & pct_detect_AGM_4 <= 60 & 
+                      pct_detect_YS_b1 <= 60 & pct_detect_YS_b2 <= 60 
+                    | 
+                      logFC_YSm_vs_AGM >= up_thresh & FDR_YSm_vs_AGM <= FDR_thresh &
+                      #pct_detect_AGM_3 <= 60 & pct_detect_AGM_4 <= 60 & 
+                      pct_detect_YS_b1 <= 60 & pct_detect_YS_b2 <= 60 ~ "YS_m",
+                    TRUE ~ " "),
+                
+                # High in AGM 
+                Cat_AGM = 
+                  case_when(
+                    logFC_YSb_vs_AGM <= dwn_thresh & FDR_YSb_vs_AGM <= FDR_thresh &
+                      #pct_detect_YS_m1 <= 60 & pct_detect_YS_m2 <= 60 & 
+                      pct_detect_YS_b1 <= 60 & pct_detect_YS_b2 <= 60
+                    |
+                      logFC_YSm_vs_AGM <= dwn_thresh & FDR_YSm_vs_AGM <= FDR_thresh &
+                      #pct_detect_YS_m1 <= 60 & pct_detect_YS_m2 <= 60 & 
+                      pct_detect_YS_b1 <= 60 & pct_detect_YS_b2 <= 60 ~ "AGM",
+                    TRUE ~ " "))
+```
+
+
+Clean up a bit
+
+```{r}
+dge_m <- dge_m %>%
+  dplyr::select(UniqGeneID, Symbol, gene_type, isTF, isCS, isSec,
+                Cat_YSb, Cat_YSm, Cat_AGM,
+                logFC_YSb_vs_YSm, FDR_YSb_vs_YSm, logFC_YSb_vs_AGM:FDR_YSm_vs_AGM,
+                pct_detect_all:pct_detect_YS_LMP
+                )
+
+write.csv(dge_m, file.path(wd$cur, "DE_unique_summary.csv"))
+```
+
+### Num of DE genes
+
+We get the number of differently expressed genes in each comparison
+
+```{r}
+# ------ YS_b vs YS_m ----- #
+num_up <- filter(dge_m1, Sig == "TRUE" & logFC >= up_thresh) %>% nrow()
+num_dwn <- filter(dge_m1, Sig == "TRUE" & logFC <= dwn_thresh) %>% nrow()
+
+# Volcano plot
+pv1 <- dge_m1 %>%
+  ggplot(aes(y=LogpValue, x=logFC, colour=Sig)) +
+  geom_point(size=1, alpha=0.8) + 
+  scale_colour_manual(values=c("grey50", "red")) +
+  theme_bw() +
+  geom_vline(xintercept = up_thresh, linetype=2, alpha=0.3) +
+  geom_vline(xintercept = dwn_thresh, linetype=2, alpha=0.3) +
+  geom_hline(yintercept = -log10(FDR_thresh), linetype=2, alpha=0.3) +
+  labs(y=expression(paste("-log"[10], " Adj p-value")),
+       x=expression(paste("log"[2], " Fold Change"))) +
+  guides('colour'=guide_legend(title="Statistically significant")) +
+  theme(panel.grid.major = element_line(linetype = "blank"), 
+        panel.grid.minor = element_line(linetype = "blank"),
+        legend.position = "none") +
+  # Annotate box
+  annotate("text", 
+           x = -3, y = 75, label = paste0("High in YS_m", "\nn=", num_dwn)) +
+  annotate("text", 
+           x = 3, y = 75, label = paste0("High in YS_b", "\nn=", num_up)) +
+  ggtitle("YS_b[2-3] vs YS_m[1-2]") +
+  NULL
+
+# ------ YS_b vs AGM ----- #
+num_up <- filter(dge_m2, Sig == "TRUE" & logFC >= up_thresh) %>% nrow()
+num_dwn <- filter(dge_m2, Sig == "TRUE" & logFC <= dwn_thresh) %>% nrow()
+
+# Volcano plot
+pv2 <- dge_m2 %>%
+  ggplot(aes(y=LogpValue, x=logFC, colour=Sig)) +
+  geom_point(size=1, alpha=0.8) + 
+  scale_colour_manual(values=c("grey50", "red")) +
+  theme_bw() +
+  geom_vline(xintercept = up_thresh, linetype=2, alpha=0.3) +
+  geom_vline(xintercept = dwn_thresh, linetype=2, alpha=0.3) +
+  geom_hline(yintercept = -log10(FDR_thresh), linetype=2, alpha=0.3) +
+  labs(y=expression(paste("-log"[10], " Adj p-value")),
+       x=expression(paste("log"[2], " Fold Change"))) +
+  guides('colour'=guide_legend(title="Statistically significant")) +
+  theme(panel.grid.major = element_line(linetype = "blank"), 
+        panel.grid.minor = element_line(linetype = "blank"),
+        legend.position = "none") +
+  # Annotate box
+  annotate("text", 
+           x = -3, y = 60, label = paste0("High in AGM", "\nn=", num_dwn)) +
+  annotate("text", 
+           x = 3, y = 60, label = paste0("High in YS_b", "\nn=", num_up)) +
+  ggtitle("YS_b[2-3] vs AGM[3-4]") +
+  NULL
+
+
+# ------ YS_m vs AGM ----- #
+num_up <- filter(dge_m3, Sig == "TRUE" & logFC >= up_thresh) %>% nrow()
+num_dwn <- filter(dge_m3, Sig == "TRUE" & logFC <= dwn_thresh) %>% nrow()
+
+# Volcano plot
+pv3 <- dge_m3 %>%
+  ggplot(aes(y=LogpValue, x=logFC, colour=Sig)) +
+  geom_point(size=1, alpha=0.8) + 
+  scale_colour_manual(values=c("grey50", "red")) +
+  theme_bw() +
+  geom_vline(xintercept = up_thresh, linetype=2, alpha=0.3) +
+  geom_vline(xintercept = dwn_thresh, linetype=2, alpha=0.3) +
+  geom_hline(yintercept = -log10(FDR_thresh), linetype=2, alpha=0.3) +
+  labs(y=expression(paste("-log"[10], " Adj p-value")),
+       x=expression(paste("log"[2], " Fold Change"))) +
+  guides('colour'=guide_legend(title="Statistically significant")) +
+  theme(panel.grid.major = element_line(linetype = "blank"), 
+        panel.grid.minor = element_line(linetype = "blank"),
+        legend.position = "none") +
+  # Annotate box
+  annotate("text", 
+           x = 2.5, y = 60, label = paste0("High in YS_m", "\nn=", num_up)) +
+    annotate("text", 
+           x = -2.5, y = 60, label = paste0("High in AGM", "\nn=", num_dwn)) +
+  ggtitle("YS_m[1-2] vs AGM[3-4]") +
+  #scale_y_continuous(limits=c(0,60)) +
+  NULL
+
+pv_all <- pv1 + pv2 + pv3
+
+ggsave(pv_all, file=file.path(wd$cur, "DE_volcano_v2.pdf"), width = 12, height = 4, device = "pdf", dpi=300)
+```
+
+# Objective 3
+
+* **Consensus HE signature**
+
+To get consensus HE signature, we compare ;
+
+1) Each HE population to the respective ENDO population    
+2) Each HE population to the progenitors (EMP + LMP)   
+
+The idea is that HE should have ENDO and HEMATO identity. 
+
+
+## Conclusion 
+
+Lets compile the list
+
+```{r}
+dge_e1_sub <- dge_endo_agm %>% 
+  dplyr::select(UniqGeneID, logFC, adj.P.Val, isTF, isCS, isSec) %>%
+  dplyr::rename(logFC_AGM_HE_vs_Endo = logFC,
+                FDR_AGM_HE_vs_Endo = adj.P.Val)
+
+dge_e2_sub <- dge_endo_YSM %>% 
+  dplyr::select(UniqGeneID, logFC, adj.P.Val) %>%
+  dplyr::rename(logFC_YSm_HE_vs_Endo = logFC,
+                FDR_YSm_HE_vs_Endo = adj.P.Val)
+
+dge_e3_sub <- dge_endo_YSb %>% 
+  dplyr::select(UniqGeneID, logFC, adj.P.Val) %>%
+  dplyr::rename(logFC_YSb_HE_vs_Endo = logFC,
+                FDR_YSb_HE_vs_Endo = adj.P.Val)
+
+
+# Combine with the dropout info 
+dge_e <- rr_sub2 %>%
+  dplyr::left_join(dge_e1_sub) %>%
+  dplyr::left_join(dge_e2_sub) %>%
+  dplyr::left_join(dge_e3_sub)
+
+# Add gene annotations
+dge_e <- dge_e %>% mutate(Symbol = gsub("_.*", "", UniqGeneID))
+
+dge_e <- dge_e %>% left_join(rD)
+```
+
+Lets also incorporate the comparison to progenitors (EMP + LMP)
+
+
+```{r}
+dge_p1_sub <- dge_prog_AGM %>% 
+  dplyr::select(UniqGeneID, logFC, adj.P.Val) %>%
+  dplyr::rename(logFC_AGM_HE_vs_prog = logFC,
+                FDR_AGM_HE_vs_prog = adj.P.Val)
+
+dge_p2_sub <- dge_prog_YSm %>% 
+  dplyr::select(UniqGeneID, logFC, adj.P.Val) %>%
+  dplyr::rename(logFC_YSm_HE_vs_prog = logFC,
+                FDR_YSm_HE_vs_prog = adj.P.Val)
+
+dge_p3_sub <- dge_prog_YSb %>% 
+  dplyr::select(UniqGeneID, logFC, adj.P.Val) %>%
+  dplyr::rename(logFC_YSb_HE_vs_prog = logFC,
+                FDR_YSb_HE_vs_prog = adj.P.Val)
+
+# Combine all the above
+dge_p <- dge_p1_sub %>%
+  dplyr::left_join(dge_p2_sub) %>%
+  dplyr::left_join(dge_p3_sub) 
+
+# Combine with the comparison with ENDO
+dge_all <- dge_e %>% left_join(dge_p) %>%
+  # Get a detection rate for the progenitor
+  mutate(pct_detect_prog = pmax(pct_detect_YS_EMP,pct_detect_YS_LMP))
+
+```
+
+
+### Categorization
+
+Now make the category. If the gene is expressed less then 60% in endo, we consider it a HE signature, and if it is expressed less then 60% in prog we consider it Enod signature
+
+```{r}
+cut_detect <- 60
+# Individual category
+dge_all <- dge_all %>%
+  dplyr::mutate(
+                # High in AGM  
+                HE_sig_AGM =
+                  case_when(
+                    logFC_AGM_HE_vs_Endo >= up_thresh & FDR_AGM_HE_vs_Endo <= FDR_thresh  ~ "HE_sig",
+                      #pct_detect_AGM_1 <= cut_detect  ,
+                    logFC_AGM_HE_vs_prog >= up_thresh & FDR_AGM_HE_vs_prog <= FDR_thresh  ~ "ENDO_sig",
+                      #pct_detect_prog  <= cut_detect ,
+                    TRUE ~ " "),
+                
+                # High in YS m
+                HE_sig_YSm = 
+                  case_when(
+                    logFC_YSm_HE_vs_Endo >= up_thresh & FDR_YSm_HE_vs_Endo <= FDR_thresh  ~ "HE_sig",
+                    logFC_YSm_HE_vs_prog >= up_thresh & FDR_YSm_HE_vs_prog <= FDR_thresh  ~ "ENDO_sig",
+                    TRUE ~ " "),
+                
+                # High in YS b
+                HE_sig_YSb = 
+                  case_when(
+                    logFC_YSb_HE_vs_Endo >= up_thresh & FDR_YSb_HE_vs_Endo <= FDR_thresh  ~ "HE_sig",
+                    logFC_YSb_HE_vs_prog >= up_thresh & FDR_YSb_HE_vs_prog <= FDR_thresh  ~ "ENDO_sig",
+                    TRUE ~ " "))
+```
+
+
+Clean up a bit
+
+```{r}
+dge_all_tmp <- dge_all %>%
+  dplyr::select(UniqGeneID,
+                HE_sig_AGM, HE_sig_YSm, HE_sig_YSb,
+                logFC_AGM_HE_vs_Endo, FDR_AGM_HE_vs_Endo, logFC_YSm_HE_vs_Endo:FDR_YSb_HE_vs_Endo, logFC_AGM_HE_vs_prog:FDR_YSb_HE_vs_prog)
+
+write.csv(dge_all_tmp, file.path(wd$cur, "DE_summary_vs_Endo.csv"))
+```
+
+### Num of DE genes
+
+We get the number of differently expressed genes in each comparison
+
+```{r}
+# ------ Endo vs AGM ----- #
+num_up <- filter(dge_endo_agm, Sig == "TRUE" & logFC >= up_thresh) %>% nrow()
+num_dwn <- filter(dge_endo_agm, Sig == "TRUE" & logFC <= dwn_thresh) %>% nrow()
+
+# Volcano plot
+pe1 <- dge_endo_agm %>%
+  ggplot(aes(y=LogpValue, x=logFC, colour=Sig)) +
+  geom_point(size=1, alpha=0.8) + 
+  scale_colour_manual(values=c("grey50", "red")) +
+  theme_bw() +
+  geom_vline(xintercept = up_thresh, linetype=2, alpha=0.3) +
+  geom_vline(xintercept = dwn_thresh, linetype=2, alpha=0.3) +
+  geom_hline(yintercept = -log10(FDR_thresh), linetype=2, alpha=0.3) +
+  labs(y=expression(paste("-log"[10], " Adj p-value")),
+       x=expression(paste("log"[2], " Fold Change"))) +
+  guides('colour'=guide_legend(title="Statistically significant")) +
+  theme(panel.grid.major = element_line(linetype = "blank"), 
+        panel.grid.minor = element_line(linetype = "blank"),
+        legend.position = "none") +
+  # Annotate box
+  annotate("text", 
+           x = -3, y = 50, label = paste0("High in Endo", "\nn=", num_dwn)) +
+  annotate("text", 
+           x = 3, y = 50, label = paste0("High in AGM", "\nn=", num_up)) +
+  ggtitle("Endo (AGM_1) vs HE (AGM 2 + 3)") +
+  NULL
+
+# ------ Endo vs YS_m1 ----- #
+num_up <- filter(dge_endo_YSM, Sig == "TRUE" & logFC >= up_thresh) %>% nrow()
+num_dwn <- filter(dge_endo_YSM, Sig == "TRUE" & logFC <= dwn_thresh) %>% nrow()
+
+# Volcano plot
+pe2 <- dge_endo_YSM %>%
+  ggplot(aes(y=LogpValue, x=logFC, colour=Sig)) +
+  geom_point(size=1, alpha=0.8) + 
+  scale_colour_manual(values=c("grey50", "red")) +
+  theme_bw() +
+  geom_vline(xintercept = up_thresh, linetype=2, alpha=0.3) +
+  geom_vline(xintercept = dwn_thresh, linetype=2, alpha=0.3) +
+  geom_hline(yintercept = -log10(FDR_thresh), linetype=2, alpha=0.3) +
+  labs(y=expression(paste("-log"[10], " Adj p-value")),
+       x=expression(paste("log"[2], " Fold Change"))) +
+  guides('colour'=guide_legend(title="Statistically significant")) +
+  theme(panel.grid.major = element_line(linetype = "blank"), 
+        panel.grid.minor = element_line(linetype = "blank"),
+        legend.position = "none") +
+  # Annotate box
+  annotate("text", 
+           x = -3, y = 30, label = paste0("High in Endo", "\nn=", num_dwn)) +
+  annotate("text", 
+           x = 3, y = 30, label = paste0("High in YSm", "\nn=", num_up)) +
+  ggtitle("Endo (Mix) vs HE (YS_m 1 + 2)") +
+  scale_y_continuous(limits=c(0,40)) +
+  NULL
+
+
+# ------ Endo vs YS_b1 ----- #
+num_up <- filter(dge_endo_YSb, Sig == "TRUE" & logFC >= up_thresh) %>% nrow()
+num_dwn <- filter(dge_endo_YSb, Sig == "TRUE" & logFC <= dwn_thresh) %>% nrow()
+
+# Volcano plot
+pe3 <- dge_endo_YSb %>%
+  ggplot(aes(y=LogpValue, x=logFC, colour=Sig)) +
+  geom_point(size=1, alpha=0.8) + 
+  scale_colour_manual(values=c("grey50", "red")) +
+  theme_bw() +
+  geom_vline(xintercept = up_thresh, linetype=2, alpha=0.3) +
+  geom_vline(xintercept = dwn_thresh, linetype=2, alpha=0.3) +
+  geom_hline(yintercept = -log10(FDR_thresh), linetype=2, alpha=0.3) +
+  labs(y=expression(paste("-log"[10], " Adj p-value")),
+       x=expression(paste("log"[2], " Fold Change"))) +
+  guides('colour'=guide_legend(title="Statistically significant")) +
+  theme(panel.grid.major = element_line(linetype = "blank"), 
+        panel.grid.minor = element_line(linetype = "blank"),
+        legend.position = "none") +
+  # Annotate box
+  annotate("text", 
+           x = -3, y = 50, label = paste0("High in Endo", "\nn=", num_dwn)) +
+  annotate("text", 
+           x = 3, y = 50, label = paste0("High in YSb", "\nn=", num_up)) +
+  ggtitle("Endo (YS_b1) vs HE (YS_b 2 + 3)") +
+  NULL
+  NULL
+
+pv_all_2 <- pe1 + pe2 + pe3
+
+ggsave(pv_all_2, file=file.path(wd$cur, "DE_volcano_Endo.pdf"), width = 12, height = 4, device = "pdf", dpi=300)
+```
+
+
+Now generate volcano for progenitors
+
+```{r}
+# ------ Prog vs AGM ----- #
+num_up <- filter(dge_prog_AGM, Sig == "TRUE" & logFC >= up_thresh) %>% nrow()
+num_dwn <- filter(dge_prog_AGM, Sig == "TRUE" & logFC <= dwn_thresh) %>% nrow()
+
+# Volcano plot
+pe1 <- dge_prog_AGM %>%
+  ggplot(aes(y=LogpValue, x=logFC, colour=Sig)) +
+  geom_point(size=1, alpha=0.8) + 
+  scale_colour_manual(values=c("grey50", "red")) +
+  theme_bw() +
+  geom_vline(xintercept = up_thresh, linetype=2, alpha=0.3) +
+  geom_vline(xintercept = dwn_thresh, linetype=2, alpha=0.3) +
+  geom_hline(yintercept = -log10(FDR_thresh), linetype=2, alpha=0.3) +
+  labs(y=expression(paste("-log"[10], " Adj p-value")),
+       x=expression(paste("log"[2], " Fold Change"))) +
+  guides('colour'=guide_legend(title="Statistically significant")) +
+  theme(panel.grid.major = element_line(linetype = "blank"), 
+        panel.grid.minor = element_line(linetype = "blank"),
+        legend.position = "none") +
+  # Annotate box
+  annotate("text", 
+           x = -3, y = 150, label = paste0("High in Prog", "\nn=", num_dwn)) +
+  annotate("text", 
+           x = 3, y = 150, label = paste0("High in AGM", "\nn=", num_up)) +
+  ggtitle("Prog (EMP + LMP) vs HE (AGM 2 + 3)") +
+  NULL
+
+# ------ Prog vs YS_m1 ----- #
+num_up <- filter(dge_prog_YSm, Sig == "TRUE" & logFC >= up_thresh) %>% nrow()
+num_dwn <- filter(dge_prog_YSm, Sig == "TRUE" & logFC <= dwn_thresh) %>% nrow()
+
+# Volcano plot
+pe2 <- dge_prog_YSm %>%
+  ggplot(aes(y=LogpValue, x=logFC, colour=Sig)) +
+  geom_point(size=1, alpha=0.8) + 
+  scale_colour_manual(values=c("grey50", "red")) +
+  theme_bw() +
+  geom_vline(xintercept = up_thresh, linetype=2, alpha=0.3) +
+  geom_vline(xintercept = dwn_thresh, linetype=2, alpha=0.3) +
+  geom_hline(yintercept = -log10(FDR_thresh), linetype=2, alpha=0.3) +
+  labs(y=expression(paste("-log"[10], " Adj p-value")),
+       x=expression(paste("log"[2], " Fold Change"))) +
+  guides('colour'=guide_legend(title="Statistically significant")) +
+  theme(panel.grid.major = element_line(linetype = "blank"), 
+        panel.grid.minor = element_line(linetype = "blank"),
+        legend.position = "none") +
+  # Annotate box
+  annotate("text", 
+           x = -5, y = 20, label = paste0("High in Prog", "\nn=", num_dwn)) +
+  annotate("text", 
+           x = 5, y = 20, label = paste0("High in YSm", "\nn=", num_up)) +
+  ggtitle("Prog (EMP + LMP) vs HE (YS_m 1 + 2)") +
+  scale_y_continuous(limits=c(0,40)) +
+  NULL
+
+
+# ------ Prog vs YS_b1 ----- #
+num_up <- filter(dge_prog_YSb, Sig == "TRUE" & logFC >= up_thresh) %>% nrow()
+num_dwn <- filter(dge_prog_YSb, Sig == "TRUE" & logFC <= dwn_thresh) %>% nrow()
+
+# Volcano plot
+pe3 <- dge_prog_YSb %>%
+  ggplot(aes(y=LogpValue, x=logFC, colour=Sig)) +
+  geom_point(size=1, alpha=0.8) + 
+  scale_colour_manual(values=c("grey50", "red")) +
+  theme_bw() +
+  geom_vline(xintercept = up_thresh, linetype=2, alpha=0.3) +
+  geom_vline(xintercept = dwn_thresh, linetype=2, alpha=0.3) +
+  geom_hline(yintercept = -log10(FDR_thresh), linetype=2, alpha=0.3) +
+  labs(y=expression(paste("-log"[10], " Adj p-value")),
+       x=expression(paste("log"[2], " Fold Change"))) +
+  guides('colour'=guide_legend(title="Statistically significant")) +
+  theme(panel.grid.major = element_line(linetype = "blank"), 
+        panel.grid.minor = element_line(linetype = "blank"),
+        legend.position = "none") +
+  # Annotate box
+  annotate("text", 
+           x = -3, y = 150, label = paste0("High in Prog", "\nn=", num_dwn)) +
+  annotate("text", 
+           x = 3, y = 150, label = paste0("High in YSb", "\nn=", num_up)) +
+  ggtitle("Prog (EMP + LMP) vs HE (YS_b 2 + 3)") +
+  NULL
+  NULL
+
+pv_all_3 <- pe1 + pe2 + pe3
+
+ggsave(pv_all_3, file=file.path(wd$cur, "DE_volcano_Prog.pdf"), width = 12, height = 4, device = "pdf", dpi=300)
+
+pvs <- pv_all_2 / pv_all_3
+
+ggsave(pvs, file=file.path(wd$cur, "DE_volcano_summary.pdf"), width = 12, height = 8, device = "pdf", dpi=300)
+```
+
+
+# Objective 4
+
+Combine unique and common HE profile as one excel file
+
+```{r}
+dge_f <- left_join(dge_m, dge_all_tmp)
+# Reorder a bit
+
+dge_f <- dge_f %>%
+  select(UniqGeneID:isSec, 
+         HE_sig_AGM:HE_sig_YSb,
+         Cat_YSb:Cat_AGM,
+         logFC_YSb_vs_YSm:FDR_YSm_vs_AGM,
+         logFC_AGM_HE_vs_Endo:FDR_YSb_HE_vs_prog,
+         pct_detect_all:pct_detect_YS_LMP) %>%
+  mutate(pct_detect_prog = pmax(pct_detect_YS_EMP,pct_detect_YS_LMP))
+
+writexl::write_xlsx(dge_f, file.path(wd$cur, "MainPopulation_DEsummary.xlsx"))
+```
+
+
+# Objective 5
+
+Cell cycle profile. We the percentage of cells in a particular cell cycle phase as stacked bar graph across populations 
+
+
+```{r}
+df_bar <- df_plot %>%
+  dplyr::group_by(FinalCat, Phase) %>% 
+  dplyr::summarise(count=n()) %>% 
+  dplyr::mutate(perc=(count/sum(count)*100)) %>%
+  mutate(Phase = factor(Phase, 
+                        levels=rev(c("G1", "G2M", "S")), 
+                        labels=rev(c("G1", "G2/M", "S"))))
+
+ggplot(df_bar, aes(x = FinalCat, y = perc, fill = Phase, label = round(perc,0))) +
+  geom_bar(stat="identity", width = 0.5) +
+  geom_text(size = 4, position = position_stack(vjust = 0.5)) +
+  scale_fill_manual(values = c("lightgreen","lightblue", "indianred")) +
+  labs(x="Clusters", y="Percentage", fill="Phase") +
+   theme(
+     panel.grid.minor = element_blank(),
+     panel.grid.major = element_blank(),
+     panel.background = element_blank(),
+     panel.border = element_rect(colour = "grey30", fill=NA, size=0.5),
+     strip.background = element_rect(fill="white", colour = "white")
+  ) #+ rotate()
+
+ggsave(file=file.path(wd$cur, "CellCycle.pdf"), width = 12, height = 5, device = "pdf", dpi=300)
+```
+
+
+
+# Objective 6 
+
+
+
+
+Calculate a signature socre
+
+
+We read in the file provided by Michael
+
+
+```{r}
+dat_sig <- readxl::read_excel(file.path(wd$data, "From_michael/gene_signatures/potential_signatures.xlsx"),
+                                 sheet=1) %>%
+  dplyr::rename(Notch_GO = 'UniqGeneID (based on GO0007219_187genes)',
+                Notch_ML = 'UniqGeneID (made up myself)')
+x1 <- dat_sig %>% filter(!is.na(Notch_GO)) %>% pull(Notch_GO)
+x2 <-  dat_sig %>% filter(!is.na(Notch_ML)) %>% pull(Notch_ML) 
+
+dat_sig <- readxl::read_excel(file.path(wd$data, "From_michael/gene_signatures/potential_signatures.xlsx"),
+                                 sheet=2) %>%
+  dplyr::rename(Oxs = 'UniqGeneID (based on GO_0006119_147genes)')
+x3 <- dat_sig$Oxs
+
+dat_sig <- readxl::read_excel(file.path(wd$data, "From_michael/gene_signatures/potential_signatures.xlsx"),
+                                 sheet=3) %>%
+  dplyr::rename(Glyco = 'UniqGeneID (based on GO_0006096_104genes)')
+x4 <- dat_sig$Glyco
+
+dat_sig <- readxl::read_excel(file.path(wd$data, "From_michael/gene_signatures/potential_signatures.xlsx"),
+                                 sheet=4) %>%
+  dplyr::rename(Tgfb = 'UniqGeneID (based on GO0071560_251genes)')
+x5 <- dat_sig$Tgfb
+
+dat_sig <- readxl::read_excel(file.path(wd$data, "From_michael/gene_signatures/potential_signatures.xlsx"),
+                                 sheet=5) %>%
+  dplyr::rename(Art = 'ARTERIAL (20 lit)',
+                Ven = 'VENOUS (4 lit)',
+                YS_endo = 'YS ENDO (top30 ys paper)')
+x6 <- dat_sig %>% filter(!is.na(Art)) %>% pull(Art) 
+x7 <- dat_sig %>% filter(!is.na(Ven)) %>% pull(Ven) 
+x8 <- dat_sig %>% filter(!is.na(YS_endo)) %>% pull(YS_endo) 
+```
+
+We get mitochondira & glycolysis signature from [Zhou](https://www.nature.com/articles/nature17997). Essentially, download from KEGG. We download "KEGG_OXIDATIVE_PHOSPHORYLATION" and "KEGG_GLYCOLYSIS_GLUCONEOGENESIS". Make sure to download the mouse version. 
+
+```{r}
+x9 <- read.delim(file.path(wd$data, "gene_signature/HALLMARK_GLYCOLYSIS.v2023.2.Mm.grp")) %>% pull(HALLMARK_GLYCOLYSIS) 
+x10 <- read.delim(file.path(wd$data, "gene_signature/HALLMARK_OXIDATIVE_PHOSPHORYLATION.v2023.2.Mm.grp")) %>% pull(HALLMARK_OXIDATIVE_PHOSPHORYLATION) 
+```
+
+Get additional signatures, EMP and LMP from our AGM paper or alternatively use the one from thesis.
+
+```{r}
+# dat_sig <- readxl::read_excel(file.path(wd$data, "gene_signature/bloodbld2020007885-suppl2.xlsx"),
+#                                  sheet=5, skip=1)
+# x11 <- dat_sig %>% filter(!is.na(EMP)) %>% pull(EMP)
+# x12 <- dat_sig %>% filter(!is.na(LMP)) %>% pull(LMP)
+# 
+# dat_sig <- readxl::read_excel(file.path(wd$data, "gene_signature/EMP_LMP_thesis.xlsx"))
+# x11 <- dat_sig %>% filter(Sig == "EMP_sig") %>% pull(Gene)
+# x12 <- dat_sig %>% filter(Sig == "LMP_sig") %>% pull(Gene)
+
+
+# Another way is to get those EMP and LMP signatures without filtering if these are expressed in other clusters
+dat_sig <- read.csv(file.path(wd$data, "gene_signature/DE_full_EMPk4_vs_LMPk5.csv"))
+x11 <- dat_sig %>% filter(Sig == "TRUE")%>% filter(logFC < -1 ) %>% pull(UniqGeneID)
+x12 <- dat_sig %>% filter(Sig == "TRUE") %>% filter(logFC > 1 ) %>% pull(UniqGeneID)
+
+```
+
+Get additional  hematopoietic and Endothelial gene signature. We used the list we have in the first figure
+
+```{r}
+dat_sig <- readxl::read_excel(file.path(wd$data, "Others/Genes_edit_v2.xlsx"))
+x13 <- dat_sig %>% filter(Class == "Endo") %>% pull(Gene)
+x14 <- dat_sig %>% filter(Class == "Hema") %>% pull(Gene)
+```
+
+
+To calculate the scoring, we will use this package to calculate the score https://bioconductor.org/packages/release/bioc/html/UCell.html
+
+
+Make a list
+
+```{r}
+ll <- list()
+
+ll[[1]] <- x1
+ll[[2]] <- x2
+ll[[3]] <- x3
+ll[[4]] <- x4
+ll[[5]] <- x5
+ll[[6]] <- x6
+ll[[7]] <- x7
+ll[[8]] <- x8
+ll[[9]] <- x9
+ll[[10]] <- x10
+ll[[11]] <- x11
+ll[[12]] <- x12
+ll[[13]] <- x13
+ll[[14]] <- x14
+
+
+names(ll) <- c("Notch_GO", "Notch_ML", "Ox", "Glyco", "Tgfb", "Art", "Ven", "YS_endo", 
+               "Hallm_Glyco", "Hallm_OxPhos", "EMP", "LMP", "Endo", "Hema")
+```
+
+
+Calculate score
+
+```{r}
+sce_in <- se.full
+sce2 <- ScoreSignatures_UCell(sce_in, features=ll, 
+                                 assay = 'counts', name=NULL)
+
+
+```
+
+
+Extract UCell value
+
+```{r}
+df_meta <- as.data.frame(colData(sce2))
+
+dat_Ucell <- t(assay(altExp(sce2, "UCell")))
+
+df_data <- cbind(df_meta, dat_Ucell)
+
+# Plot
+df_plot <- df_data %>% select(in_silico_clusters, Notch_GO:Hema)
+
+m <- melt(df_plot)
+m2 <- m %>%  
+  filter(variable %in% c("Art", "Ven", "YS_endo", "EMP", "LMP")) %>% 
+  mutate(variable = factor(variable, levels=c("Art", "Ven", "YS_endo", "EMP", "LMP")))
+
+  #filter(variable %in% c("Art", "Ven", "YS_endo", "Hema", "Endo")) %>% 
+  #mutate(variable = factor(variable, levels=c("Endo", "Hema", "Ven", "Art")))
+
+p1 <- 
+  ggplot(m2, aes(x=in_silico_clusters, y=value, fill=in_silico_clusters)) +
+  geom_quasirandom(groupOnX=TRUE, size = 0.8, alpha = 0.5, width = 0.4) +
+  geom_violin(alpha = 0.5, scale = "width", position = position_dodge(width = 0.9)) +
+  geom_boxplot(alpha = 0.5, width = 0.2, position = position_dodge(width = 0.9),
+               outlier.shape=NA) +
+  scale_fill_manual(values=unique(pal.full)) +
+  theme_bw() +
+  theme(legend.position = "none",
+        panel.grid.major = element_line(linetype = "blank"), 
+        panel.grid.minor = element_line(linetype = "blank"),
+        axis.text.x = element_text(angle = 45, hjust = 1)) +
+  facet_wrap(~variable, ncol=1, scale="free_y") +
+  NULL
+
+ggsave(p1, file=file.path(wd$cur, "Sig_score_v2.pdf"), width = 10, height = 12, device="pdf")
+```
+
+
+# Objective 7
+
+Plot correlation signature
+
+
+Co-expression plot
+
+```{r}
+pal.clus <- df_pal_cl
+#pal.clus <- pal.full
+
+# Extract expression
+geneToPlot <- c("Vwf", "Lyve1", "Cd24a", "Runx1")
+
+
+se_eht <- se[,se$Barcode %in% df_dim$Barcode]
+setmp <- se_eht[,!se_eht$in_silico_clusters %in% c("p_01", "p_02")]
+setmp$finalCluster2 <- setmp$in_silico_clusters
+
+#pal_sub <- pal.cl[6:11]
+
+expInt <- assay(setmp, "logcounts")[geneToPlot,]
+df_exp <- as.data.frame(as.matrix(expInt))
+colnames(df_exp) <- setmp$Barcode
+
+df_exp_t <- df_exp %>%
+  t() %>%
+  as.data.frame() %>%
+  tibble::rownames_to_column(var = "Barcode") %>%
+  dplyr::mutate(Vwf_bin = if_else(Vwf > 0, "Yes", "No"),
+                Lyve1_bin = if_else(Lyve1 > 0, "Yes", "No"),
+                Cd24a_bin = if_else(Cd24a > 0, "Yes", "No"))
+
+# Join with annotation
+dftmp <- as.data.frame(colData(setmp)) 
+cD_sub <- dftmp %>%
+  dplyr::select(Barcode, finalCluster2) 
+df_exp_t <- df_exp_t %>%
+  dplyr::left_join(cD_sub)
+
+
+# Plot
+df_exp_t_sub <- df_exp_t %>%
+  dplyr::filter(finalCluster2 %in% c("mix", "YS_m1", "YS_m2",
+                                     "YS_b1", "YS_b2", "YS_b3"))
+
+# Some stats
+mid_vwf <- mean(df_exp_t$Vwf)
+mid_lyve1 <- mean(df_exp_t$Lyve1)
+mid_runx1 <- mean(df_exp_t$Runx1)
+sum_vwf <- summary(df_exp_t$Vwf)
+sum_lyve1 <- summary(df_exp_t$Lyve1)
+sum_runx1 <- summary(df_exp_t$Runx1)
+
+text_vwf_m = sum_vwf[4] - 1 # 4 is mean, # 3 if median
+text_vwf_max = sum_vwf[6] - 0.7
+text_lyve1_m = sum_lyve1[4] - 1
+text_lyve1_max = sum_lyve1[6] - 0.7
+text_runx1_m = sum_runx1[4] - 1
+text_runx1_max = sum_runx1[6] - 0.7
+
+```
+
+Now we look at Vwf relationship
+
+```{r}
+# Plot
+mid_cd24a <- mean(df_exp_t$Cd24a)
+sum_cd24a <- summary(df_exp_t$Cd24a)
+
+text_cd24a_m = sum_cd24a[4] - 1 # 4 is mean, # 3 if median
+text_cd24a_max = sum_cd24a[6] - 0.7
+
+
+# Get stats of cells in the category
+df_exp_t_sub <- df_exp_t_sub %>%
+  dplyr::mutate(
+    Vwf_Cd24a_cat = 
+      case_when(
+        Vwf > mid_vwf & Cd24a > mid_cd24a ~ "DP",
+        Vwf > mid_vwf & Cd24a <= mid_cd24a ~ "SP_Vwf",
+        Vwf <= mid_vwf & Cd24a > mid_cd24a ~ "SP_Cd24a",
+        Vwf <= mid_vwf & Cd24a <= mid_cd24a ~ "DN"),
+    Vwf_Lyve1_cat =
+      case_when(
+        Lyve1 > mid_lyve1 & Vwf > mid_vwf ~ "DP",
+        Lyve1 > mid_lyve1 & Vwf <= mid_vwf ~ "SP_Lyve1",
+        Lyve1 <= mid_lyve1 & Vwf > mid_vwf ~ "SP_Vwf",
+        Lyve1 <= mid_lyve1 & Vwf <= mid_vwf ~ "DN"),
+    Runx1_Vwf_cat =
+      case_when(
+        Runx1 > mid_runx1 & Vwf > mid_vwf ~ "DP",
+        Runx1 > mid_runx1 & Vwf <= mid_vwf ~ "SP_Runx1",
+        Runx1 <= mid_runx1 & Vwf > mid_vwf ~ "SP_Vwf",
+        Runx1 <= mid_runx1 & Vwf <= mid_vwf ~ "DN"),
+    Runx1_Lyve1_cat =
+      case_when(
+        Runx1 > mid_runx1 & Lyve1 > mid_lyve1 ~ "DP",
+        Runx1 > mid_runx1 & Lyve1 <= mid_lyve1 ~ "SP_Runx1",
+        Runx1 <= mid_runx1 & Lyve1 > mid_lyve1 ~ "SP_Lyve1",
+        Runx1 <= mid_runx1 & Lyve1 <= mid_lyve1 ~ "DN"),
+  )
+
+# For the m-cluster: Look at Mcam vs Cd24
+df_exp_t_sub2 <- df_exp_t_sub %>%
+  dplyr::filter(finalCluster2 %in% c("mix", "YS_m1", "YS_m2",
+                                     "YS_b1", "YS_b2", "YS_b3"))
+
+
+# Calculate percentage
+stat1 <- df_exp_t_sub2 %>%
+  dplyr::group_by(finalCluster2, Vwf_Cd24a_cat) %>% 
+  dplyr::summarise(count=n()) %>% 
+  dplyr::mutate(
+    perc=(round(count/sum(count)*100, 0)),
+    perc_lab = paste0(perc, "%"),
+    x = case_when(Vwf_Cd24a_cat %in% c("DN", "SP_Cd24a") ~  text_cd24a_m,
+                  Vwf_Cd24a_cat %in% c("DP", "SP_Vwf") ~  text_cd24a_max),
+    
+    y = case_when(Vwf_Cd24a_cat %in% c("DN", "SP_Vwf") ~  text_vwf_m,
+                  Vwf_Cd24a_cat %in% c("DP", "SP_Cd24a") ~  text_vwf_max)
+    )
+
+tmp_pal <- pal.clus %>% filter(Meta %in% df_exp_t_sub2$finalCluster2)
+
+p1 <- 
+ggplot(df_exp_t_sub2, aes(x=Vwf, y=Cd24a, colour=finalCluster2)) +
+  geom_point() +
+  #geom_density_2d() +
+  #eom_xsidedensity(aes(y = after_stat(density)), position = "stack") +
+  #geom_ysidedensity(aes(x = after_stat(density)), position = "stack") +
+  theme_custom +
+  theme(legend.position = "none") +
+  facet_wrap(~finalCluster2) +
+  scale_colour_manual(values=tmp_pal$Col) +
+  geom_hline(yintercept = mid_cd24a) + 
+  geom_vline(xintercept = mid_vwf) + 
+  scale_y_continuous(#limits=c(-5,12),
+                     breaks=c(-5, 0,5,10)) +
+  scale_x_continuous(#limits=c(-5,12), 
+                     breaks=c(-5, 0,5,10)) +
+  geom_text(data=stat1,
+            aes(x=x,
+                y=y,
+                label=perc_lab),
+            color="black", size = 4) +
+  #theme(ggside.panel.scale = .3) +
+  NULL
+
+
+
+ggsave(p1, filename = file.path(wd$cur, "Cd24_Vwf_Clusters.pdf"), device = "pdf", width = 8, height = 6, dpi = 300)
+
+
+```
+
+
+Plot of Runx1 vs Vwf (m cluseters) and Runx1 vs Lyve1 (b clusters)
+
+```{r}
+# For the m-cluster: Look at Mcam vs Cd24
+df_exp_t_sub_mClus <- df_exp_t_sub2 %>%
+  dplyr::filter(finalCluster2 %in% c("mix", "YS_m1", "YS_m2"))
+
+
+# Calculate percentage
+stat1 <- df_exp_t_sub_mClus %>%
+  dplyr::group_by(finalCluster2, Runx1_Vwf_cat) %>% 
+  dplyr::summarise(count=n()) %>% 
+  dplyr::mutate(
+    perc=(round(count/sum(count)*100, 0)),
+    perc_lab = paste0(perc, "%"),
+    x = case_when(Runx1_Vwf_cat %in% c("DN", "SP_Runx1") ~  text_runx1_m,
+                  Runx1_Vwf_cat %in% c("DP", "SP_Vwf") ~  text_runx1_max),
+    
+    y = case_when(Runx1_Vwf_cat %in% c("DN", "SP_Vwf") ~  text_vwf_m,
+                  Runx1_Vwf_cat %in% c("DP", "SP_Runx1") ~  text_vwf_max)
+    )
+
+tmp_pal <- pal.clus %>% filter(Meta %in% df_exp_t_sub_mClus$finalCluster2)
+
+p1 <- 
+ggplot(df_exp_t_sub_mClus, aes(x=Vwf, y=Runx1, colour=finalCluster2)) +
+  geom_point() +
+  theme_custom +
+  theme(legend.position = "none") +
+  facet_wrap(~finalCluster2) +
+  scale_colour_manual(values=tmp_pal$Col) +
+  geom_hline(yintercept = mid_runx1) + 
+  geom_vline(xintercept = mid_vwf) + 
+    scale_y_continuous(breaks=c(0,5,10)) +
+  scale_x_continuous(breaks=c(0,5,10)) +
+  geom_text(data=stat1,
+            aes(x=x,
+                y=y,
+                label=perc_lab),
+            color="black", size = 4) +
+  NULL
+
+# For the b-cluster: Look at Runx1 vs Lyve1
+df_exp_t_sub_bClus <- df_exp_t_sub2 %>%
+  dplyr::filter(finalCluster2 %in% c("YS_b1", "YS_b2", "YS_b3"))
+
+
+# Calculate percentage
+stat2 <- df_exp_t_sub_bClus %>%
+  dplyr::group_by(finalCluster2, Runx1_Lyve1_cat) %>% 
+  dplyr::summarise(count=n()) %>% 
+  dplyr::mutate(
+    perc=(round(count/sum(count)*100, 0)),
+    perc_lab = paste0(perc, "%"),
+    x = case_when(Runx1_Lyve1_cat %in% c("DN", "SP_Runx1") ~  text_runx1_m,
+                  Runx1_Lyve1_cat %in% c("DP", "SP_Lyve1") ~  text_runx1_max),
+    
+    y = case_when(Runx1_Lyve1_cat %in% c("DN", "SP_Lyve1") ~  text_lyve1_m,
+                  Runx1_Lyve1_cat %in% c("DP", "SP_Runx1") ~  text_lyve1_max)
+    )
+
+tmp_pal <- pal.clus %>% filter(Meta %in% df_exp_t_sub_bClus$finalCluster2)
+
+p2 <- 
+ggplot(df_exp_t_sub_bClus, aes(x=Lyve1, y=Runx1, colour=finalCluster2)) +
+  geom_point() +
+  theme_custom +
+  theme(legend.position = "none") +
+  facet_wrap(~finalCluster2) +
+  scale_colour_manual(values=tmp_pal$Col) +
+  geom_hline(yintercept = mid_runx1) + 
+  geom_vline(xintercept = mid_lyve1) + 
+    scale_y_continuous(breaks=c(0,5,10)) +
+  scale_x_continuous(breaks=c(0,5,10)) +
+  geom_text(data=stat2,
+            aes(x=x,
+                y=y,
+                label=perc_lab),
+            color="black", size = 4) +
+  NULL
+
+p_all <- p1 + p2 + plot_layout(ncol=1)
+
+ggsave(p_all, filename = file.path(wd$cur, "Runx1_Vwf_and_Runx1_Lyve1_Mcam_Cluster.pdf"), device = "pdf", width = 8, height = 6.5, dpi = 300)
+
+
+```
+
+
+
+# Objective 8
+
+Heatmap of interested genes
+
+We try to show the data as heatmap
+
+```{r}
+g_515 <- read_xlsx(file.path(wd$data,"From_michael/gene_signatures/tables 2 version 6.4 07032024 heatmaps fig5 sup3c.xlsx"),
+                  sheet = 2) %>% 
+  dplyr::rename(gene_type = 'Gene type')
+```
+
+Function to draw heatmap based on a gene list
+
+```{r}
+draw_heat <- function(seObj, df_meta, GENE, Clusters_Sub, fontSizerow){
+  
+  # 1) Subset to desired data
+  df_dim_sub <- df_meta %>%
+    dplyr::filter( in_silico_clusters %in% Clusters_Sub)
+  ## Subset the single cell object
+  seObj_sub <- seObj[,seObj$Barcode %in% df_dim_sub$Barcode]
+  
+  # 2) Change input from tab delim to individual character
+  ## Split new line into character (https://stackoverflow.com/questions/10738729/r-strsplit-with-multiple-unordered-split-arguments)
+  GeneSplit <- unlist(strsplit(GENE, "[, ]+|\n"))
+  ## Make the first letter uppercase
+  GeneSplit <- as.character(mapply(simpleCap, GeneSplit)) 
+  
+  ## 3) Find the desired order
+  ## For now re-order based on Ruxn1 and Pecam1
+  cd31_exp <- assay(seObj_sub, "logcounts")["Pecam1",]
+  runx1_exp <- assay(seObj_sub, "logcounts")["Runx1",]
+  # Arrange cluster
+  df_dim_or <- as.data.frame(colData(seObj_sub)) %>%
+    dplyr::mutate(endo = cd31_exp,
+                  hemato = runx1_exp) %>%
+    dplyr::arrange(in_silico_clusters, hemato, desc(endo))
+  
+  # 4) Extract gene expression
+  ## Intersect genes with that of in the seObject
+  int_gene <- row.names(seObj_sub) [ row.names(seObj_sub) %in% GeneSplit ]
+  ## Extract interesected genes
+  mat <- assay(seObj_sub, "logcounts")[int_gene,]
+  
+  colnames(mat) <- seObj_sub$Barcode
+  mMat <- as.data.frame(as.matrix(mat))
+  mMat$Gene <- rownames(mMat)
+  mMat <- melt(mMat) %>% 
+    dplyr::rename(Barcode = variable)
+  
+  # Join with cluster info
+  cD_tmp <- as.data.frame(colData(seObj_sub)) %>% 
+    select(Barcode, in_silico_clusters)
+  
+  mMat <- left_join(mMat, cD_tmp)
+  mMat_g <- mMat %>% group_by(Gene, in_silico_clusters) %>% 
+    dplyr::summarise(MeanExp = mean(value))
+  
+  
+  # Convert back to matrix format
+  mat2 <- mMat_g %>% pivot_wider(names_from = in_silico_clusters, values_from = MeanExp)
+  mat2 <- as.data.frame(mat2)
+  rownames(mat2) <- mat2$Gene
+  mat2 <- as.matrix(mat2[,-1])
+  
+  
+  ## 6) Add heatmap metadata
+  # Columns we want to show on heatmap
+  ann_col <- data.frame(Cell = colnames(mat2),
+                        Cluster = colnames(mat2))
+  ann_col2 <- ann_col
+  row.names(ann_col) <- ann_col$Cell
+  ## Colours
+  # Remove the cell column
+  ann_col <- dplyr::select(ann_col, Cluster) # Remove cell column
+  # Specify the colours for the population
+  ann_list <- list(Cluster = 
+                     c(
+                       "AGM_VE" = pal.cl[1],
+                       "AGM_1" = pal.cl[2],
+                       "AGM_2" = pal.cl[3],
+                       "AGM_3" = pal.cl[4],
+                       "AGM_4" = pal.cl[5],
+                       "AGM_5" = pal.cl[6],
+                       "mix" = pal.cl[7],
+                       "YS_m1" = pal.cl[8],
+                       "YS_m2" = pal.cl[9],
+                       "YS_b1" = pal.cl[10],
+                       "YS_b2" = pal.cl[11],
+                       "YS_b3" = pal.cl[12],
+                       "YS_p1" = pal.cl[13],
+                       "YS_p2" = pal.cl[14],
+                       "YS_EMP" = pal.cl[15],
+                       "YS_LMP" = pal.cl[16]))
+  ## Add gaps between cluster
+  l_clust <- gsub("YS_b.*", "YS_b", colnames(mat2))
+  l_clust <- gsub("YS_m.*", "YS_m", l_clust)
+  l_clust <- gsub("YS_p.*", "YS_p", l_clust)
+  l_clust <- gsub("AGM_.*", "AGM", l_clust)
+  l_clust <- factor(l_clust, levels=c("AGM", "mix", "YS_m", "YS_b", "YS_p", "YS_EMP", "YS_LMP"))
+  l_clust <- as.vector(table(l_clust))
+  l_clust <- cumsum(l_clust) # Get the cummulative sum
+  l_clust <- l_clust[-2] # Ignaore mix
+  #l_clust <- c(1, l_clust) # Add venous seperator
+
+p_heat <- 
+  pheatmap(mat2,
+           cluster_rows = TRUE, 
+           cluster_cols = FALSE,
+           scale = "row",
+           cutree_rows = 2,
+           breaks = seq(-2, 2, length.out = 100),
+          
+           annotation_col = ann_col,
+           annotation_colors = ann_list,
+           gaps_col = l_clust,
+           
+           show_colnames =T,
+           show_rownames = F,
+           fontsize_row = fontSizerow,
+           annotation_legend = FALSE)
+
+return(p_heat)
+}
+
+
+draw_heat2 <- function(seObj, df_meta, GENE, Clusters_Sub, fontSizerow){
+  
+  # 1) Subset to desired data
+  df_dim_sub <- df_meta %>%
+    dplyr::filter( in_silico_clusters %in% Clusters_Sub)
+  ## Subset the single cell object
+  seObj_sub <- seObj[,seObj$Barcode %in% df_dim_sub$Barcode]
+  
+  # 2) Change input from tab delim to individual character
+  ## Split new line into character (https://stackoverflow.com/questions/10738729/r-strsplit-with-multiple-unordered-split-arguments)
+  GeneSplit <- unlist(strsplit(GENE, "[, ]+|\n"))
+  ## Make the first letter uppercase
+  GeneSplit <- as.character(mapply(simpleCap, GeneSplit)) 
+  
+  ## 3) Find the desired order
+  ## For now re-order based on Ruxn1 and Pecam1
+  cd31_exp <- assay(seObj_sub, "logcounts")["Pecam1",]
+  runx1_exp <- assay(seObj_sub, "logcounts")["Runx1",]
+  # Arrange cluster
+  df_dim_or <- as.data.frame(colData(seObj_sub)) %>%
+    dplyr::mutate(endo = cd31_exp,
+                  hemato = runx1_exp) %>%
+    dplyr::arrange(in_silico_clusters, hemato, desc(endo))
+  
+  # 4) Extract gene expression
+  ## Intersect genes with that of in the seObject
+  int_gene <- row.names(seObj_sub) [ row.names(seObj_sub) %in% GeneSplit ]
+  ## Extract interesected genes
+  mat <- assay(seObj_sub, "logcounts")[int_gene,]
+  
+  colnames(mat) <- seObj_sub$Barcode
+  mMat <- as.data.frame(as.matrix(mat))
+  mMat$Gene <- rownames(mMat)
+  mMat <- melt(mMat) %>% 
+    dplyr::rename(Barcode = variable)
+  
+  # Join with cluster info
+  cD_tmp <- as.data.frame(colData(seObj_sub)) %>% 
+    select(Barcode, in_silico_clusters)
+  
+  mMat <- left_join(mMat, cD_tmp)
+  mMat_g <- mMat %>% group_by(Gene, in_silico_clusters) %>% 
+    dplyr::summarise(MeanExp = mean(value))
+  
+  
+  # Convert back to matrix format
+  mat2 <- mMat_g %>% pivot_wider(names_from = in_silico_clusters, values_from = MeanExp)
+  mat2 <- as.data.frame(mat2)
+  rownames(mat2) <- mat2$Gene
+  mat2 <- as.matrix(mat2[,-1])
+  
+  
+  ## 6) Add heatmap metadata
+  # Columns we want to show on heatmap
+  ann_col <- data.frame(Cell = colnames(mat2),
+                        Cluster = colnames(mat2))
+  ann_col2 <- ann_col
+  row.names(ann_col) <- ann_col$Cell
+  ## Colours
+  # Remove the cell column
+  ann_col <- dplyr::select(ann_col, Cluster) # Remove cell column
+  # Specify the colours for the population
+  ann_list <- list(Cluster = 
+                     c(
+                       "AGM_VE" = pal.cl[1],
+                       "AGM_1" = pal.cl[2],
+                       "AGM_2" = pal.cl[3],
+                       "AGM_3" = pal.cl[4],
+                       "AGM_4" = pal.cl[5],
+                       "AGM_5" = pal.cl[6],
+                       "mix" = pal.cl[7],
+                       "YS_m1" = pal.cl[8],
+                       "YS_m2" = pal.cl[9],
+                       "YS_b1" = pal.cl[10],
+                       "YS_b2" = pal.cl[11],
+                       "YS_b3" = pal.cl[12],
+                       "YS_p1" = pal.cl[13],
+                       "YS_p2" = pal.cl[14],
+                       "YS_EMP" = pal.cl[15],
+                       "YS_LMP" = pal.cl[16]))
+  ## Add gaps between cluster
+  l_clust <- gsub("YS_b.*", "YS_b", colnames(mat2))
+  l_clust <- gsub("YS_m.*", "YS_m", l_clust)
+  l_clust <- gsub("YS_p.*", "YS_p", l_clust)
+  l_clust <- gsub("AGM_.*", "AGM", l_clust)
+  l_clust <- factor(l_clust, levels=c("AGM", "mix", "YS_m", "YS_b", "YS_p", "YS_EMP", "YS_LMP"))
+  l_clust <- as.vector(table(l_clust))
+  l_clust <- cumsum(l_clust) # Get the cummulative sum
+  l_clust <- l_clust[-2] # Ignaore mix
+  #l_clust <- c(1, l_clust) # Add venous seperator
+
+p_heat <- 
+  pheatmap(mat2,
+           cluster_rows = TRUE, 
+           cluster_cols = FALSE,
+           scale = "row",
+           breaks = seq(-2, 2, length.out = 100),
+          
+           annotation_col = ann_col,
+           annotation_colors = ann_list,
+           gaps_col = l_clust,
+           
+           show_colnames =T,
+           show_rownames = T,
+           fontsize_row = fontSizerow,
+           annotation_legend = FALSE)
+
+return(p_heat)
+}
+
+df_pal_cl = data.frame(
+  Meta =c(
+    "AGM_VE",
+    "AGM_1", "AGM_2", "AGM_3", "AGM_4", "AGM_5",
+    "mix", 
+    "YS_m1", "YS_m2",
+    "YS_b1", "YS_b2", "YS_b3",
+    "YS_p1", "YS_p2",
+    "YS_EMP", "YS_LMP"),
+  Col = c(
+    
+    # AGM ARM
+    '#4E79A7', # AGM Venous
+    
+    '#87afb5', # AGM ACE
+    #"#A5AA99", "#A8786E", "#848484", "#5B5043", # Runx1:pre-HE, Gfi1:HE, EHT, IAHC
+    'grey70', 'grey30', '#A8786E', 'black',
+    
+    # MIX
+    '#4CB8E0',
+    
+    # MIDDLE middle arm (YS similar to AGM)
+    "#F1BA88", '#FA8775',
+    
+    # RIGHT ARM (YS ARM)
+    '#898ace', # YS endo
+    '#00794F','#8CD17D', 
+    
+    # Progenitor 
+    "#D4A6C8", "#631879",
+    
+    # EMP & LMP
+    #"#702F7D", "#F148D0"))
+    "#f6b26b", "#f66d6b"))
+
+df_pal_cl$Col <- as.character(df_pal_cl$Col)
+pal.cl <- df_pal_cl$Col
+
+```
+
+Plot the heatmap of 515 genes
+
+```{r}
+# Scripts optimized 
+c_sub <- unique(se.full$in_silico_clusters)
+c_sub <- c_sub[-1]
+gg <- g_515$UniqGeneID
+df_in <- as.data.frame(colData(se.full))
+
+p_ht <- 
+  draw_heat(seObj=se.full, 
+          df_meta = df_in,
+          GENE=gg, 
+          Clusters_Sub = c_sub,
+          fontSizerow=4)
+pdf(file.path(wd$cur, "MeanHeatmap_515.pdf"), height = 5, width = 12)
+p_ht
+dev.off()
+```
+
+Plot the heatmap of HE cluster only
+
+```{r}
+gg <- g_515 %>% filter(gene_type == "Hec selective") %>% pull(UniqGeneID)
+gg <- c("Runx1", gg)
+p_ht <- 
+  draw_heat2(seObj=se.full, 
+          df_meta = df_in,
+          GENE=gg, 
+          Clusters_Sub = c_sub,
+          fontSizerow=10)
+pdf(file.path(wd$cur, "MeanHeatmap_Hec.pdf"), height = 5, width = 12)
+p_ht
+dev.off()
+```
+
+
+# Objective 9
+
+## Nancy data
+
+Performance of signature in public datasets. We get nancy spec data
+
+```{r}
+workDirNancy <- file.path(wd$data,"publicData/GEO_dowload/Nancy_2020")
+dat <- readMM(file.path(workDirNancy, "GSE137116_gene_by_cell_count_matrix.txt") )
+
+g.anno <-read.csv(file.path(workDirNancy, "GSE137116_gene_annotation.csv"))
+c.anno <- read.csv(file.path(workDirNancy, "GSE137116_cell_annotation.csv"))
+
+colnames(dat) <- c.anno$X
+rownames(dat) <- g.anno$id
+
+seNancyOri <- 
+  SingleCellExperiment(
+  assays = list(counts = dat),
+  colData = c.anno,
+  rowData = g.anno)
+  
+new.row.names <- uniquifyFeatureNames(
+    rowData(seNancyOri)$id,
+    rowData(seNancyOri)$symbol
+)
+rownames(seNancyOri) <- new.row.names
+head(rownames(seNancyOri), 20)
+
+# # Filter to expressing genes
+# ave.counts <- rowMeans(counts(seNancyOri))
+# cutOFFval <- 0.001
+# keep <- ave.counts >= cutOFFval
+# print(paste0("Before filtering Gene Numbers (including the 0 expression ones): ", dim(rowData(seNancyOri))[1]))
+# print(paste0('After filtering Gene Numbers: ',sum(keep)))
+# # Check hist
+# hist(log10(ave.counts), breaks=200, main="", col="grey80",
+#      xlab=expression(Log[10]~"average count"), cex.lab=1.3, cex.axis=1.1)
+# abline(v=log10(cutOFFval), col="blue", lwd=2, lty=2)
+# 
+# seNancy <- seNancyOri[keep, ]
+seNancy <- seNancyOri
+
+# Remove NA from the population tab
+se.Nancy.sub <- seNancy[,!is.na(seNancy$Cell_type_refined) ]
+
+# Keep E10.5 data only
+dataInt <- as.character(unique( c.anno$Combined_Dataset[grep("E10.5", c.anno$Combined_Dataset)]))
+scATAC_loc <- grep("scATAC", dataInt)
+dataInt <- dataInt[-scATAC_loc]
+se.Nancy.sub <- se.Nancy.sub[,se.Nancy.sub$Combined_Dataset %in% dataInt]
+
+
+# Remove unrelated population
+popInterest <- 
+  c("Conflux endo [AE]", 
+    "Endo (Wnt_high) [AE]", 
+    #"Endo (Wnt_high) [VE]", 
+    "Endo (Wnt_low) [AE]",
+    #"Endo (Wnt_low) [VE]", 
+    "HE", "IAC", "Pre-HE [AE]","Endo (other)")
+
+se.Nancy.sub <- se.Nancy.sub[,se.Nancy.sub$Cell_type_refined %in% popInterest]
+```
+
+
+Now calculate signature score in Nancy data
+
+First define the gene signature
+
+```{r}
+x1 <- g_515 %>% filter(gene_type == "Hec selective") %>% pull(UniqGeneID) 
+x1 <- c("Runx1", x1)
+x2 <- g_515 %>% filter(gene_type == "Up Hemato") %>% pull(UniqGeneID)
+x3 <- g_515 %>% filter(gene_type == "Up Endo") %>% pull(UniqGeneID)
+x4 <- g_515  %>% pull(UniqGeneID)
+x4 <- x4[-grep("RFP", x4)]
+```
+
+
+```{r}
+# Get gene signature
+ll <- list()
+
+ll[[1]] <- x1
+ll[[2]] <- x2
+ll[[3]] <- x3
+ll[[4]] <- x4
+
+
+names(ll) <- c("Hec_sel", "Up_Hemato", "Up_Endo", "All")
+
+# Get number of genes in each signature
+x_list <- list(x1, x2, x3, x4)
+length_sig <- sapply(x_list, length)
+
+names(ll) <- paste0(names(ll), " (n=", length_sig, ")" )
+```
+
+
+
+Calculate score
+
+```{r}
+sce_in <- se.Nancy.sub
+sce2 <- ScoreSignatures_UCell(sce_in, features=ll, 
+                                 assay = 'counts', name=NULL)
+
+
+```
+
+
+Extract UCell value
+
+```{r}
+df_meta <- as.data.frame(colData(sce2))
+
+dat_Ucell <- t(assay(altExp(sce2, "UCell")))
+
+df_data <- cbind(df_meta, dat_Ucell)
+
+# Plot
+df_plot <- df_data %>% select(Cell_type_refined, Hec_sel:All)
+
+
+lvlnancy <- c("Endo (other)", 
+                   "Endo (Wnt_low) [VE]", 
+                   "Endo (Wnt_high) [VE]", 
+                   "Endo (Wnt_low) [AE]",
+                   "Endo (Wnt_high) [AE]", 
+                   "Conflux endo [AE]",
+                   "Pre-HE [AE]",
+                   "HE", "IAC")
+
+
+m <- melt(df_plot)
+m2 <- m %>%  
+  mutate(Cell_type_refined = factor(Cell_type_refined, levels=lvlnancy))
+
+pal.10 <- paletteer::paletteer_d("ggthemes::Tableau_10")
+pal.20 <- paletteer_d("ggthemes::Tableau_20")
+
+p2 <- 
+  ggplot(m2, aes(x=Cell_type_refined, y=value, fill=Cell_type_refined)) +
+  geom_quasirandom(groupOnX=TRUE, size = 0.8, alpha = 0.5, width = 0.4) +
+  geom_violin(alpha = 0.5, scale = "width", position = position_dodge(width = 0.9)) +
+  geom_boxplot(alpha = 0.5, width = 0.2, position = position_dodge(width = 0.9),
+               outlier.shape=NA) +
+  scale_fill_manual(values=pal.10) +
+  theme_bw() +
+  theme(legend.position = "none",
+        panel.grid.major = element_line(linetype = "blank"), 
+        panel.grid.minor = element_line(linetype = "blank"),
+        axis.text.x = element_text(angle = 45, hjust = 1)) +
+  facet_wrap(~variable, ncol=1, scale="free_y") +
+  NULL
+
+ggsave(p2, file=file.path(wd$cur, "Sig_score_nancy.pdf"), width = 10, height = 12, device="pdf")
+```
+
+## AGM E10.5 and E11.5
+
+Lets try to run the same signature on the E10.5 and E11.5 dataset
+
+```{r}
+se_e10_e11 <- readRDS(file.path(wd$data, "se_E10.5_E11.5.RDS"))
+```
+
+
+Calculate score
+
+```{r}
+sce_in <- se_e10_e11
+sce2 <- ScoreSignatures_UCell(sce_in, features=ll, 
+                                 assay = 'counts', name=NULL)
+
+
+```
+
+
+Extract UCell value
+
+```{r}
+df_meta <- as.data.frame(colData(sce2))
+
+dat_Ucell <- t(assay(altExp(sce2, "UCell")))
+
+df_data <- cbind(df_meta, dat_Ucell)
+
+# Plot
+df_plot <- df_data %>% select(Population, eStage, Hec_sel:All)
+
+m <- melt(df_plot)
+m2 <- m %>%  
+  filter(Population %in% c("E11.5_Fcs-HE-Gfi", "E10.5_Fcs-HE-Gfi1"))
+
+
+p3 <- 
+  ggplot(m2, aes(x=Population, y=value, fill=Population)) +
+  geom_quasirandom(groupOnX=TRUE, size = 0.8, alpha = 0.5, width = 0.4) +
+  geom_violin(alpha = 0.5, scale = "width", position = position_dodge(width = 0.9)) +
+  geom_boxplot(alpha = 0.5, width = 0.2, position = position_dodge(width = 0.9),
+               outlier.shape=NA) +
+  #scale_fill_manual(values=pal.10) +
+  theme_bw() +
+  theme(legend.position = "none",
+        panel.grid.major = element_line(linetype = "blank"), 
+        panel.grid.minor = element_line(linetype = "blank"),
+        axis.text.x = element_text(angle = 45, hjust = 1)) +
+  facet_wrap(~variable, ncol=1, scale="free_y") +
+  NULL
+
+ggsave(p3, file=file.path(wd$cur, "Sig_score_E10.5_E11.5.pdf"), width = 10, height = 12, device="pdf")
+```
+
+
+Plot some gene expression
+
+```{r}
+gg2 <- c("Sox17", "Runx1", "Fbln5", "Gfi1", "Sox7")
+g.exp <- assay(se_e10_e11, "logcounts")[gg2,] %>% 
+  melt() %>% 
+  dplyr::rename(Cell = Var2)
+
+cD_e <- as.data.frame(colData(se_e10_e11)) %>% 
+  tibble::rownames_to_column(var = "Cell")
+
+mm <- g.exp %>% left_join(cD_e) %>% 
+  filter(Population %in% c("E11.5_Fcs-HE-Gfi", "E10.5_Fcs-HE-Gfi1"))
+
+p4 <- 
+  ggplot(mm, aes(x=Population, y=value, fill=Population)) +
+  geom_quasirandom(groupOnX=TRUE, size = 0.8, alpha = 0.5, width = 0.4) +
+  geom_violin(alpha = 0.5, scale = "width", position = position_dodge(width = 0.9)) +
+  geom_boxplot(alpha = 0.5, width = 0.2, position = position_dodge(width = 0.9),
+               outlier.shape=NA) +
+  scale_y_continuous(limits=c(0,14)) +
+  #scale_fill_manual(values=pal.10) +
+  theme_bw() +
+  theme(legend.position = "none",
+        panel.grid.major = element_line(linetype = "blank"), 
+        panel.grid.minor = element_line(linetype = "blank"),
+        axis.text.x = element_text(angle = 45, hjust = 1)) +
+  facet_wrap(~Var1, ncol=1, scale="free_y") +
+  geom_signif(
+    test = "t.test",
+    colour = "black",
+    y_position = 12,
+    comparisons = list(c(
+      "E11.5_Fcs-HE-Gfi", "E10.5_Fcs-HE-Gfi1")),
+    map_signif_level = TRUE) +
+  NULL
+
+ggsave(p4, file=file.path(wd$cur, "Gene_exp_E10.5_E11.5.pdf"), width = 10, height = 12, device="pdf")
+
+```
+
+
+## EHT data
+
+Repeat on our dataset
+
+Calculate score
+
+```{r}
+sce_in <- se.full
+sce2 <- ScoreSignatures_UCell(sce_in, features=ll, 
+                                 assay = 'counts', name=NULL)
+
+
+```
+
+
+Extract UCell value
+
+```{r}
+df_meta <- as.data.frame(colData(sce2))
+
+dat_Ucell <- t(assay(altExp(sce2, "UCell")))
+
+df_data <- cbind(df_meta, dat_Ucell)
+
+# Plot
+df_plot <- df_data %>% select(in_silico_clusters, Hec_sel:All)
+
+m <- melt(df_plot)
+
+
+
+p4 <- 
+  ggplot(m, aes(x=in_silico_clusters, y=value, fill=in_silico_clusters)) +
+  geom_quasirandom(groupOnX=TRUE, size = 0.8, alpha = 0.5, width = 0.4) +
+  geom_violin(alpha = 0.5, scale = "width", position = position_dodge(width = 0.9)) +
+  geom_boxplot(alpha = 0.5, width = 0.2, position = position_dodge(width = 0.9),
+               outlier.shape=NA) +
+  scale_fill_manual(values=pal_tmp$Col) +
+  theme_bw() +
+  theme(legend.position = "none",
+        panel.grid.major = element_line(linetype = "blank"), 
+        panel.grid.minor = element_line(linetype = "blank"),
+        axis.text.x = element_text(angle = 45, hjust = 1)) +
+  facet_wrap(~variable, ncol=1, scale="free_y") +
+  NULL
+
+ggsave(p4, file=file.path(wd$cur, "Sig_score_YS_AGM_EHT.pdf"), width = 10, height = 12, device="pdf")
+```
+
+If we segregate them by trajectories
+
+```{r}
+m2 <- m %>% 
+  filter(!in_silico_clusters == "AGM_VE") %>% 
+  mutate(Traj = case_when(str_detect(in_silico_clusters, "AGM") ~ "AGM" ,
+                          in_silico_clusters %in% c("mix", "YS_m1", "YS_m2", "YS_p1", "YS_LMP") ~ "YS_m",
+                          in_silico_clusters %in% c("YS_b1", "YS_b2", "YS_b3", "YS_p2", "YS_EMP") ~ "YS_b"
+                          ))
+
+m3 <- m2 %>% filter(variable == "Hec_sel")
+
+# Order differntly
+new_or <- 
+  c(
+    "AGM_1", "AGM_2", "AGM_3", "AGM_4", "AGM_5", 
+    "mix", "YS_m1", "YS_m2", "YS_p1", "YS_LMP", 
+    "YS_b1", "YS_b2", "YS_b3", "YS_p2", "YS_EMP")
+
+m3 <- m3 %>%
+  mutate(in_silico_clusters = factor(in_silico_clusters, levels=new_or))
+
+# Plot
+pal_tmp <- df_pal_cl %>% filter(Meta %in% m3$in_silico_clusters) %>% 
+  mutate(Meta = factor(Meta, levels=new_or)) %>% 
+  arrange(Meta)
+
+
+pp4 <- 
+  ggplot(m3, aes(x=in_silico_clusters, y=value, fill=in_silico_clusters)) +
+  geom_quasirandom(groupOnX=TRUE, size = 0.8, alpha = 0.5, dodge.width = 0.9) +
+  geom_violin(alpha = 0.5, scale = "width", position = position_dodge(width = 0.9)) +
+  geom_boxplot(alpha = 0.5, width = 0.2, position = position_dodge(width = 0.9),
+               outlier.shape=NA) +
+  scale_fill_manual(values=pal_tmp$Col) +
+  theme_bw() +
+  theme(legend.position = "right",
+        panel.grid.major = element_line(linetype = "blank"), 
+        panel.grid.minor = element_line(linetype = "blank"),
+        axis.text.x = element_text(angle = 45, hjust = 1)) +
+  #facet_wrap(~Traj, ncol=4, scale="free_y") +
+  NULL
+
+
+ggsave(pp4, file=file.path(wd$cur, "Sig_score_YS_AGM_EHT_byTraj.pdf"), width = 8, height = 4, device="pdf")
+```
+
+
+
+Lets try to E9.0 and E9.5 YS
+
+```{r}
+pop_all <- unique(se.full$condition)
+pop_all2 <- pop_all[grep("YS_E9.[0-5]", pop_all)]
+
+sce_in <- se.full[,se.full$condition %in% pop_all2]
+
+sce2 <- ScoreSignatures_UCell(sce_in, features=ll, 
+                                 assay = 'counts', name=NULL)
+
+# Extract values & plot
+df_meta <- as.data.frame(colData(sce2))
+dat_Ucell <- t(assay(altExp(sce2, "UCell")))
+df_data <- cbind(df_meta, dat_Ucell)
+
+df_plot <- df_data %>% select(in_silico_clusters, Hec_sel:All)
+m <- melt(df_plot)
+
+pal_tmp <- df_pal_cl %>% filter(Meta %in% m$in_silico_clusters)
+
+p5 <- 
+  ggplot(m, aes(x=in_silico_clusters, y=value, fill=in_silico_clusters)) +
+  geom_quasirandom(groupOnX=TRUE, size = 0.8, alpha = 0.5, width = 0.4) +
+  geom_violin(alpha = 0.5, scale = "width", position = position_dodge(width = 0.9)) +
+  geom_boxplot(alpha = 0.5, width = 0.2, position = position_dodge(width = 0.9),
+               outlier.shape=NA) +
+  scale_fill_manual(values=pal_tmp$Col) +
+  theme_bw() +
+  theme(legend.position = "none",
+        panel.grid.major = element_line(linetype = "blank"), 
+        panel.grid.minor = element_line(linetype = "blank"),
+        axis.text.x = element_text(angle = 45, hjust = 1)) +
+  facet_wrap(~variable, ncol=1, scale="free_y") +
+  ggtitle("Signature limited to - E9.0 & E9.5 YS") +
+  NULL
+
+ggsave(p5, file=file.path(wd$cur, "Sig_score_YS_9.0_YS_E9.5.pdf"), width = 10, height = 12, device="pdf")
+
+```
+
+Lets try E9.5 YS alone
+
+```{r}
+pop_all <- unique(se.full$condition)
+pop_all2 <- pop_all[grep("YS_E9.5", pop_all)]
+
+sce_in <- se.full[,se.full$condition %in% pop_all2]
+
+sce2 <- ScoreSignatures_UCell(sce_in, features=ll, 
+                                 assay = 'counts', name=NULL)
+
+# Extract values & plot
+df_meta <- as.data.frame(colData(sce2))
+dat_Ucell <- t(assay(altExp(sce2, "UCell")))
+df_data <- cbind(df_meta, dat_Ucell)
+
+df_plot <- df_data %>% select(in_silico_clusters, Hec_sel:All)
+m <- melt(df_plot)
+
+pal_tmp <- df_pal_cl %>% filter(Meta %in% m$in_silico_clusters)
+
+p6 <- 
+  ggplot(m, aes(x=in_silico_clusters, y=value, fill=in_silico_clusters)) +
+  geom_quasirandom(groupOnX=TRUE, size = 0.8, alpha = 0.5, width = 0.4) +
+  geom_violin(alpha = 0.5, scale = "width", position = position_dodge(width = 0.9)) +
+  geom_boxplot(alpha = 0.5, width = 0.2, position = position_dodge(width = 0.9),
+               outlier.shape=NA) +
+  scale_fill_manual(values=pal_tmp$Col) +
+  theme_bw() +
+  theme(legend.position = "none",
+        panel.grid.major = element_line(linetype = "blank"), 
+        panel.grid.minor = element_line(linetype = "blank"),
+        axis.text.x = element_text(angle = 45, hjust = 1)) +
+  facet_wrap(~variable, ncol=1, scale="free_y") +
+  ggtitle("Signature limited to - E9.5 YS") +
+  NULL
+
+ggsave(p6, file=file.path(wd$cur, "Sig_score_YS_E9.5.pdf"), width = 10, height = 12, device="pdf")
+
+```
+
+Lets try E10.5 YS alone
+
+```{r}
+pop_all <- unique(se.full$condition)
+pop_all2 <- pop_all[grep("YS_E10.5", pop_all)]
+
+sce_in <- se.full[,se.full$condition %in% pop_all2]
+
+sce2 <- ScoreSignatures_UCell(sce_in, features=ll, 
+                                 assay = 'counts', name=NULL)
+
+# Extract values & plot
+df_meta <- as.data.frame(colData(sce2))
+dat_Ucell <- t(assay(altExp(sce2, "UCell")))
+df_data <- cbind(df_meta, dat_Ucell)
+
+df_plot <- df_data %>% select(in_silico_clusters, Hec_sel:All)
+m <- melt(df_plot)
+
+pal_tmp <- df_pal_cl %>% filter(Meta %in% m$in_silico_clusters)
+
+p7 <- 
+  ggplot(m, aes(x=in_silico_clusters, y=value, fill=in_silico_clusters)) +
+  geom_quasirandom(groupOnX=TRUE, size = 0.8, alpha = 0.5, width = 0.4) +
+  geom_violin(alpha = 0.5, scale = "width", position = position_dodge(width = 0.9)) +
+  geom_boxplot(alpha = 0.5, width = 0.2, position = position_dodge(width = 0.9),
+               outlier.shape=NA) +
+  scale_fill_manual(values=pal_tmp$Col) +
+  theme_bw() +
+  theme(legend.position = "none",
+        panel.grid.major = element_line(linetype = "blank"), 
+        panel.grid.minor = element_line(linetype = "blank"),
+        axis.text.x = element_text(angle = 45, hjust = 1)) +
+  facet_wrap(~variable, ncol=1, scale="free_y") +
+  ggtitle("Signature limited to - E10.5 YS") +
+  NULL
+
+ggsave(p7, file=file.path(wd$cur, "Sig_score_YS_E10.5.pdf"), width = 10, height = 12, device="pdf")
+
+```
+
+If we subset the values when the signature is calculated
+
+```{r}
+sce_in <- se.full
+
+sce2 <- ScoreSignatures_UCell(sce_in, features=ll, 
+                                 assay = 'counts', name=NULL)
+
+# Extract values & plot
+df_meta <- as.data.frame(colData(sce2))
+dat_Ucell <- t(assay(altExp(sce2, "UCell")))
+df_data <- cbind(df_meta, dat_Ucell)
+
+df_plot <- df_data %>% select(in_silico_clusters, condition, Hec_sel:All)
+m <- melt(df_plot)
+
+# Plot of E9.0, E9.5, E10.5
+pop_all2 <- pop_all[grep("YS_E9.[0-5]", pop_all)] %>% as.character()
+m1 <- m %>% filter(condition %in% pop_all2)
+pal_tmp <- df_pal_cl %>% filter(Meta %in% m1$in_silico_clusters)
+
+
+p8.1 <- 
+  ggplot(m1, aes(x=in_silico_clusters, y=value, fill=in_silico_clusters)) +
+  geom_quasirandom(groupOnX=TRUE, size = 0.8, alpha = 0.5, width = 0.4) +
+  geom_violin(alpha = 0.5, scale = "width", position = position_dodge(width = 0.9)) +
+  geom_boxplot(alpha = 0.5, width = 0.2, position = position_dodge(width = 0.9),
+               outlier.shape=NA) +
+  scale_fill_manual(values=pal_tmp$Col) +
+  theme_bw() +
+  theme(legend.position = "none",
+        panel.grid.major = element_line(linetype = "blank"), 
+        panel.grid.minor = element_line(linetype = "blank"),
+        axis.text.x = element_text(angle = 45, hjust = 1)) +
+  facet_wrap(~variable, ncol=1, scale="free_y") +
+  ggtitle("Signature limited to - E9.0 & E9.5 YS") +
+  NULL
+
+# E9.5
+pop_all2 <- pop_all[grep("YS_E9.5", pop_all)]
+m1 <- m %>% filter(condition %in% pop_all2)
+pal_tmp <- df_pal_cl %>% filter(Meta %in% m1$in_silico_clusters)
+
+p8.2 <- 
+  ggplot(m1, aes(x=in_silico_clusters, y=value, fill=in_silico_clusters)) +
+  geom_quasirandom(groupOnX=TRUE, size = 0.8, alpha = 0.5, width = 0.4) +
+  geom_violin(alpha = 0.5, scale = "width", position = position_dodge(width = 0.9)) +
+  geom_boxplot(alpha = 0.5, width = 0.2, position = position_dodge(width = 0.9),
+               outlier.shape=NA) +
+  scale_fill_manual(values=pal_tmp$Col) +
+  theme_bw() +
+  theme(legend.position = "none",
+        panel.grid.major = element_line(linetype = "blank"), 
+        panel.grid.minor = element_line(linetype = "blank"),
+        axis.text.x = element_text(angle = 45, hjust = 1)) +
+  facet_wrap(~variable, ncol=1, scale="free_y") +
+  ggtitle("Signature limited to - E9.5 YS") +
+  NULL
+
+# E10.5
+pop_all2 <- pop_all[grep("YS_E10.5", pop_all)]
+m1 <- m %>% filter(condition %in% pop_all2)
+pal_tmp <- df_pal_cl %>% filter(Meta %in% m1$in_silico_clusters)
+
+p8.3 <- 
+  ggplot(m1, aes(x=in_silico_clusters, y=value, fill=in_silico_clusters)) +
+  geom_quasirandom(groupOnX=TRUE, size = 0.8, alpha = 0.5, width = 0.4) +
+  geom_violin(alpha = 0.5, scale = "width", position = position_dodge(width = 0.9)) +
+  geom_boxplot(alpha = 0.5, width = 0.2, position = position_dodge(width = 0.9),
+               outlier.shape=NA) +
+  scale_fill_manual(values=pal_tmp$Col) +
+  theme_bw() +
+  theme(legend.position = "none",
+        panel.grid.major = element_line(linetype = "blank"), 
+        panel.grid.minor = element_line(linetype = "blank"),
+        axis.text.x = element_text(angle = 45, hjust = 1)) +
+  facet_wrap(~variable, ncol=1, scale="free_y") +
+  ggtitle("Signature limited to - E10.5 YS") +
+  NULL
+
+pdf(file.path(wd$cur, "Sig_score_fullSet.pdf"), width = 10, height = 12)
+p8.1
+p8.2
+p8.3
+dev.off()
+```
+
+
+Plot E9.5 and E10.5 side by side
+
+```{r}
+# E9.5
+pop_all2 <- pop_all[grep("YS_E9.5", pop_all)]
+m1 <- m %>% filter(condition %in% pop_all2) %>% mutate(eStage = "E9.5")
+# E 10.5
+pop_all2 <- pop_all[grep("YS_E10.5", pop_all)]
+m2 <- m %>% filter(condition %in% pop_all2) %>% mutate(eStage = "E10.5")
+
+m3 <- rbind(m1, m2)
+m3 <- m3 %>% filter(!str_detect(in_silico_clusters, "AGM"))
+
+p9 <- 
+  ggplot(m3, aes(x=in_silico_clusters, y=value, fill=eStage)) +
+  #geom_quasirandom(groupOnX=TRUE, size = 0.8, alpha = 0.5, width = 0.7) +
+  #geom_violin(alpha = 0.5, scale = "width", position = position_dodge(width = 0.9)) +
+  geom_boxplot(alpha = 0.5, width = 0.2, position = position_dodge(width = 0.4),
+               outlier.shape=NA) +
+  #scale_fill_manual(values=pal_tmp$Col) +
+  theme_bw() +
+  theme(legend.position = "right",
+        panel.grid.major = element_line(linetype = "blank"), 
+        panel.grid.minor = element_line(linetype = "blank"),
+        axis.text.x = element_text(angle = 45, hjust = 1)) +
+  facet_wrap(~variable, ncol=1, scale="free_y") +
+  ggtitle("Comparing signature") +
+  NULL
+
+ggsave(p9, file=file.path(wd$cur, "Sig_score_E9.5_E10.5_sideByside.pdf"), width = 10, height = 12, device="pdf")
+write.csv(m3, file.path(wd$cur, "Sig_scoreData.csv"))
+```
+
+
+## AGM & YS data
+
+We wanted to get the scRNA-seq data from this [publication](https://www.sciencedirect.com/science/article/pii/S1673852723001169#fig3). Specifically we want to extract the clusters in Figure 3. 
+
+The scRNA-seq data from Figure 3 are of these populations; 
+
+1) **YS cells** E10.0–E10.5 endothelial cells (CD41–CD43–CD45–CD31+CD144+): CD44+Gja5-EGFP+    
+2) **YS cells** E10.0–E10.5 endothelial cells (CD41–CD43–CD45–CD31+CD144+): CD44+Gja5-EGFP–   
+3) **AGM cells** E10.0–E10.5 endothelial cells (CD41–CD43–CD45–CD31+CD144+): CD44+Gja5-EGFP+
+
+4) **YS cells** E10.0 PK44 cells
+5) **AGM cells** E10.0 PK44 cells
+
+
+These cells were described in previous publications by their group;   
+
+1) AGM PK 44 population [publication](https://www.nature.com/articles/s41422-020-0300-2) with the GEO ID [GSE139389](https://www.ncbi.nlm.nih.gov/geo/query/acc.cgi?acc=GSE139389) 
+2) YS data are from two publications;  
+    a) YS Gja5+ population [publication](https://pubmed.ncbi.nlm.nih.gov/34181164/) with the GEO ID [GSE167588](https://www.ncbi.nlm.nih.gov/geo/query/acc.cgi?acc=GSE167588) 
+    b) YS PK 44 population [publication](https://pubmed.ncbi.nlm.nih.gov/34458261/) with the GEO ID [GSE173833](https://www.ncbi.nlm.nih.gov/geo/query/acc.cgi?acc=GSE173833) 
+
+
+We do this one publication at a time
+
+
+### AGM data
+
+We focused on the AGM data, specifically [Figure 4G](https://www.nature.com/articles/s41422-020-0300-2/figures/4) of the publication.
+
+```{r}
+AGM_loc <- file.path(wd$data, "publicdata/AGM_YS/AGM_Hou_2020/")
+# Read the metadata of Figure 4
+agm_dat_f4 <- readxl::read_xls(file.path(AGM_loc, "41422_2020_300_MOESM5_ESM.xls"),
+                               sheet = 8) %>% 
+  dplyr::rename(Cell = '...1')
+
+# Replot the low dimension embedding
+ggplot(agm_dat_f4, aes(x=tSNE_2, y=tSNE_1, colour=Cluster)) +
+  geom_point() +
+  theme_bw() +
+  theme_custom +
+  NULL
+```
+
+
+Now lets get the raw counts data of these cells. The raw counts were uploaded per experiement batch. So lets read all the counts and subset to those we are interested in. 
+
+```{r}
+list_files <- list.files(file.path(AGM_loc, "GEO_data"), pattern = "*.txt", full.names = TRUE)
+
+# Read all files and create a master count list
+tmp_list <- list()
+for (i in seq_along(list_files)){
+  
+  x1 <- read.delim(file.path(list_files[i]))
+  
+  tmp_list[[i]] <- x1
+}
+
+
+AGM_counts <- do.call(cbind, tmp_list)
+
+# Subset to interested cells
+AGM_counts_sub <- AGM_counts[,agm_dat_f4$Cell]
+
+# Sanity check
+identical(colnames(AGM_counts_sub), agm_dat_f4$Cell)
+```
+
+
+Calculate score & plot Ucell values
+
+```{r}
+# Create single cell object
+hou.sce <- 
+  SingleCellExperiment(
+  assays = list(counts = AGM_counts_sub),
+  colData = agm_dat_f4)
+
+sce_in <- hou.sce
+sce2 <- ScoreSignatures_UCell(sce_in, features=ll, 
+                                 assay = 'counts', name=NULL)
+
+# Extract value
+df_meta <- as.data.frame(colData(sce2))
+
+dat_Ucell <- t(assay(altExp(sce2, "UCell")))
+
+df_data <- cbind(df_meta, dat_Ucell)
+
+# Plot
+df_plot <- df_data %>% select(Cluster, matches("Hec_sel|Up_|All"))
+
+
+lvl_hou <- c("vEC", "earlyAEC", "lateAEC", "NE+", "tif-HEC", "HC")
+
+
+m <- melt(df_plot)
+m2 <- m %>%  
+  mutate(Cluster = factor(Cluster, levels=lvl_hou))
+
+pal.10 <- paletteer::paletteer_d("ggthemes::Tableau_10")
+#pal.20 <- paletteer_d("ggthemes::Tableau_20")
+
+p_hou <- 
+  ggplot(m2, aes(x=Cluster, y=value, fill=Cluster)) +
+  geom_quasirandom(groupOnX=TRUE, size = 0.8, alpha = 0.5, width = 0.4) +
+  geom_violin(alpha = 0.5, scale = "width", position = position_dodge(width = 0.9)) +
+  geom_boxplot(alpha = 0.5, width = 0.2, position = position_dodge(width = 0.9),
+               outlier.shape=NA) +
+  scale_fill_manual(values=pal.10) +
+  theme_bw() +
+  theme(legend.position = "none",
+        panel.grid.major = element_line(linetype = "blank"), 
+        panel.grid.minor = element_line(linetype = "blank"),
+        axis.text.x = element_text(angle = 45, hjust = 1)) +
+  facet_wrap(~variable, ncol=1, scale="free_y") +
+  NULL
+
+ggsave(p_hou, file=file.path(wd$cur, "Sig_score_Hou_AGM.pdf"), width = 10, height = 12, device="pdf")
+```
+
+
+### YS data
+
+Repeat same thing in the YS data.
+
+#### Dataset 1
+
+
+In this [paper](https://www.frontiersin.org/articles/10.3389/fcell.2021.699263/full), they sequenced PK44 cells from the YS. However they did not provide the clustering for these cells. Instead they distinguised the YS PK44 to either ENDO-biased or HEMATO-biased in [Figure 5](https://www.frontiersin.org/files/Articles/699263/fcell-09-699263-HTML/image_m/fcell-09-699263-g005.jpg). 
+
+So we 1st downaload the GEO file, then infer ourself the clusters. 
+
+
+```{r}
+YS_loc1 <- file.path(wd$data, "publicdata/AGM_YS/YS_Li/")
+
+dat1 <- read.csv(file.path(YS_loc1, "GEO_GSE173833/GSM5281418_HE1_rawdata.csv"))
+dat2 <- read.csv(file.path(YS_loc1, "GEO_GSE173833/GSM5281419_HE2_rawdata.csv")) %>% select(-X)
+
+dat <- cbind(dat1,dat2)
+rownames(dat) <- dat$X  
+dat <- dat[,-1]
+
+se_YSpk44 <- 
+  SingleCellExperiment(
+  assays = list(counts = dat))
+
+# Normalize
+set.seed(123)
+se_YSpk44 <- computeSumFactors(se_YSpk44, min.mean=0.1)
+se_YSpk44 <- logNormCounts(se_YSpk44)
+
+dec.se <- modelGeneVar(se_YSpk44)
+top.se <- getTopHVGs(dec.se, n=2000)
+se_YSpk44 <- runPCA(se_YSpk44, subset_row=top.se) 
+
+se_YSpk44 <- runUMAP(se_YSpk44, dimred="PCA", subset_row=top.se,
+              pca=30,
+              n_neighbors=30,
+              min_dist=0.4)
+
+
+```
+
+
+The paper provided a list of DEG that distinguish ENDO-biased and HEMATO-biased. Lets use this gene to cluster the cells
+
+```{r}
+# Read in the genes
+df_deg <- read_xlsx(file.path(YS_loc1, "Table 1.xlsx"), sheet = 3, skip=2) %>% 
+  dplyr::select(-'...1')
+chosen <- df_deg$gene
+
+# Cluster cells
+chosen.exprs <- assay(se_YSpk44, "logcounts")[chosen,]
+my.dist = dist(as.matrix(t(chosen.exprs)), method = "euclidean")
+my.tree <- hclust(my.dist, method="ward.D2")
+
+my.dend <- as.dendrogram(my.tree, hang=0.1)
+my.clusters <- unname(cutreeDynamic(my.tree, distM=as.matrix(my.dist), verbose=0, minClusterSize=10, deepSplit=0))
+#my.clusters <- paste0("k_", my.clusters)
+length(unique(my.clusters))
+
+n_clusters <- length(unique(my.clusters))
+
+
+# Making a prettier dendrogram.
+my.tree$labels <- seq_along(my.tree$labels)
+coltree <- gg_color_hue(n=n_clusters)
+
+my.tree_or <- my.clusters[order.dendrogram(my.dend)]
+
+# Setting up colours for the clustering
+se_YSpk44$TreeCut <- paste0("k_", my.clusters)
+cFACS <- coltree[as.factor(se_YSpk44$TreeCut)[order.dendrogram(my.dend)]]
+
+dend2 <- branches_attr_by_clusters(my.dend, my.tree_or, values = coltree)
+plot(dend2)
+
+UniqClus <- unique(my.tree_or)
+
+pdf(file.path(wd$cur, "YS_Li_Tree.pdf"),height = 4, width = 12)
+plot(dend2)
+
+plot(UniqClus, ylim = c(-1, length(UniqClus)))
+text(x =1:length(UniqClus), y=-1, UniqClus)
+
+dev.off()
+
+plotPCA(se_YSpk44, colour_by="TreeCut")
+
+plotExpression(se_YSpk44, features="Gja5", x="TreeCut")
+```
+
+
+
+
+Calculate score & plot Ucell values
+
+```{r}
+sce_in <- se_YSpk44
+sce2 <- ScoreSignatures_UCell(sce_in, features=ll, 
+                                 assay = 'counts', name=NULL)
+
+# Extract value
+df_meta <- as.data.frame(colData(sce2))
+
+dat_Ucell <- t(assay(altExp(sce2, "UCell")))
+
+df_data <- cbind(df_meta, dat_Ucell)
+
+# Plot
+df_plot <- df_data %>% select(TreeCut, matches("Hec_sel|Up_|All"))
+
+
+lvl_li <- c("k_2", "k_1", "k_3")
+
+
+m <- melt(df_plot)
+m2 <- m %>%  
+  mutate(Cluster = factor(TreeCut, levels=lvl_li))
+
+pal.10 <- paletteer::paletteer_d("ggthemes::Tableau_10")
+#pal.20 <- paletteer_d("ggthemes::Tableau_20")
+
+p_li <- 
+  ggplot(m2, aes(x=Cluster, y=value, fill=Cluster)) +
+  geom_quasirandom(groupOnX=TRUE, size = 0.8, alpha = 0.5, width = 0.4) +
+  geom_violin(alpha = 0.5, scale = "width", position = position_dodge(width = 0.9)) +
+  geom_boxplot(alpha = 0.5, width = 0.2, position = position_dodge(width = 0.9),
+               outlier.shape=NA) +
+  scale_fill_manual(values=pal.10) +
+  theme_bw() +
+  theme(legend.position = "none",
+        panel.grid.major = element_line(linetype = "blank"), 
+        panel.grid.minor = element_line(linetype = "blank"),
+        axis.text.x = element_text(angle = 45, hjust = 1)) +
+  facet_wrap(~variable, ncol=1, scale="free_y") +
+  NULL
+
+ggsave(p_li, file=file.path(wd$cur, "Sig_score_Li_YS_PK44.pdf"), width = 10, height = 12, device="pdf")
+```
+
+
+Draw heatmap
+
+```{r}
+exp_mat <- assay(sce_in, "logcounts")[chosen,]
+# Scale the rows
+mat2 = t(apply(exp_mat, 1, function(x) {
+    q10 = quantile(x, 0.1)
+    q90 = quantile(x, 0.9)
+    x[x < q10] = q10
+    x[x > q90] = q90
+    scale(x)}))
+colnames(mat2) <- colnames(exp_mat)
+# Some NA because of the sacling, so we remove them
+x <- mat2[,1]
+y <- x[is.na(x)]
+mat22 <- mat2[!row.names(mat2) %in% names(y),]
+
+mat_YS_PK44 <- mat22
+
+
+# Re-order
+df_or <- data.frame(
+  Cell = colnames(sce_in),
+  Cluster = factor(sce_in$TreeCut, lvl_li)
+) %>% arrange(Cluster)
+
+mat22_or <- mat22[,df_or$Cell]
+
+# Heatmap annotation
+column_ha = HeatmapAnnotation(
+  cluster = df_or$Cluster
+  #col = list(
+    #ct = c(
+      #"mel" = "green","lung" = "blue")
+  #)
+)
+
+ComplexHeatmap::Heatmap(
+  as.matrix(mat22_or),
+  cluster_columns = FALSE,
+  show_column_names = FALSE,
+  row_names_gp = gpar(fontsize = 10),
+  top_annotation = column_ha)
+
+
+pdf(file.path(wd$cur, "Heatmap_YS_PK44.pdf"), width = 10, height = 7)
+ComplexHeatmap::Heatmap(
+  as.matrix(mat22_or),
+  cluster_columns = FALSE,
+  show_column_names = FALSE,
+  row_names_gp = gpar(fontsize = 10),
+  top_annotation = column_ha)
+dev.off()
+
+```
+
+#### Dataset 2
+
+We focused on the other YS data, specifically [Figure 5](https://link.springer.com/article/10.1007/s11427-021-1935-2) of the publication.
+
+
+```{r}
+YS_loc2 <- file.path(wd$data, "publicdata/AGM_YS/YS_Wang_2021/")
+# Read the metadata of Figure 4
+ys_dat_f5 <- readxl::read_xls(file.path(YS_loc2, "11427_2021_1935_MOESM7_ESM.xls"), skip=1) %>% 
+  dplyr::rename(Cell = '...1')
+
+# Replot the low dimension embedding
+ggplot(ys_dat_f5, aes(x=PC1, y=PC2, colour=cluster)) +
+  geom_point() +
+  theme_bw() +
+  theme_custom +
+  NULL
+```
+
+
+Now lets get the raw counts data of these cells. The raw counts were uploaded per experiement batch. So lets read all the counts and subset to those we are interested in. 
+
+We noted the "processed_rawdata" and "Gja5" files has differnt number of genes. So lets process them seperately
+
+```{r}
+# Read  processed_rawdata.tx and create a master count list
+list_files <- list.files(file.path(YS_loc2, "GSE167588_RAW"), pattern = "*processed_rawdata.tx", full.names = TRUE)
+tmp_list <- list()
+for (i in seq_along(list_files)){
+  
+  x1 <- read.csv(file.path(list_files[i]))
+  
+  tmp_list[[i]] <- x1
+}
+
+gene_info <- read.csv(file.path(list_files[i]))
+YS_dat2_count_1 <- do.call(cbind, tmp_list)
+rownames(YS_dat2_count_1) <- gene_info$X
+
+
+
+# Read  processed_rawdata.tx and create a master count list
+list_files <- list.files(file.path(YS_loc2, "GSE167588_RAW"), pattern = "*Gja5*", full.names = TRUE)
+
+tmp_list <- list()
+for (i in seq_along(list_files)){
+  
+  x1 <- read.csv(file.path(list_files[i]))
+  x1 <- x1[,-1]
+  
+  tmp_list[[i]] <- x1
+}
+
+gene_info <- read.csv(file.path(list_files[i]))
+YS_dat2_count_2 <- do.call(cbind, tmp_list)
+rownames(YS_dat2_count_2) <- gene_info$X
+
+
+# Make sure the two data has the same rownames
+int_row <- intersect(rownames(YS_dat2_count_2), rownames(YS_dat2_count_1))
+
+# Merge the two
+YS_1 <- YS_dat2_count_1[int_row,]
+YS_2 <- YS_dat2_count_2[int_row,]
+
+
+YS_all <- cbind(YS_1, YS_2)
+
+# Subset to interested cells in figure 5
+YS_all_sub <- YS_all[,ys_dat_f5$Cell]
+
+# Sanity check
+identical(colnames(YS_all_sub), ys_dat_f5$Cell)
+```
+
+
+Calculate score & plot Ucell values
+
+```{r}
+# Create single cell object
+wang.sce <- 
+  SingleCellExperiment(
+  assays = list(counts = YS_all_sub),
+  colData = ys_dat_f5)
+
+sce_in <- wang.sce
+sce2 <- ScoreSignatures_UCell(sce_in, features=ll, 
+                                 assay = 'counts', name=NULL)
+
+# Extract value
+df_meta <- as.data.frame(colData(sce2))
+
+dat_Ucell <- t(assay(altExp(sce2, "UCell")))
+
+df_data <- cbind(df_meta, dat_Ucell)
+
+# Plot
+df_plot <- df_data %>% select(cluster, matches("Hec_sel|Up_|All"))
+
+
+lvl_wang <- c("YS_Aplnr+EC", "YS_aEC", "YS_HE", "YS_Ery",
+              "CR_aEC", "CR_HE")
+
+
+m <- melt(df_plot)
+m2 <- m %>%  
+  mutate(Cluster = factor(cluster, levels=lvl_wang))
+
+pal.10 <- paletteer::paletteer_d("ggthemes::Tableau_10")
+#pal.20 <- paletteer_d("ggthemes::Tableau_20")
+
+p_wang <- 
+  ggplot(m2, aes(x=Cluster, y=value, fill=Cluster)) +
+  geom_quasirandom(groupOnX=TRUE, size = 0.8, alpha = 0.5, width = 0.4) +
+  geom_violin(alpha = 0.5, scale = "width", position = position_dodge(width = 0.9)) +
+  geom_boxplot(alpha = 0.5, width = 0.2, position = position_dodge(width = 0.9),
+               outlier.shape=NA) +
+  scale_fill_manual(values=pal.10) +
+  theme_bw() +
+  theme(legend.position = "none",
+        panel.grid.major = element_line(linetype = "blank"), 
+        panel.grid.minor = element_line(linetype = "blank"),
+        axis.text.x = element_text(angle = 45, hjust = 1)) +
+  facet_wrap(~variable, ncol=1, scale="free_y") +
+  NULL
+
+ggsave(p_wang, file=file.path(wd$cur, "Sig_score_Wang_YS.pdf"), width = 10, height = 12, device="pdf")
+```
+
+
+
+# Objective 10
+
+Focus on EMP and LMP signatures
+
+## UCell signature
+
+We define the lists of potential EMP and LMP signatures
+
+```{r}
+# From AGM paper
+dat_sig <- readxl::read_excel(file.path(wd$data, "gene_signature/bloodbld2020007885-suppl2.xlsx"),
+                                 sheet=5, skip=1)
+x1.1 <- dat_sig %>% filter(!is.na(EMP)) %>% pull(EMP)
+x1.2 <- dat_sig %>% filter(!is.na(LMP)) %>% pull(LMP)
+
+# From thesis, filtered genes in EMP and LMP that is not expressed in any other populations 
+dat_sig <- readxl::read_excel(file.path(wd$data, "gene_signature/EMP_LMP_thesis.xlsx"))
+x2.1 <- dat_sig %>% filter(Sig == "EMP_sig") %>% pull(Gene)
+x2.2 <- dat_sig %>% filter(Sig == "LMP_sig") %>% pull(Gene)
+
+
+# Another way is to get those EMP and LMP signatures without filtering if these are expressed in other clusters
+dat_sig <- read.csv(file.path(wd$data, "gene_signature/DE_full_EMPk4_vs_LMPk5.csv"))
+x3.1 <- dat_sig %>% filter(Sig == "TRUE")%>% filter(logFC <= -1.5 ) %>% pull(UniqGeneID)
+x3.2 <- dat_sig %>% filter(Sig == "TRUE") %>% filter(logFC >= 1.5 ) %>% pull(UniqGeneID)
+
+# Michael made a new set of signature
+dat_sig <- readxl::read_excel(file.path(wd$data, "gene_signature/Custom_ML_EMP_LMP.xlsx"))
+x4.1 <- dat_sig %>% filter(Sig == "Early_EMP") %>% pull(Gene)
+x4.2 <- dat_sig %>% filter(Sig == "Early_LMP") %>% pull(Gene)
+```
+
+Make into a list
+
+```{r}
+ll <- list()
+
+ll[[1]] <- x1.1
+ll[[2]] <- x1.2
+ll[[3]] <- x2.1
+ll[[4]] <- x2.2
+ll[[5]] <- x3.1
+ll[[6]] <- x3.2
+ll[[7]] <- x4.1
+ll[[8]] <- x4.2
+
+
+names(ll) <- c("EMP_1", "LMP_1", 
+               "EMP_2", "LMP_2", 
+               "EMP_3", "LMP_3", 
+               "EMP_4", "LMP_4")
+```
+
+Calculate score
+
+```{r}
+pop_all <- unique(se.full$in_silico_clusters)
+pop_all2 <- pop_all[grep("mix|YS", pop_all)]
+
+sce_in <- se.full[,se.full$in_silico_clusters %in% pop_all2]
+#sce_in <- se.full
+
+sce2 <- ScoreSignatures_UCell(sce_in, features=ll, 
+                                 assay = 'counts', name=NULL)
+
+
+```
+
+Extract UCell value
+
+```{r}
+df_meta <- as.data.frame(colData(sce2))
+
+dat_Ucell <- t(assay(altExp(sce2, "UCell")))
+
+df_data <- cbind(df_meta, dat_Ucell)
+
+# Plot
+df_plot <- df_data %>% select(in_silico_clusters, EMP_1:LMP_4)
+
+new_or <- c("YS_p2", "YS_EMP", "YS_p1", "YS_LMP")
+m <- melt(df_plot) %>% filter(in_silico_clusters %in% c("YS_p1", "YS_p2", "YS_EMP", "YS_LMP")) %>% 
+  mutate(in_silico_clusters = factor(in_silico_clusters, levels=new_or)) #%>% 
+  #filter(!variable %in% c("EMP_4", "LMP_4"))
+
+pal_tmp <- df_pal_cl %>% filter(Meta %in% m$in_silico_clusters) %>% 
+  mutate(Meta = factor(Meta, levels=new_or)) %>% 
+  arrange(Meta)
+
+p10 <- 
+  ggplot(m, aes(x=in_silico_clusters, y=value, fill=in_silico_clusters)) +
+  geom_quasirandom(groupOnX=TRUE, size = 0.8, alpha = 0.5, width = 0.4) +
+  geom_violin(alpha = 0.5, scale = "width", position = position_dodge(width = 0.9)) +
+  geom_boxplot(alpha = 0.5, width = 0.2, position = position_dodge(width = 0.9),
+               outlier.shape=NA) +
+  scale_fill_manual(values=pal_tmp$Col) +
+  theme_bw() +
+  theme(legend.position = "none",
+        panel.grid.major = element_line(linetype = "blank"), 
+        panel.grid.minor = element_line(linetype = "blank"),
+        axis.text.x = element_text(angle = 45, hjust = 1)) +
+  facet_wrap(~variable, ncol=2, scale="fixed") +
+  NULL
+
+ggsave(p10, file=file.path(wd$cur, "Sig_score_EMP_LMP_v2.pdf"), width = 12, height = 9, device="pdf")
+```
+
+A version where we show all populations except AGM
+
+```{r}
+df_meta <- as.data.frame(colData(sce2))
+
+dat_Ucell <- t(assay(altExp(sce2, "UCell")))
+
+df_data <- cbind(df_meta, dat_Ucell)
+
+# Plot
+df_plot <- df_data %>% select(in_silico_clusters, EMP_1:LMP_4)
+
+new_or <- c(
+  "mix", "YS_m1", "YS_m2", "YS_p1", "YS_LMP",          
+  "YS_b1", "YS_b2", "YS_b3", "YS_p2", "YS_EMP")
+
+m <- melt(df_plot) %>% filter(in_silico_clusters %in% new_or) %>% 
+  mutate(in_silico_clusters = factor(in_silico_clusters, levels=new_or)) #%>% 
+  #filter(!variable %in% c("EMP_4", "LMP_4"))
+
+pal_tmp <- df_pal_cl %>% filter(Meta %in% m$in_silico_clusters) %>% 
+  mutate(Meta = factor(Meta, levels=new_or)) %>% 
+  arrange(Meta)
+
+p11 <- 
+  ggplot(m, aes(x=in_silico_clusters, y=value, fill=in_silico_clusters)) +
+  geom_quasirandom(groupOnX=TRUE, size = 0.8, alpha = 0.5, width = 0.4) +
+  geom_violin(alpha = 0.5, scale = "width", position = position_dodge(width = 0.9)) +
+  geom_boxplot(alpha = 0.5, width = 0.2, position = position_dodge(width = 0.9),
+               outlier.shape=NA) +
+  scale_fill_manual(values=pal_tmp$Col) +
+  theme_bw() +
+  theme(legend.position = "none",
+        panel.grid.major = element_line(linetype = "blank"), 
+        panel.grid.minor = element_line(linetype = "blank"),
+        axis.text.x = element_text(angle = 45, hjust = 1)) +
+  facet_wrap(~variable, ncol=2, scale="free_y") +
+  NULL
+
+ggsave(p11, file=file.path(wd$cur, "Sig_score_EMP_LMP_v3.pdf"), width = 12, height = 9, device="pdf")
+```
+
+
+
+## Individual genes
+
+Lets just plot some genes in this dataset
+
+```{r}
+setmp <- sce_in
+geneToPlot <- c(
+  # LMP / Lymphoid
+  "Il7r", "Flt3",
+  # EMP / Myeloid
+  "Gata1", "Cpa3")
+
+#geneToPlot <- x2.1[11:20]
+
+expInt <- as.data.frame(as.matrix(assay(setmp, "logcounts")[geneToPlot,]))
+
+
+m <- as.data.frame(expInt)
+colnames(m) <- setmp$Barcode
+m$gene <- row.names(m)
+m <- melt(m)
+#m$gene <- factor(m$gene, levels=geneToPlot)
+dftmp <- as.data.frame(colData(setmp)) 
+cD_sub <- dftmp %>%
+  dplyr::select(Barcode, in_silico_clusters) 
+
+# Order differntly
+new_or <- 
+  c(
+    "mix", "YS_m1", "YS_m2", "YS_p1", "YS_LMP", 
+    "YS_b1", "YS_b2", "YS_b3", "YS_p2", "YS_EMP")
+
+m <- m %>%
+  dplyr::left_join(cD_sub, by = c("variable" = "Barcode")) %>% 
+  filter(in_silico_clusters %in% new_or) %>% 
+  mutate(in_silico_clusters = factor(in_silico_clusters, levels=new_or))
+
+
+# Find number of cells expressing in each group and write it on the top of the plot
+df_g <- m %>%
+  group_by(in_silico_clusters, gene) %>%
+  dplyr::summarise(Ncell = n(),
+                   Nexp = sum( value >0 )) %>%
+  dplyr::mutate(PecExp = round(Nexp / Ncell * 100, 0),
+                Text = paste0(" (", PecExp, "%", ")"))
+
+
+#m$gene <- factor(m$gene, levels=df_g_or$gene)
+m$gene <- factor(m$gene, levels=geneToPlot)
+df_g <- df_g  %>%
+  dplyr::mutate(gene =factor(gene, levels = geneToPlot))
+
+# Plot
+pal_tmp <- df_pal_cl %>% filter(Meta %in% m$in_silico_clusters) %>% 
+  mutate(Meta = factor(Meta, levels=new_or)) %>% 
+  arrange(Meta)
+
+
+p_viol_gene <- 
+  m %>%
+  ggplot(aes(x = in_silico_clusters, y = value, colour = in_silico_clusters)) +
+  geom_violin(fill=NA, scale="width") +
+  geom_quasirandom(groupOnX=TRUE, size = 0.8, alpha = 0.5, width = 0.4) +
+  stat_summary(fun.y = mean, fun.ymin = mean, fun.ymax = mean,
+               geom = "crossbar", width = 0.3, alpha = 0.8, colour="black") +
+  
+  facet_grid(gene ~ .) +
+  scale_colour_manual(values=pal_tmp$Col) +
+  theme_bw() +
+  theme(legend.position = "none",
+        panel.grid.major = element_line(linetype = "blank"), 
+        panel.grid.minor = element_line(linetype = "blank"),
+        axis.text.x = element_text(angle = 45, hjust = 1)) +
+  scale_y_continuous(limits = c(0,15),
+                     breaks = c(0,5,10, 15)) +
+  xlab("") +
+  NULL
+
+p_viol_gene2 <-
+  p_viol_gene + 
+  geom_text(data=df_g ,
+            aes(x = in_silico_clusters, y = max(m$value + 1), label=Text),
+            color="black", size = 4) +
+  NULL
+
+
+ggsave(p_viol_gene2, file=file.path(wd$cur, "SelectedGenes_EMP_LMP"), width = 12, height = 9, device="pdf")
+
+```
+
+# Objective 11
+
+Overlay previous YS cluster on the integrated UMAP
+
+Load the YS cluster information
+
+```{r}
+se_YS <- readRDS(file.path(outData_dir, "se_YS_only_fullInfo_2024.RDS"))
+
+# Extract cell ID and cluster
+df_YS_clust <- as.data.frame(colData(se_YS)) %>% select(Barcode, TreeCut_re)
+
+df_dim2 <- df_dim %>% select(-TreeCut_re)
+df_int_umap <- df_dim2 %>% left_join(df_YS_clust) %>% 
+  mutate(TreeCut_re = case_when(TreeCut_re == "k_6" ~ "k_5",
+                                is.na(TreeCut_re) ~ "no_k",
+                                TRUE ~ TreeCut_re))
+
+
+pUMAP_YS <- 
+  ggplot(df_int_umap, aes(x=UMAP_2_sub, y=UMAP_1_sub, colour=TreeCut_re, size=TreeCut_re)) +
+  geom_point() +
+  gghighlight(use_direct_label = FALSE) +
+  theme(legend.position = "right") +
+  theme_custom +
+  scale_colour_manual(values=pal.YS_clust_simple) + 
+  scale_size_manual(values=c(2,2,2,2,2,0.5)) + 
+  labs(title="Highlighting the in_silico_clusters")
+pUMAP_YS
+
+
+ggsave(pUMAP_YS, filename = file.path(wd$cur, "UMAP_clusters_YS.pdf"), device = "pdf", 
+       width = 6, height = 4, dpi = 300)
+```
+

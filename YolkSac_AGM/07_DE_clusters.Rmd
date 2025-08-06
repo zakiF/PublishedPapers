@@ -1,0 +1,882 @@
+---
+title: "Profiling clusters"
+subtitle: "DE and GO"
+author: "Zaki"
+date: "13/10/2021"
+output:
+  html_document:
+    self_contained: yes
+    toc: true
+    toc_float: true
+    df_print: paged
+    number_sections: false
+editor_options: 
+  chunk_output_type: console
+---
+```{r setup, echo=FALSE, message=FALSE, results='hide'}
+library(knitr)
+knitr::opts_chunk$set(cache=TRUE, error=FALSE, cache.lazy = TRUE)
+```
+
+## Objective
+
+WE performed PAGA and identified clusters. Now we want to characterise the cluster in more details ;
+
+1) Proportion of FACS populations in each cluster
+2) DE genes defining each clusters
+
+
+## Prepare the environment
+
+```{r , warning=FALSE, message=FALSE}
+# Data wrangling
+library(plyr)
+library(dplyr)
+library(tidyverse)
+library(data.table)
+library(ggforce)
+library(alluvial)
+library(ggsignif)
+
+# Plots
+library(gridExtra)
+library(ggpubr)
+library(patchwork)
+library(gghighlight)
+library(ggbeeswarm)
+library(pheatmap)
+library(UpSetR)
+library(fmsb)
+library(ggradar)
+
+# sc
+library(Seurat)
+library(scater)
+library(scran)
+
+# Palettes
+library(pals)
+library(paletteer)
+library(viridis)
+
+# Pathway
+library(biomaRt)
+library(clusterProfiler)
+
+# AUC
+library(AUCell)
+library(GSEABase)
+
+# DE
+library(edgeR)
+
+```
+
+
+Specify the work space
+
+```{r}
+set.seed(123)
+workDir <- getwd()
+workDir <- gsub("/scripts", "", workDir)
+dataDir <- file.path(workDir, "data")
+outDir <- file.path(workDir, "output")
+
+# out data
+outData_dir <- file.path(outDir, "out_data")
+
+outDir_cur <- file.path(outDir, "Chapter_07_DE")
+dir.create(outDir_cur)
+
+# Other dir
+#pagaDir <- file.path(dataDir, "PAGA_processing/PAGA_inHouse")
+
+source(file.path(workDir, "functions.R"))
+```
+
+
+We download the list of transcription factors from two site http://fantom.gsc.riken.jp/5/sstar/Browse_Transcription_Factors_mm9 and http://genome.gsc.riken.jp/TFdb/tf_list.html. The list of cell surfurce marker from here http://wlab.ethz.ch/cspa/#downloads (CSPA validated surfaceome proteins). We read the following file into R.
+
+Load list of CC genes
+
+```{r}
+s.genes <- cc.genes.updated.2019$s.genes
+g2m.genes <- cc.genes.updated.2019$g2m.genes
+```
+
+Read list of cell surface genes
+
+```{r}
+df_cs <- read.delim(file.path(dataDir, "Others/RM_cur_CS_mouse.txt"), stringsAsFactors = FALSE)
+```
+
+Read list of transcription factors
+
+```{r}
+tf_dat <- read.csv(file.path(dataDir, "Others/TF_listRiken.csv"))
+tf_dat2 <- read.delim(file.path(dataDir, "Others/TF_list.txt"))
+
+tf_dat$Symbol <- toupper(tf_dat$Symbol)
+tf_dat2$Symbol <- toupper(tf_dat2$Symbol)
+tf_all <- unique(c(tf_dat$Symbol, tf_dat2$Symbol))
+# Lower case
+tf_all2 <- tolower(tf_all)
+tf_all2 <- as.character(mapply(simpleCap, tf_all2))
+```
+
+
+
+## Load data
+
+Read the single cell object we previously (limited to the EHT populations)
+
+```{r}
+se <- readRDS(file.path(outData_dir, "se_YS_AGM_final.RDS"))
+df_dim <- readRDS(file.path(outData_dir, "MetaData_YS_AGM_final.RDS"))
+se_YS <- readRDS(file.path(outData_dir, "se_YS_only_fullInfo.RDS"))
+```
+
+
+## DE
+
+```{r}
+outDir_DE <- file.path(outDir_cur, "DE")
+dir.create(outDir_DE)
+```
+
+
+We do a DE between these groups ;
+
+1) YS mid vs YS bot
+
+
+### Gene detection
+
+We generate a data frame that shows the detection rate in all cell populations and also individual populations. 
+
+```{r}
+sde <- se
+# Calculate the dropout rate in the overall single cell object
+drp_all <- scater::perFeatureQCMetrics(sde) %>%
+  as.data.frame() %>%
+  tibble::rownames_to_column(var = "UniqGeneID") %>%
+  dplyr::rename(pct_detect_all = detected,
+                MeanExp_all = mean)
+
+# In individual population
+
+p_list <- as.factor(unique(as.character(sde$in_silico_clusters)))
+p_list <- levels(p_list)
+
+
+dpt_list <- list()
+
+# Find the percentage expressing gene per-cluster
+for (i in seq_along(p_list)){
+  x <- dropOut_in_silico_clusters(sde, p_list[i])
+  dpt_list[[i]] <- x
+}
+
+
+dpt_df <- as.data.frame(do.call(cbind, dpt_list))
+colnames(dpt_df) <- paste0("pct_detect_", p_list)
+dpt_df$UniqGeneID <- row.names(sde)
+
+rr <- as.data.frame(rowData(sde)) %>%
+  tibble::rownames_to_column(var = "UniqGeneID") %>%
+  dplyr::inner_join(dpt_df) %>%
+  dplyr::inner_join(drp_all)
+
+write.csv(rr, file.path(outDir_DE, "GeneDetection.csv"))
+```
+
+Retain genes which are detected at more than 30% in any (or all) of the populatons
+
+```{r}
+rr_sub <- rr %>% 
+  dplyr::filter_at(vars(starts_with("pct_detect")), any_vars(. >=10))
+```
+
+### Main pop
+
+```{r}
+outDir_DE_1 <- file.path(outDir_DE, "Main_pop")
+dir.create(outDir_DE_1)
+```
+
+Here we create a limma object of the main trajectory population. 
+
+Generate limma object. The grouping is based on which trajectory arm
+
+```{r}
+sde <- se[row.names(se) %in% rr_sub$UniqGeneID,]
+# Do the DE
+cD <- as.data.frame(colData(sde))
+group <- as.character(cD$in_silico_clusters)
+
+# Refine the group
+group <- case_when(
+                   group == "AGM_1" ~ "non_trajectory",
+                   group == "AGM_2" ~ "non_trajectory",
+                   group == "AGM_3" ~ "AGM_arm",
+                   group == "AGM_4" ~ "AGM_arm",
+                   group == "AGM_5" ~ "non_trajectory",
+                   
+                   group == "mix" ~ "non_trajectory",
+                   
+                   group == "YS_m1" ~ "YS_m",
+                   group == "YS_m2" ~ "YS_m",
+                   
+                   group == "YS_b1" ~ "non_trajectory",
+                   group == "YS_b2" ~ "YS_b",
+                   group == "YS_b3" ~ "YS_b",
+                   
+                   group == "YS_p1" ~ "non_trajectory",
+                   group == "YS_p2" ~ "non_trajectory")
+
+
+cts <- as.matrix(assay(sde, "counts"))
+colnames(cts) <- sde$Barcode
+
+
+dge <- DGEList(counts = cts, group =group)
+dge <- calcNormFactors(dge)
+
+# Do the DE
+design <- model.matrix(~0 + group, cD)
+vm <- voom(dge, design = design, plot = TRUE)
+fit <- lmFit(vm, design)
+```
+
+
+#### YS_b vs YS_m
+
+```{r}
+contrast.matrix <- makeContrasts(groupYS_b-groupYS_m, levels=design)
+fit2 <- contrasts.fit(fit, contrast.matrix)
+fit2 <- eBayes(fit2)
+# We extract the DE genes in each comparison.
+dge_m1 <- 
+  topTable(fit2, n = Inf, adjust.method = "BH", coef=1) %>%
+  tibble::rownames_to_column(var = "UniqGeneID") %>%
+  dplyr::mutate(isTF = ifelse(UniqGeneID %in% tf_all2, "TF", "notTF"),
+                isCS = ifelse(UniqGeneID %in% df_cs$symbol, "CS", "notCS")) 
+```
+
+#### YS_b vs AGM
+
+When we want to compare AGM with YS, we want to maintain the ratio of cell number in each population constant. Eg YS_m1 (n=98) and YS_m2 (n=100) is a bout 1:1. But in AGM_3 (n=41) and AGM_4 (n=23) 2:1. So generate new object where the ratio of the populations are similar. 
+
+```{r}
+# Randomly sample 23 cells from AGM_3
+se_AGM_3 <- se[,se$in_silico_clusters == "AGM_3"]
+set.seed(123)
+indices <- sample(1:ncol(se_AGM_3), 18) # 41 - 23 (we want to remove 18 cells)
+se_AGM_3 <- se_AGM_3[,indices] # These are cells we would like removed
+Barcode_se_AGM_3 <- se_AGM_3$Barcode
+
+# Re-create object for DE
+sde <- se[row.names(se) %in% rr_sub$UniqGeneID, !se$Barcode %in% Barcode_se_AGM_3]
+# Do the DE
+cD <- as.data.frame(colData(sde))
+group <- as.character(cD$in_silico_clusters)
+
+# Refine the group
+group <- case_when(
+                   group == "AGM_1" ~ "non_trajectory",
+                   group == "AGM_2" ~ "non_trajectory",
+                   group == "AGM_3" ~ "AGM_arm",
+                   group == "AGM_4" ~ "AGM_arm",
+                   group == "AGM_5" ~ "non_trajectory",
+                   
+                   group == "mix" ~ "non_trajectory",
+                   
+                   group == "YS_m1" ~ "YS_m",
+                   group == "YS_m2" ~ "YS_m",
+                   
+                   group == "YS_b1" ~ "non_trajectory",
+                   group == "YS_b2" ~ "YS_b",
+                   group == "YS_b3" ~ "YS_b",
+                   
+                   group == "YS_p1" ~ "non_trajectory",
+                   group == "YS_p2" ~ "non_trajectory")
+
+cts <- as.matrix(assay(sde, "counts"))
+colnames(cts) <- sde$Barcode
+
+
+dge <- DGEList(counts = cts, group =group)
+dge <- calcNormFactors(dge)
+
+# Do the DE
+design <- model.matrix(~0 + group, cD)
+vm <- voom(dge, design = design, plot = TRUE)
+fit <- lmFit(vm, design)
+```
+
+Run the DE of AGM
+
+```{r}
+contrast.matrix <- makeContrasts(groupYS_b-groupAGM_arm, levels=design)
+fit2 <- contrasts.fit(fit, contrast.matrix)
+fit2 <- eBayes(fit2)
+# We extract the DE genes in each comparison.
+dge_m2 <- 
+  topTable(fit2, n = Inf, adjust.method = "BH", coef=1) %>%
+  tibble::rownames_to_column(var = "UniqGeneID") %>%
+  dplyr::mutate(isTF = ifelse(UniqGeneID %in% tf_all2, "TF", "notTF"),
+                isCS = ifelse(UniqGeneID %in% df_cs$symbol, "CS", "notCS")) 
+```
+
+
+#### YS_m vs AGM
+
+```{r}
+contrast.matrix <- makeContrasts(groupYS_m-groupAGM_arm, levels=design)
+fit2 <- contrasts.fit(fit, contrast.matrix)
+fit2 <- eBayes(fit2)
+# We extract the DE genes in each comparison.
+dge_m3 <- 
+  topTable(fit2, n = Inf, adjust.method = "BH", coef=1) %>%
+  tibble::rownames_to_column(var = "UniqGeneID") %>%
+  dplyr::mutate(isTF = ifelse(UniqGeneID %in% tf_all2, "TF", "notTF"),
+                isCS = ifelse(UniqGeneID %in% df_cs$symbol, "CS", "notCS")) 
+```
+
+
+### Conclusion
+
+Lets make a master table of all these comparison. We also wish to indicate which genes are 'marker' of which trajectory. To do this, we do the following ;
+
+1) DE between two groups > 1.5 logFC & FDR <0.05
+2) NOT expressed in another population by more than 60% 
+
+
+Lets compile the list
+
+```{r}
+dge_m1_sub <- dge_m1 %>% 
+  dplyr::select(UniqGeneID, logFC, adj.P.Val, isTF, isCS) %>%
+  dplyr::rename(logFC_YSb_vs_YSm = logFC,
+                FDR_YSb_vs_YSm = adj.P.Val)
+
+dge_m2_sub <- dge_m2 %>% 
+  dplyr::select(UniqGeneID, logFC, adj.P.Val) %>%
+  dplyr::rename(logFC_YSb_vs_AGM = logFC,
+                FDR_YSb_vs_AGM = adj.P.Val)
+
+dge_m3_sub <- dge_m3 %>% 
+  dplyr::select(UniqGeneID, logFC, adj.P.Val) %>%
+  dplyr::rename(logFC_YSm_vs_AGM = logFC,
+                FDR_YSm_vs_AGM = adj.P.Val)
+
+
+# Combine with the dropout info 
+rr_sub2 <- rr_sub %>%
+  dplyr::select(pct_detect_all, pct_detect_AGM_1:pct_detect_YS_p2) %>%
+  round() %>%
+  dplyr::mutate(UniqGeneID = rr_sub$UniqGeneID)
+
+dge_m <- rr_sub2 %>%
+  dplyr::left_join(dge_m1_sub) %>%
+  dplyr::left_join(dge_m2_sub) %>%
+  dplyr::left_join(dge_m3_sub)
+
+# Set treshold for significance
+up_thresh <- 1.5
+dwn_thresh <- -1.5
+FDR_thresh <- 0.05
+
+```
+
+
+Now make the category
+
+Individual groups
+
+```{r}
+# Individual category
+dge_m <- dge_m %>%
+  dplyr::mutate(Cat_YSb =
+                  # High in YS_b 
+                  case_when(
+                    logFC_YSb_vs_YSm >= up_thresh & FDR_YSb_vs_YSm <= FDR_thresh  &
+                      #pct_detect_AGM_3 <= 60 & pct_detect_AGM_4 <= 60 & 
+                      pct_detect_YS_m1 <= 60 & pct_detect_YS_m2 <= 60 
+                    | 
+                      logFC_YSb_vs_AGM >= up_thresh & FDR_YSb_vs_AGM <= FDR_thresh &
+                      #pct_detect_AGM_3 <= 60 & pct_detect_AGM_4 <= 60 & 
+                      pct_detect_YS_m1 <= 60 & pct_detect_YS_m2 <= 60 ~ "YS_b",
+                    TRUE ~ " "),
+                
+                # High in YS_m 
+                Cat_YSm = 
+                  case_when(
+                    logFC_YSb_vs_YSm <= dwn_thresh & FDR_YSb_vs_YSm <= FDR_thresh &
+                      #pct_detect_AGM_3 <= 60 & pct_detect_AGM_4 <= 60 & 
+                      pct_detect_YS_b1 <= 60 & pct_detect_YS_b2 <= 60 
+                    | 
+                      logFC_YSm_vs_AGM >= up_thresh & FDR_YSm_vs_AGM <= FDR_thresh &
+                      #pct_detect_AGM_3 <= 60 & pct_detect_AGM_4 <= 60 & 
+                      pct_detect_YS_b1 <= 60 & pct_detect_YS_b2 <= 60 ~ "YS_m",
+                    TRUE ~ " "),
+                
+                # High in AGM 
+                Cat_AGM = 
+                  case_when(
+                    logFC_YSb_vs_AGM <= dwn_thresh & FDR_YSb_vs_AGM <= FDR_thresh &
+                      #pct_detect_YS_m1 <= 60 & pct_detect_YS_m2 <= 60 & 
+                      pct_detect_YS_b1 <= 60 & pct_detect_YS_b2 <= 60
+                    |
+                      logFC_YSm_vs_AGM <= dwn_thresh & FDR_YSm_vs_AGM <= FDR_thresh &
+                      #pct_detect_YS_m1 <= 60 & pct_detect_YS_m2 <= 60 & 
+                      pct_detect_YS_b1 <= 60 & pct_detect_YS_b2 <= 60 ~ "AGM",
+                    TRUE ~ " "))
+```
+
+
+
+Clean up a bit
+
+```{r}
+dge_m <- dge_m %>%
+  dplyr::select(UniqGeneID, isTF, isCS, 
+                Cat_YSb, Cat_YSm, Cat_AGM,
+                logFC_YSb_vs_YSm, FDR_YSb_vs_YSm, logFC_YSb_vs_AGM:FDR_YSm_vs_AGM,
+                pct_detect_all:pct_detect_YS_p2
+                )
+
+write.csv(dge_m, file.path(outDir_DE_1, "DE_summary.csv"))
+```
+
+
+Summarise number of DEG in each comparison
+
+
+```{r}
+# YSb vs YSm
+num_1 <- dge_m %>%
+  dplyr::filter(FDR_YSb_vs_YSm <= FDR_thresh) 
+# High in YSb 
+num_YSb_1 <- num_1 %>%
+  dplyr::filter(logFC_YSb_vs_YSm >= up_thresh)
+# High in YSm 
+num_YSm_1 <- num_1 %>%
+  dplyr::filter(logFC_YSb_vs_YSm <= dwn_thresh)
+
+# Ysb vs AGM
+num_2 <- dge_m %>%
+  dplyr::filter(FDR_YSb_vs_AGM <= FDR_thresh) 
+# High in YSb 
+num_YSb_2 <- num_2 %>%
+  dplyr::filter(logFC_YSb_vs_AGM >= up_thresh)
+# High in AGM
+num_AGM_1 <- num_2 %>%
+  dplyr::filter(logFC_YSb_vs_AGM <= dwn_thresh)
+
+# YSm vs AGM
+num_3 <- dge_m %>%
+  dplyr::filter(FDR_YSm_vs_AGM <= FDR_thresh) 
+# High in YSm 
+num_YSm_2 <- num_3 %>%
+  dplyr::filter(logFC_YSm_vs_AGM >= up_thresh)
+# High in AGM
+num_AGM_2 <- num_3 %>%
+  dplyr::filter(logFC_YSm_vs_AGM <= dwn_thresh)
+
+```
+
+
+Make a data frame summary
+
+```{r}
+df_YSb <- data.frame(
+  Cat = c(rep("Up",2), rep("Dwn",2)),
+  Com  = rep(c("Ysm", "AGM"),2),
+  NumGene = c(nrow(num_YSb_1), nrow(num_YSb_2),
+              -nrow(num_YSm_1), -nrow(num_AGM_1))
+)
+
+int_1 <- length(intersect(num_YSb_1$UniqGeneID, num_YSb_2$UniqGeneID))
+int_2 <- length(intersect(num_YSm_1$UniqGeneID, num_AGM_1$UniqGeneID))
+
+# Plot
+
+ggplot(df_YSb,  aes(x=Com, y=NumGene, fill=Cat)) +
+  geom_bar(stat="identity") +
+  scale_y_continuous(breaks=c(-1000, -800, -600, -400, -200, 0, 200, 400, 600, 800, 1000),
+                     limits = c(-1000,1000)) +
+  geom_text(
+    aes(label = NumGene, y = NumGene + 10),
+    #position = position_dodge(0.9),
+    vjust = 0) +
+  annotate(
+    "text", label = int_1,
+    x = 1.5, y = 400, size = 4, colour = "black") +
+    annotate(
+    "text", label = int_2,
+    x = 1.5, y = -400, size = 4, colour = "black") +
+      annotate(
+    "text", label = "High in YS_b",
+    x = 2.5, y = 500, size = 6, colour = "black") +
+        annotate(
+    "text", label = "High in YS_m / AGM",
+    x = 2.5, y = -500, size = 6, colour = "black") +
+  coord_flip() +
+  theme_pubclean() +
+  theme(legend.position = "none",
+        axis.title = element_blank(),
+        axis.text.x = element_blank(),
+        axis.ticks.x = element_blank()) 
+ 
+ggsave(filename = file.path(outDir_DE_1, "YSb_baseline.png"), device = "png", width = 8, height = 5, dpi = 300)
+```
+
+
+For YS middle
+
+```{r}
+df_YSm <- data.frame(
+  Cat = c(rep("Up",2), rep("Dwn",2)),
+  Com  = rep(c("Ysb", "AGM"),2),
+  NumGene = c(nrow(num_YSm_1), nrow(num_YSm_2),
+              -nrow(num_YSb_1), -nrow(num_AGM_2))
+)
+
+int_1 <- length(intersect(num_YSm_1$UniqGeneID, num_YSm_2$UniqGeneID))
+int_2 <- length(intersect(num_YSb_1$UniqGeneID, num_AGM_2$UniqGeneID))
+
+# Plot
+
+ggplot(df_YSm,  aes(x=Com, y=NumGene, fill=Cat)) +
+  geom_bar(stat="identity") +
+  scale_y_continuous(breaks=c(-600, -400, -200, 0, 200, 400, 600),
+                     limits = c(-600,600)) +
+  geom_text(
+    aes(label = NumGene, y = NumGene + 10),
+    #position = position_dodge(0.9),
+    vjust = 0) +
+  annotate(
+    "text", label = int_1,
+    x = 1.5, y = 400, size = 6, colour = "black") +
+    annotate(
+    "text", label = int_2,
+    x = 1.5, y = -400, size = 6, colour = "black") +
+        annotate(
+    "text", label = "High in YS_m",
+    x = 2.5, y = 500, size = 6, colour = "black") +
+        annotate(
+    "text", label = "High in YS_b / AGM",
+    x = 2.5, y = -500, size = 6, colour = "black") +
+  coord_flip() +
+  theme_pubclean() +
+  theme(legend.position = "none",
+        axis.title = element_blank(),
+        axis.text.x = element_blank(),
+        axis.ticks.x = element_blank())
+
+ggsave(filename = file.path(outDir_DE_1, "YSm_baseline.png"), device = "png", width = 8, height = 5, dpi = 300)
+```
+
+
+For AGM
+
+```{r}
+df_AGM <- data.frame(
+  Cat = c(rep("Up",2), rep("Dwn",2)),
+  Com  = rep(c("Ysb", "YSm"),2),
+  NumGene = c(nrow(num_AGM_1), nrow(num_AGM_2),
+              -nrow(num_YSb_2), -nrow(num_YSm_2))
+)
+
+int_1 <- length(intersect(num_AGM_1$UniqGeneID, num_AGM_2$UniqGeneID))
+int_2 <- length(intersect(num_YSb_2$UniqGeneID, num_YSm_2$UniqGeneID))
+
+# Plot
+
+ggplot(df_AGM,  aes(x=Com, y=NumGene, fill=Cat)) +
+  geom_bar(stat="identity") +
+  scale_y_continuous(breaks=c(-1000, -800, -600, -400, -200, 0, 200, 400, 600, 800, 1000),
+                     limits = c(-1000,1000)) +
+  geom_text(
+    aes(label = NumGene, y = NumGene + 10),
+    #position = position_dodge(0.9),
+    vjust = 0) +
+  annotate(
+    "text", label = int_1,
+    x = 1.5, y = 400, size = 4, colour = "black") +
+    annotate(
+    "text", label = int_2,
+    x = 1.5, y = -400, size = 4, colour = "black") +
+        annotate(
+    "text", label = "High in AGM",
+    x = 2.5, y = 500, size = 6, colour = "black") +
+        annotate(
+    "text", label = "High in YS_m / YS_b",
+    x = 2.5, y = -500, size = 6, colour = "black") +
+  coord_flip() +
+  theme_pubclean() +
+  theme(legend.position = "none",
+        axis.title = element_blank(),
+        axis.text.x = element_blank(),
+        axis.ticks.x = element_blank())
+
+ggsave(filename = file.path(outDir_DE_1, "AGM_baseline.png"), device = "png", width = 8, height = 5, dpi = 300)
+```
+
+
+
+
+
+### Individual population
+
+
+```{r}
+outDir_DE_2 <- file.path(outDir_DE, "Indv_pop")
+dir.create(outDir_DE_2)
+```
+
+Here we create a limma object
+
+```{r}
+sde <- se[row.names(se) %in% rr_sub$UniqGeneID,]
+# Do the DE
+cD <- as.data.frame(colData(sde))
+group <- as.character(cD$in_silico_clusters)
+
+cts <- as.matrix(assay(sde, "counts"))
+colnames(cts) <- sde$Barcode
+
+
+dge <- DGEList(counts = cts, group =group)
+dge <- calcNormFactors(dge)
+
+# Do the DE
+design <- model.matrix(~0 + group, cD)
+vm <- voom(dge, design = design, plot = TRUE)
+fit <- lmFit(vm, design)
+```
+
+
+#### YS_b2 vs YS_m1
+
+```{r}
+contrast.matrix <- makeContrasts(groupYS_b2-groupYS_m1, levels=design)
+fit2 <- contrasts.fit(fit, contrast.matrix)
+fit2 <- eBayes(fit2)
+# We extract the DE genes in each comparison.
+dge_i1 <- 
+  topTable(fit2, n = Inf, adjust.method = "BH", coef=1) %>%
+  tibble::rownames_to_column(var = "UniqGeneID") %>%
+  dplyr::mutate(isTF = ifelse(UniqGeneID %in% tf_all2, "TF", "notTF"),
+                isCS = ifelse(UniqGeneID %in% df_cs$symbol, "CS", "notCS")) 
+```
+
+#### YS_b2 vs AGM_3
+
+```{r}
+contrast.matrix <- makeContrasts(groupYS_b2-groupAGM_3, levels=design)
+fit2 <- contrasts.fit(fit, contrast.matrix)
+fit2 <- eBayes(fit2)
+# We extract the DE genes in each comparison.
+dge_i2 <- 
+  topTable(fit2, n = Inf, adjust.method = "BH", coef=1) %>%
+  tibble::rownames_to_column(var = "UniqGeneID") %>%
+  dplyr::mutate(isTF = ifelse(UniqGeneID %in% tf_all2, "TF", "notTF"),
+                isCS = ifelse(UniqGeneID %in% df_cs$symbol, "CS", "notCS")) 
+```
+
+
+#### YS_m1 vs AGM_3
+
+```{r}
+contrast.matrix <- makeContrasts(groupYS_m1-groupAGM_3, levels=design)
+fit2 <- contrasts.fit(fit, contrast.matrix)
+fit2 <- eBayes(fit2)
+# We extract the DE genes in each comparison.
+dge_i3 <- 
+  topTable(fit2, n = Inf, adjust.method = "BH", coef=1) %>%
+  tibble::rownames_to_column(var = "UniqGeneID") %>%
+  dplyr::mutate(isTF = ifelse(UniqGeneID %in% tf_all2, "TF", "notTF"),
+                isCS = ifelse(UniqGeneID %in% df_cs$symbol, "CS", "notCS")) 
+```
+
+
+### Summary 1
+
+Compile the results
+
+```{r}
+dge_i1_sub <- dge_i1 %>% 
+  dplyr::select(UniqGeneID, logFC, adj.P.Val, isTF, isCS) %>%
+  dplyr::rename(logFC_YSb2_vs_YSm1 = logFC,
+                FDR_YSb2_vs_YSm1 = adj.P.Val)
+
+dge_i2_sub <- dge_i2 %>% 
+  dplyr::select(UniqGeneID, logFC, adj.P.Val) %>%
+  dplyr::rename(logFC_YSb2_vs_AGM3 = logFC,
+                FDR_YSb2_vs_AGM3 = adj.P.Val)
+
+dge_i3_sub <- dge_i3 %>% 
+  dplyr::select(UniqGeneID, logFC, adj.P.Val) %>%
+  dplyr::rename(logFC_YSm1_vs_AGM3 = logFC,
+                FDR_YSm1_vs_AGM3 = adj.P.Val)
+
+
+# Combine with the dropout info 
+rr_sub2 <- rr_sub %>%
+  dplyr::select(pct_detect_all, pct_detect_AGM_1:pct_detect_YS_p2) %>%
+  round() %>%
+  dplyr::mutate(UniqGeneID = rr_sub$UniqGeneID)
+
+dge_i <- rr_sub2 %>%
+  dplyr::left_join(dge_i1_sub) %>%
+  dplyr::left_join(dge_i2_sub) %>%
+  dplyr::left_join(dge_i3_sub)
+
+```
+
+Categorise the results
+
+```{r}
+dge_i <- dge_i %>%
+  dplyr::mutate(Cat_YSb2 =
+                  # High in YS_b2 
+                  case_when(
+                    logFC_YSb2_vs_YSm1 >= up_thresh & FDR_YSb2_vs_YSm1 <= FDR_thresh  &
+                      pct_detect_AGM_3 <= 70 & pct_detect_AGM_4 <= 70 & 
+                      pct_detect_YS_m1 <= 60 & pct_detect_YS_m2 <= 60 
+                    | 
+                      logFC_YSb2_vs_AGM3 >= up_thresh & FDR_YSb2_vs_AGM3 <= FDR_thresh &
+                      pct_detect_AGM_3 <= 70 & pct_detect_AGM_4 <= 70 & 
+                      pct_detect_YS_m1 <= 60 & pct_detect_YS_m2 <= 60 ~ "YS_b2",
+                    TRUE ~ " "),
+                
+                # High in YS_m 
+                Cat_YSm1 = 
+                  case_when(
+                    logFC_YSb2_vs_YSm1 <= dwn_thresh & FDR_YSb2_vs_YSm1 <= FDR_thresh &
+                      pct_detect_AGM_3 <= 70 & pct_detect_AGM_4 <= 70 & 
+                      pct_detect_YS_b1 <= 60 & pct_detect_YS_b2 <= 60 
+                    | 
+                      logFC_YSm1_vs_AGM3 >= up_thresh & FDR_YSm1_vs_AGM3 <= FDR_thresh &
+                      pct_detect_AGM_3 <= 70 & pct_detect_AGM_4 <= 70 & 
+                      pct_detect_YS_b1 <= 60 & pct_detect_YS_b2 <= 60 ~ "YS_m1",
+                    TRUE ~ " "),
+                
+                # High in AGM 
+                Cat_AGM3 = 
+                  case_when(
+                    logFC_YSb2_vs_AGM3 <= dwn_thresh & FDR_YSb2_vs_AGM3 <= FDR_thresh &
+                      pct_detect_YS_m1 <= 70 & pct_detect_YS_m2 <= 70 & 
+                      pct_detect_YS_b1 <= 60 & pct_detect_YS_b2 <= 60
+                    |
+                      logFC_YSm1_vs_AGM3 <= dwn_thresh & FDR_YSm1_vs_AGM3 <= FDR_thresh &
+                      pct_detect_YS_m1 <= 70 & pct_detect_YS_m2 <= 70 & 
+                      pct_detect_YS_b1 <= 60 & pct_detect_YS_b2 <= 60 ~ "AGM_3",
+                    TRUE ~ " "))
+```
+
+
+
+Clean up a bit
+
+```{r}
+dge_i <- dge_i %>%
+  dplyr::select(UniqGeneID, isTF, isCS, 
+                Cat_YSb2, Cat_YSm1, Cat_AGM3,
+                logFC_YSb2_vs_YSm1, FDR_YSb2_vs_YSm1, logFC_YSb2_vs_AGM3:FDR_YSm1_vs_AGM3,
+                pct_detect_all:pct_detect_YS_p2
+                )
+
+write.csv(dge_i, file.path(outDir_DE_2, "DE_summary_HE.csv"))
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+--------------------------------------------------------------------------------
+## Session Information
+```{r}
+sessionInfo()
+```

@@ -1,0 +1,815 @@
+# Pre-processing on pheonix
+
+
+## Objective
+
+
+We want to analsye all the Smart-seq2 data we have to date. These includes data dating back from 2016 to the most recent data in 2021 (GL69). These are all the data we have ;
+
+1) GL32 - /mnt/gpfs2/facilities/sequencers/seq.04/160909_NS500428_0188_AHFVC7BGXY/Unaligned
+2) GL34 - /mnt/gpfs2/facilities/sequencers/seq.04/170209_NS500428_0228_AHL22YBGXY/Unaligned
+3) GL36 - /mnt/gpfs2/facilities/sequencers/seq.04/170913_NS500428_0263_AHF5VFBGX2/Unaligned
+4) GL37 - /mnt/gpfs2/facilities/sequencers/seq.04/170905_NS500428_0260_AHF5NCBGX2/Unaligned
+5) GL43 - /mnt/gpfs2/facilities/sequencers/seq.04/190208_NS500428_0405_AHNJW3BGX7/Unaligned
+6) GL58 - /mnt/gpfs2/facilities/sequencers/seq.04/190927_NS500428_0479_AHKMY7BGXB/Unaligned
+7) GL69 - 
+
+
+
+GL69 had 4 instance of sequencing done (due to sample mix-up and errors)
+
+1) /mnt/gpfs2/facilities/sequencers/seq.08/201002_A01065_0017_BHT2VKDRXX/Unaligned_GL69 (Cells 1 - 767) 
+2) /mnt/gpfs2/facilities/sequencers/seq.08/201023_A01065_0020_AHTJWMDRXX/Unaligned_GL69 (Cells 769 - 1091) 
+3) /mnt/gpfs2/facilities/sequencers/seq.08/201216_A01065_0028_AHWMLMDRXX/Unaligned_GL69 (Cells 1092 - 1475) 
+4) /mnt/gpfs2/facilities/sequencers/seq.08/210505_A01065_0052_AHY72HDRXX/Unaligned_GL69 (Cells 1476 - 1858) 
+
+
+
+
+## Conclusion
+
+
+
+## Background
+
+## Set-up
+
+Load required library
+
+```{r, warning=FALSE, message=FALSE}
+library(ggplot2)
+library(dplyr)
+# library(rtracklayer) # To import GTF
+```
+
+Specify the workspace
+
+```{r}
+workDir <- getwd()
+workDir <- gsub("/scripts", "", workDir)
+dataDir <- file.path(workDir, "data")
+outDir <- file.path(workDir, "output")
+dir.create(outDir)
+
+# out data
+outData_dir <- file.path(outDir, "out_data")
+dir.create(outData_dir)
+
+outDir_cur <- file.path(outDir, "Chapter_01_Preprocessing")
+dir.create(outDir_cur)
+set.seed(100)
+```
+
+
+
+
+## Pre-processing
+
+We record where the software version, parameters, reference sequence of all the programs used in the pre-processing steps. 
+
+### Gathering fastq
+
+Lets copy all the seuqencing files to one location
+
+
+```{bash, eval=FALSE}
+workDir=/scratch/wsspaces/zfadlullah-GL69_corrected-0
+
+fastqDir=${workDir}/fastq
+NovaSeqDir=${workDir}/GL69_YS_AGMace
+NextSeqDir=${workDir}/NextSeq_fastq
+# --------------------------- GL32 - GL58  --------------------------- #
+# GL32
+cp /mnt/gpfs2/facilities/sequencers/seq.04/160909_NS500428_0188_AHFVC7BGXY/Unaligned/GL32* ${NextSeqDir}/GL32
+# GL34 
+cp /mnt/gpfs2/facilities/sequencers/seq.04/170209_NS500428_0228_AHL22YBGXY/Unaligned/GL34* ${NextSeqDir}/GL34
+# GL36
+cp /mnt/gpfs2/facilities/sequencers/seq.04/170913_NS500428_0263_AHF5VFBGX2/Unaligned/GL36_* ${NextSeqDir}/GL36
+# GL37
+cp /mnt/gpfs2/facilities/sequencers/seq.04/170905_NS500428_0260_AHF5NCBGX2/Unaligned/GL37_* ${NextSeqDir}/GL37
+# GL43
+cp /mnt/gpfs2/facilities/sequencers/seq.04/190208_NS500428_0405_AHNJW3BGX7/Unaligned/GL43_* ${NextSeqDir}/GL43
+# GL58
+cp /mnt/gpfs2/facilities/sequencers/seq.04/190927_NS500428_0479_AHKMY7BGXB/Unaligned/GL58_* ${NextSeqDir}/GL58
+
+# ---------------------------  GL69 --------------------------- #
+# Sequencing run 1
+cp /mnt/gpfs2/facilities/sequencers/seq.08/201002_A01065_0017_BHT2VKDRXX/Unaligned_GL69/*fastq.gz ${NovaSeqDir}
+# Seq run 2
+cp /mnt/gpfs2/facilities/sequencers/seq.08/201023_A01065_0020_AHTJWMDRXX/Unaligned_GL69/*fastq.gz ${NovaSeqDir}
+# Seq run 3
+cp /mnt/gpfs2/facilities/sequencers/seq.08/201216_A01065_0028_AHWMLMDRXX/Unaligned_GL69/*fastq.gz ${NovaSeqDir}
+# Seq run 4
+cp /mnt/gpfs2/facilities/sequencers/seq.08/210505_A01065_0052_AHY72HDRXX/Unaligned_GL69/*fastq.gz ${NovaSeqDir}
+```
+
+
+The Nextseq sequencing run (GL32 - GL58) were sequenced across 4 lanes. We will need to merge the fastq files
+
+
+```{bash, eval=FALSE}
+#!/bin/bash
+#PBS -lnodes=1:ppn=32,mem=2000gb
+#PBS -l walltime=01:00:00:00
+#PBS -N lane_merge
+#PBS -m abe
+#PBS -o mergeR1_o.log
+#PBS -e mergeR1_e.log
+
+# ---------------------------------------------------------- #
+# Merge multiple fastq files into one - This is only for R1  #
+# ---------------------------------------------------------- #
+
+# Read pair
+ReadPair="R1"
+
+# Global item
+startTime=`date +%y%m%d_%H%M%S`
+
+# Location of sequencing files 
+fastqDir=/mnt/gpfs2/facilities/sequencers/seq.04/190731_NS500428_0462_AHNHYLAFXY/Unaligned  #<?~@~T?~@~T
+r1files=(`ls ${fastqDir}/GL55_*L001*_*R1*.fastq.gz`) #<?~@~T?~@~T
+
+# Location to save output
+projectOutputDir=/scratch/wsspaces/rmevel-GL55-0/02_merge_lanes  #<?~@~T?~@~T 
+mergeDir=${projectOutputDir}/fastq_merged
+mkdir ${mergeDir}
+
+# Directory for output logs
+logMaster=${projectOutputDir}/instructions
+mkdir ${logMaster}
+
+# Recording command used for mapping
+commandLog=${logMaster}/02_lane_merge_${ReadPair}_GL55.txt #<?~@~T?~@~T 
+touch ${commandLog}
+
+jname=01_lane_merge_${ReadPair}_${startTime}
+
+# Loop function to merge
+for inputFastq1 in ${r1files[*]}; do
+# %% is a pattern matching command - http://tldp.org/LDP/abs/html/parameter-substitution.html
+noExt=${inputFastq1%%_L00[1-4]_${ReadPair}_001.fastq.gz}
+newName=$(basename ${noExt}_${ReadPair}_001.fastq.gz)
+
+command="cat ${noExt}_L001_${ReadPair}_001.fastq.gz ${noExt}_L002_${ReadPair}_001.fastq.gz ${noExt}_L003_${ReadPair}_001.fastq.gz ${noExt}_L004_${ReadPair}_001.fastq.gz > ${mergeDir}/${newName}"
+echo "${command}" >> ${commandLog}
+
+done
+```
+
+
+The script above will generate a text file, once the text file is generated it will need to be run.
+
+
+### Reference genome
+
+As we intend to integrate our data with some 10x data, we use the 10x reference genome. Reference genome can be downloaded from the download link provided at https://support.10xgenomics.com/single-cell-gene-expression/software/downloads/latest.
+
+```{bash, eval=FALSE}
+# 10x reference and GTF can be downloaded using wget
+wget https://cf.10xgenomics.com/supp/cell-exp/refdata-gex-mm10-2020-A.tar.gz
+```
+
+
+The scRNA-seq smaples comes from mouse with GFP and RFP sequence, so we insert these sequence in the reference fasta. For reference this is the RFP and GFP fasta. Based on the guide https://support.10xgenomics.com/single-cell-gene-expression/software/pipelines/latest/using/tutorial_mr, we can add sequence to the reference fasta file
+
+```{bash, eval=FALSE}
+>GFP
+ATGGTGAGCAAGGGCGAGGAGCTGTTCACCGGGGTGGTGCCCATCCTGGTCGAGCTGGACGGCGACGTAAACGGCCACAAGTTCAGCGTGTCCGGCGAGGGCGAGGGCGATGCCACCTACGGCAAGCTGACCCTGAAGTTCATCTGCACCACCGGCAAGCTGCCCGTGCCCTGGCCCACCCTCGTGACCACCCTGACCTACGGCGTGCAGTGCTTCAGCCGCTACCCCGACCACATGAAGCAGCACGACTTCTTCAAGTCCGCCATGCCCGAAGGCTACGTCCAGGAGCGCACCATCTTCTTCAAGGACGACGGCAACTACAAGACCCGCGCCGAGGTGAAGTTCGAGGGCGACACCCTGGTGAACCGCATCGAGCTGAAGGGCATCGACTTCAAGGAGGACGGCAACATCCTGGGGCACAAGCTGGAGTACAACTACAACAGCCACAACGTCTATATCATGGCCGACAAGCAGAAGAACGGCATCAAGGTGAACTTCAAGATCCGCCACAACATCGAGGACGGCAGCGTGCAGCTCGCCGACCACTACCAGCAGAACACCCCCATCGGCGACGGCCCCGTGCTGCTGCCCGACAACCACTACCTGAGCACCCAGTCCGCCCTGAGCAAAGACCCCAACGAGAAGCGCGATCACATGGTCCTGCTGGAGTTCGTGACCGCCGCCGGGATCACTCTCGGCATGGACGAGCTGTACAAGTAAGGATCCAGATCTTATTAAAGCAGAACTTGTTTATTGCAGCTTATAATGGTTACAAATAAAGCAATAGCATCACAAATTTCACAAATAAAGCATTTTTTTCACTGCATTCTAGTTGTGGTTTGTCCAAACTCATCAATGTATCTTATC
+
+>RFP
+ATGGTGGCCTCCTCCGAGGACGTCATCAAAGAGTTCATGCGCTTCAAGGTGCGCATGGAGGGCTCCGTGAACGGCCACGAGTTCGAGATCGAGGGCGAGGGCGAGGGCCGCCCCTACGAGGGCACCCAGACCGCCAAGCTGAAGGTGACCAAGGGCGGCCCCCTGCCCTTCGCCTGGGACATCCTGTCCCCCCAGTTCCAGTACGGCTCCAAGGCGTACGTGAAGCACCCCGCCGACATCCCCGACTACAAGAAGCTGTCCTTCCCCGAGGGCTTCAAGTGGGAGCGCGTGATGAACTTCGAGGACGGCGGCGTGGTGACCGTGACCCAGGACTCCTCCCTGCAGGACGGCACGCTGATCTACAAGGTGAAGTTCCGCGGCACCAACTTCCCCCCCGACGGCCCCGTAATGCAGAAGAAGACCATGGGCTGGGAGGCCTCCACCGAGCGCCTGTACCCCCGCGACGGCGTGCTGAAGGGCGAGATCCACCAGGCCCTGAAGCTGAAGGACGGCGGCCACTACCTGGTGGAGTTCAAGACCATCTACATGGCCAAGAAGCCCGTGCAGCTGCCCGGCTACTACTACGTGGACACCAAGCTGGACATCACCTCCCACAACGAGGACTACACCATCGTGGAACAGTACGAGCGCTCCGAGGGCCGCCACCACCTGTTCCTGGGGCATGGCACCGGCAGCACCGGCAGCGGCAGCTCCGGCACCGCCTCCTCCGAGGACGTCATCAAAGAGTTCATGCGCTTCAAGGTGCGCATGGAGGGCTCCGTGAACGGCCACGAGTTCGAGATCGAGGGCGAGGGCGAGGGCCGCCCCTACGAGGGCACCCAGACCGCCAAGCTGAAGGTGACCAAGGGCGGCCCCCTGCCCTTCGCCTGGGACATCCTGTCCCCCCAGTTCCAGTACGGCTCCAAGGCGTACGTGAAGCACCCCGCCGACATCCCCGACTACAAGAAGCTGTCCTTCCCCGAGGGCTTCAAGTGGGAGCGCGTGATGAACTTCGAGGACGGCGGCGTGGTGACCGTGACCCAGGACTCCTCCCTGCAGGACGGCACGCTGATCTACAAGGTGAAGTTCCGCGGCACCAACTTCCCCCCCGACGGCCCCGTAATGCAGAAGAAGACCATGGGCTGGGAGGCCTCCACCGAGCGCCTGTACCCCCGCGACGGCGTGCTGAAGGGCGAGATCCACCAGGCCCTGAAGCTGAAGGACGGCGGCCACTACCTGGTGGAGTTCAAGACCATCTACATGGCCAAGAAGCCCGTGCAGCTGCCCGGCTACTACTACGTGGACACCAAGCTGGACATCACCTCCCACAACGAGGACTACACCATCGTGGAACAGTACGAGCGCTCCGAGGGCCGCCACCACCTGTTCCTGTAGGAATTCGGATCCAGATCTTATTAAAGCAGAACTTGTTTATTGCAGCTTATAATGGTTACAAATAAAGCAATAGCATCACAAATTTCACAAATAAAGCATTTTTTTCACTGCATTCTAGTTGTGGTTTGTCCAAACTCATCAATGTATCTTATC
+
+>dTomato
+ATGCCAGAGCCAGCGAAGTCTGCTCCCGCCCCGAAAAAGGGCTCCAAGAAGGCGGTGACTAAGGCGCAGAAGAAAGGCGGCAAGAAGCGCAAGCGCAGCCGCAAGGAGAGCTATTCCATCTATGTGTACAAGGTTCTGAAGCAGGTCCACCCTGACACCGGCATTTCGTCCAAGGCCATGGGCATCATGAATTCGTTTGTGAACGACATTTTCGAGCGCATCGCAGGTGAGGCTTCCCGCCTGGCGCATTACAACAAGCGCTCGACCATCACCTCCAGGGAGATCCAGACGGCCGTGCGCCTGCTGCTGCCTGGGGAGTTGGCCAAGCACGCCGTGTCCGAGGGTACTAAGGCCATCACCAAGTACACCAGCGCTAAGTCTAGAATGGTGAGCAAGGGCGAGGAGGTCATCAAAGAGTTCATGCGCTTCAAGGTGCGCATGGAGGGCTCCATGAACGGCCACGAGTTCGAGATCGAGGGCGAGGGCGAGGGCCGCCCCTACGAGGGCACCCAGACCGCCAAGCTGAAGGTGACCAAGGGCGGCCCCCTGCCCTTCGCCTGGGACATCCTGTCCCCCCAGTTCATGTACGGCTCCAAGGCGTACGTGAAGCACCCCGCCGACATCCCCGATTACAAGAAGCTGTCCTTCCCCGAGGGCTTCAAGTGGGAGC
+```
+
+To generate a line in the GTF use the following (repeat for all the sequence)
+
+
+```{bash, eval=FALSE}
+# Check length of sequence
+cat dTomato.fa | grep -v "^>" | tr -d "\n" | wc -c
+# 670 in length
+# Generate GTF
+echo -e 'dTomato\tunknown\texon\t1\t670\t.\t+\t.\tgene_id "dTomato"; transcript_id "dTomato"; gene_name "dTomato"; gene_biotype "protein_coding";' > dTomato.gtf
+```
+
+
+
+And the fasta and GTF to the big reference genome fasta & GTF
+
+```{bash, eval=FALSE}
+cat dTomato.fa >> genome.fa
+cat dTomato.gtf >> genes.gtf
+```
+
+### Trimming  
+
+
+Trimming was not done
+
+
+### STAR mapping
+
+We used STAR version: 2.7.9a. Using the STAR solo command 
+
+
+STAR index was generated as follows. Ther reference fasta and GTF has the RFP, GFP and dTomato sequenence. 
+
+```{bash, eval=FALSE}
+ml apps/star/2.7.9a
+
+workDir=/scratch/wsspaces/zfadlullah-GL69_corrected-0/
+outIndex=${workDir}/ref/STARindex
+faFile=${workDir}/ref/cellRanger/RFP_GFP_ref/genome.fa
+#faFile=${workDir}/ref/cellRanger/RFP_GFP_ref
+gtfFile=${workDir}/ref/cellRanger/RFP_GFP_ref/genes.gtf
+
+
+# ml apps/star/.2.7.9a
+# Based on the guide https://github.com/alexdobin/STAR/blob/master/docs/STARsolo.md#multi-gene-reads
+# To make the agreement between STARsolo and CellRanger even more perfect, you can add
+# --genomeSAsparseD 3
+
+
+STAR \
+--runMode genomeGenerate \
+--genomeDir ${outIndex} \
+--genomeFastaFiles ${faFile} \
+--sjdbGTFfile ${gtfFile} \
+--genomeSAsparseD 3 \
+--runThreadN 5
+
+```
+
+Now we create a manifest file to specifiy the locations of all the fastq that we want to map with STAR. We manually create the files in excel
+
+```{bash, eval=FALSE}
+# List all the files
+ls -1 $PWD/*R1* > tmp.list.txt
+```
+
+The manifest files used in this quantification is saved in /data fodler
+
+
+STAR mapping was done with the following paramerter
+
+```{bash, eval=FALSE}
+#!/bin/bash
+#PBS -l nodes=1:ppn=8
+#PBS -l mem=150gb
+#PBS -l walltime=01:00:00:00
+#PBS -m abe
+#PBS -N STARsolo_nova
+
+ml apps/star/2.7.9a
+
+workDir=/scratch/wsspaces/zfadlullah-GL69_corrected-0/
+outDir=${workDir}/output/STAR_output
+outDirNova=${outDir}/GL69_YS_AGM
+
+mkdir ${outDirNova}
+
+cd ${outDirNova}
+
+STAR \
+--runThreadN 6 \
+--soloType SmartSeq \
+--readFilesCommand zcat \
+--genomeDir /scratch/wsspaces/zfadlullah-GL69_corrected-0/ref/STARindex \
+--readFilesManifest /scratch/wsspaces/zfadlullah-GL69_corrected-0/script/manifest_NovaSeq.txt \
+--outSAMattrRGline /scratch/wsspaces/zfadlullah-GL69_corrected-0/script/manifest_NovaSeq.txt \
+--soloUMIdedup Exact \
+--soloStrand Unstranded \
+--soloFeatures Gene GeneFull \
+--soloMultiMappers EM \
+--genomeLoad NoSharedMemory \
+--outSAMtype BAM SortedByCoordinate
+#--outFileNamePrefix GL69_YS_AGM \
+#--soloOutFileNames GL69_YS_AGM 
+
+# ------ NextSeq ----------
+
+#!/bin/bash
+#PBS -l nodes=1:ppn=8
+#PBS -l mem=150gb
+#PBS -l walltime=01:00:00:00
+#PBS -m abe
+#PBS -N STARsolo_next
+
+ml apps/star/2.7.9a
+
+workDir=/scratch/wsspaces/zfadlullah-GL69_corrected-0/
+outDir=${workDir}/output/STAR_output
+outDirNova=${outDir}/NextSeq
+
+mkdir ${outDirNova}
+
+cd ${outDir}
+
+STAR \
+--runThreadN 6 \
+--soloType SmartSeq \
+--readFilesCommand zcat \
+--genomeDir /scratch/wsspaces/zfadlullah-GL69_corrected-0/ref/STARindex \
+--readFilesManifest /scratch/wsspaces/zfadlullah-GL69_corrected-0/script/manifest_NextSeq.txt \
+--outSAMattrRGline /scratch/wsspaces/zfadlullah-GL69_corrected-0/script/manifest_NextSeq.txt \
+--soloUMIdedup Exact \
+--soloStrand Unstranded \
+--soloFeatures Gene GeneFull \
+--soloMultiMappers EM \
+--genomeLoad NoSharedMemory \
+--outSAMtype BAM SortedByCoordinate
+```
+
+
+## GTF
+
+Since the GTF file is large (~700Mb), we did not store this GTF in our data folder. A copy can be provided or available to donwload from the link given above.
+
+```{r, eval=FALSE}
+myGTF <- file.path(dataDir, "preProcessing/genes.gtf")
+newGTF <- import.gff(myGTF)
+gtfdf <- as.data.frame(newGTF)
+gtf_sub <- dplyr::select(gtfdf, gene_id, gene_name, gene_type, seqnames) %>%
+  dplyr::distinct(.keep_all = TRUE)
+# Save this to the ouputfolder
+write.table(gtf_sub, file.path(outData_dir, "simple_gtf.txt"), quote=F, sep="\t")
+
+# The above is enough, but we want to get the width as well
+#gtf_w <- dplyr::select(gtfdf, gene_id, type, width) %>%
+#  dplyr::filter(type == "gene") %>%
+#  dplyr::select(gene_id, width) %>%
+#  dplyr::distinct(.keep_all = TRUE)
+
+# Combine the information
+#gtf_sub <- dplyr::left_join(gtf_sub, gtf_w)
+# Save this to the data / outputfolder
+#write.table(gtf_sub, file.path(outDir, "simple_gtf.txt"), quote=F, sep="\t")
+```
+
+
+Load the simplified gtf
+
+```{r}
+simple_gtf <- read.delim(file.path(outData_dir, "simple_gtf.txt"),
+                         stringsAsFactors = FALSE)
+```
+
+
+Since the GFP, RFP and dTomato have no  **gene_type** is NA, we have to manually insert this information.
+
+```{r}
+simple_gtf$seqnames <- as.character(simple_gtf$seqnames)
+simple_gtf$gene_type[is.na(simple_gtf$gene_type)]  <- "reporter"
+simple_gtf$gene_name[is.na(simple_gtf$gene_name)] <- simple_gtf$gene_id[is.na(simple_gtf$gene_name)] 
+knitr::kable(tail(simple_gtf))
+```
+
+We rename "seqname" columns to "chrNum"
+
+```{r}
+colnames(simple_gtf) <- c("gene_id", "gene_name", "gene_type", "chrNum")
+```
+
+
+## Cell annotation
+
+Here we annotate the cells. We use the file manifest to curate the informations. 
+
+
+```{r}
+df_nova <- read.delim(file.path(dataDir, "preProcessing/manifest_NovaSeq.txt"),header=FALSE)
+df_next <- read.delim(file.path(dataDir, "preProcessing/manifest_NextSeq.txt"),header=FALSE)
+```
+
+
+### NextSeq
+
+With the exception of GL32 (first sequencing run), based on the file name, we can trace the identity of the cells.  
+
+In the initial seuqencing files (GL34), the file name did not contain the population ID. This changed in GL36 and above where the population (or cell type) is included in the naming. Generally, the file name given by the core facility represents as follows ;
+  
+  1) GL34 is the ID for the sequencing run
+  2) 001 is the position of the cell in the 384 well plate during library preperation (Figure \@ref(fig:LibraryPlate))
+  3) GL_SC_1_ : Single cell project ID
+  4) plate1_ : The number of plate used in the single cell project (some project used mulitple plate)
+  5) D7_ : The original well position of the cell in the FACS sorted plate
+
+
+The name changed over the time 
+
+Gather the metaData based on the file name
+
+```{r}
+df_next <- df_next %>%
+  select(V1, V3) %>%
+  mutate(FullName = gsub(".*NextSeq_fastq\\/", "", V1),
+         FullName = gsub("_R1_.*", "", FullName),
+         SeqRun = gsub("\\/.*", "", FullName),
+         FullName = gsub(".*\\/", "", FullName)) %>%
+  select(FullName, SeqRun, V3) %>%
+  dplyr::rename(CellID = V3)
+head(df_next)
+
+# With the exception of GL32, lets extract more metadata
+df_next_GL32 <- df_next %>%
+  filter(SeqRun == "GL32") %>%
+  mutate(
+    SC_project = "noInfo",
+    SC_plate = "noInfo",
+    FACS_well = "noInfo",
+    #Library_well = "noInfo",
+    Population = gsub(".*AGM", "AGM", FullName),
+    Population = gsub("_S.*", "", Population),
+    )
+```
+
+In GL34, For some reason two sequencing run was given a simillar name.
+
+```{bash, eval=FALSE}
+cd /mnt/gpfs2/facilities/sequencers/seq.04/170209_NS500428_0228_AHL22YBGXY
+grep "GL_SC_3_plate2_H1" SampleSheet.csv
+
+GL34_307_GL_SC_3_plate2_H1,GL34_307_GL_SC_3_plate2_H1,TAGCGCTC,AGCTAGAA
+GL34_340_GL_SC_3_plate2_H1,GL34_340_GL_SC_3_plate2_H1,CGGAGCCT,CTTAATAG
+```
+
+We manually rename sample **GL34_340_GL_SC_3_plate2_H1** to **GL34_340_GL_SC_3_plate2_H10**
+
+```{r}
+df_next_GL34 <- df_next %>%
+  filter(SeqRun == "GL34") %>%
+  mutate(
+    FullName =  gsub("GL_SC_3_plate2_H1_S340", "GL_SC_3_plate2_H10_S340", FullName),
+    SC_project = gsub(".*_GL_SC", "GL_SC", FullName),
+    SC_project = gsub("*_plate.*", "", SC_project),
+    SC_project = gsub("*_32.*", "_32", SC_project),
+    SC_plate = gsub(".*_plate", "", FullName),
+    SC_plate = gsub("_.*", "", SC_plate),
+    SC_plate = gsub("GL34", "1", SC_plate),
+    FACS_well = gsub(".*_plate[1-9]_", "", FullName),
+    FACS_well = gsub(".*GL_SC_32_", "", FACS_well),
+    FACS_well = gsub("_S.*", "", FACS_well),
+    #Library_well = gsub(".*GL34_", "", FullName),
+    #Library_well = gsub("_.*", "", Library_well),
+    Population = "noInfo"
+    )
+
+# Since we have no population info in the name, we read an external file
+df_GL34 <- read.delim(file.path(dataDir, "preProcessing/GL34_cellAnnotation.txt"))
+identical(df_GL34$Wells, df_next_GL34$FACS_well)
+df_next_GL34$Population <- df_GL34$Population
+
+df_next_GL36 <- df_next %>%
+  filter(SeqRun == "GL36") %>%
+  mutate(
+    SC_project = gsub(".*_GL_SC", "GL_SC", FullName),
+    SC_project = gsub("GL_SC_6.*", "GL_SC_6", SC_project),
+    SC_project = gsub("GL_SC_7.*", "GL_SC_7", SC_project),
+    SC_plate = gsub(".*_plate", "", FullName),
+    SC_plate = gsub("_.*", "", SC_plate),
+    SC_plate = gsub("GL36", "1", SC_plate),
+    FACS_well = gsub(".*GL_SC_6_", "", FullName),
+    FACS_well = gsub(".*GL_SC_7_", "", FACS_well),
+    FACS_well = gsub("_.*", "", FACS_well),
+    #Library_well = gsub(".*GL36_", "", FullName),
+    #Library_well = gsub("_.*", "", Library_well),
+    Population = gsub(".*GL_SC_6_", "", FullName),
+    Population = gsub(".*GL_SC_7_", "", Population),
+    Population = gsub("_S.*", "", Population),
+    Population = gsub(".*_E", "E", Population)
+    )
+
+
+df_next_GL37 <- df_next %>%
+  filter(SeqRun == "GL37") %>%
+  mutate(
+    SC_project = gsub(".*_GL_SC", "GL_SC", FullName),
+    SC_project = gsub("GL_SC_6.*", "GL_SC_6", SC_project),
+    SC_project = gsub("GL_SC_7.*", "GL_SC_7", SC_project),
+    SC_plate = gsub(".*_plate", "", FullName),
+    SC_plate = gsub("_.*", "", SC_plate),
+    SC_plate = gsub("GL37", "1", SC_plate),
+    FACS_well = gsub(".*GL_SC_6_", "", FullName),
+    FACS_well = gsub(".*GL_SC_7_", "", FACS_well),
+    FACS_well = gsub("_.*", "", FACS_well),
+    #Library_well = gsub(".*GL36_", "", FullName),
+    #Library_well = gsub("_.*", "", Library_well),
+    Population = gsub(".*GL_SC_6_", "", FullName),
+    Population = gsub(".*GL_SC_7_", "", Population),
+    Population = gsub("_S.*", "", Population),
+    Population = gsub(".*_E", "E", Population)
+    )
+
+df_next_GL43 <- df_next %>%
+  filter(SeqRun == "GL43") %>%
+  mutate(
+    SC_project = "GL_SC_43", 
+    SC_plate = gsub(".*_plate", "", FullName),
+    SC_plate = gsub("_.*", "", SC_plate),
+    SC_plate = gsub("GL43", "1", SC_plate),
+    FACS_well = gsub(".*plate1_", "", FullName),
+    FACS_well = gsub(".*plate2_", "", FACS_well),
+    FACS_well = gsub("_.*", "", FACS_well),
+   #Library_well = gsub(".*GL43_", "", FullName),
+   #Library_well = gsub("_.*", "", Library_well),
+   Population = gsub(".*_Runx1_Mes", "Runx1_Mes", FullName),
+   Population = gsub(".*_Gfi_HE", "Gfi1_HE", FullName),
+   Population = gsub(".*_Runx1_HE", "Runx1_HE", Population),
+   Population = gsub(".*_Gfi_Endo", "Gfi_Endo", Population),
+   Population = gsub(".*_Runx1_Endo", "Runx1_Endo", Population),
+   Population = gsub(".*_Runx1_Mes", "Runx1_Mes", Population),
+   Population = gsub("_S.*", "", Population),
+   Population = gsub(".*_E", "E", Population)
+    )
+
+
+df_next_GL58 <- df_next %>%
+  filter(SeqRun == "GL58") %>%
+  mutate(
+    SC_project = gsub(".*_WN-", "WN-", FullName),
+    SC_project = gsub("*_.*", "", SC_project),
+    SC_project = gsub("*WN-S2-[2-7]", "WN-S2-1", SC_project),
+    SC_plate = gsub("WN-", "", SC_project),
+    FACS_well = gsub(".*_WN-S[2-5]-[1-99]_", "", FullName),
+    FACS_well = gsub("_.*", "", FACS_well),
+    FACS_well = gsub("GL34.*", "noInfo", FACS_well),
+    #Library_well = gsub(".*GL58_", "", FullName),
+    #Library_well = gsub("_.*", "", Library_well),
+    Population = gsub(".*_Endo", "Endo", FullName),
+    Population = gsub(".*_MSC", "MSC", Population),
+    Population = gsub(".*_HE_Runx1", "HE_Runx1", Population),
+    Population = gsub(".*_Gfi1", "Gfi1", Population),
+    Population = paste(SC_plate, Population, sep="z"),
+    Population = gsub("S2-1zGfi1_HE", "E10.5_Gfi1_HE", Population),
+    Population = gsub("S3-5zGfi1_HE", "E11.5_Gfi1_HE", Population),
+    Population = gsub("S3-5zGfi1_pos_IAHC", "E11.5_IAHC", Population),
+    Population = gsub(".*z", "", Population),
+    Population = gsub("_S.*", "", Population))
+
+df_next_all <- rbind(df_next_GL32, df_next_GL34, df_next_GL36, df_next_GL37, df_next_GL43, df_next_GL58) %>%
+  dplyr::rename(FilePop = Population)
+
+df_next_all <- df_next_all %>%
+  mutate(
+    Well_num = gsub('[A-Z]', "", FACS_well),
+    Well_num = gsub('nonfo', "00000", Well_num),
+    Well_num = as.numeric(Well_num),
+    Well_num = sprintf("%02d", Well_num),
+    Well_letter = gsub('[0-9]', "", FACS_well),
+    FACS_well = paste0(Well_letter, Well_num))
+
+```
+
+Lets fix the name of the populations and make it easier
+
+```{r}
+df_next_all <- df_next_all %>%
+  mutate(condition = FilePop) %>%
+  dplyr::mutate(condition =
+                  case_when(
+                    
+                            # E10.5
+                            condition == 'E10.5_AGM_endo' ~ "AGM_E10.5_Endo",
+                            condition == 'Endo' ~ "AGM_E10.5_Endo", # Runx1 endo
+                            condition == 'E10-5_het_pos' ~ "AGM_E10.5_HE_Runx1",
+                            condition == 'Runx1_HE' ~ "AGM_E10.5_HE_Runx1",
+                            condition == 'E10.5_AGM_HE' ~ "AGM_E10.5_HE_Gfi1",
+                            condition == 'E10.5_Gfi1_HE' ~ "AGM_E10.5_HE_Gfi1",
+                            condition == 'Gfi1_HE' ~ "AGM_E10.5_HE_Gfi1",
+                            condition == 'E10.25_AGM_EHT' ~ "AGM_E10.5_EHT",
+                            condition == 'E10.25_AGM_IAHC' ~ "AGM_E10.5_IAHC",
+                            
+                            condition == 'Runx1_Mes' ~ "MES_E10.5_Runx1",
+                            condition == 'E10-5_het_neg' ~ "MES_E10.5_Runx1",
+                            
+                            # E10.5 KO
+                            condition == 'Endo_Runx1' ~ "AGM_E10.5_Endo_Runx1_KO",
+                            condition == 'E10-5_KO_pos' ~ "AGM_E10.5_HE_Runx1_KO",
+                            condition == 'HE_Runx1' ~ "AGM_E10.5_HE_Runx1_KO",
+                            condition == 'E10.25_AGM_HE' ~ "AGM_E10.5_HE_Gfis_KO",
+                            
+                            condition == 'MSC_Runx1' ~ "MES_E10.5_Runx1_KO",
+                            condition == 'E10-5_KO_neg' ~ "MES_E10.5_Runx1_KO",
+
+                            # E11.5
+                            condition == 'AGM_endo' ~ "AGM_E11.5_Endo",
+                            condition == 'E11.5_AGM_endo' ~ "AGM_E11.5_Endo",
+                            condition == 'AGM_HE' ~ "AGM_E11.5_HE_Gfi1",
+                            condition == 'E11.5_AGM_HE' ~ "AGM_E11.5_HE_Gfi1",
+                            condition == 'E11.5_Gfi1_HE' ~ "AGM_E11.5_HE_Gfi1",
+                            condition == 'E11.25_AGM_EHT' ~ "AGM_E11.5_EHT",
+                            condition == 'AGM_IAHC' ~ "AGM_E11.5_IAHC",
+                            condition == 'E11.5_IAHC' ~ "AGM_E11.5_IAHC",
+                            
+                             # YS 
+                            condition == 'E7-5_GFP_neg' ~ "YS_E7.5_GPP_neg", # Not sure what this was
+                            condition == 'E7-5_GFP_pos' ~ "YS_E7.5_GPP_pos", # Not sure what this was
+                            condition == 'E9' ~ "YS_E9.0_HE_Gfi1_Kneg",
+                            condition == 'E10' ~ "YS_E9.5_HE_Gfi1_Kneg",
+                            condition == 'E10.25_YS_HE' ~ "YS_E9.5_HE_Gfi1s_KO",
+                            condition == 'E10-25_Ckit_neg' ~ "YS_E10_HE_Gfi1_Kneg",
+                            condition == 'E10-25_Ckit_pos' ~ "YS_E10_HE_Gfi1",
+
+                  ))
+
+write.csv(df_next_all, file.path(outDir_cur, "NextSeq_full.csv"))
+```
+
+
+#### Remvove un-related populations
+
+Filer out some un-wanted populations. Some of them the sequencing did not work, and some of them we dont want
+
+  - GL32 has only AGM of E11.5 - we are only looking for E10.5. So we will exclude everything
+  - GL34 has E10.5 and E11.5 AGM. So exlude all E11.5 AGM. GL34 also have one yolk sac population (Gfi/Gfib KO), this will be kept
+  - GL36 & GL37 is the same source. Essentially the same run. We remove E7.5 cells and E10-25_Ckit_pos as this didd NOT work. 
+  - GL43 has only AGM. - Keep all
+  - GL58 has only AGM, but Roshana's E11.5 samples did NOT work, so we exlude this
+
+```{r}
+df_next_sel <- df_next_all %>%
+  filter(!SeqRun == "GL32") %>%
+  filter(!condition %in% c("AGM_E11.5_Endo", "AGM_E11.5_HE_Gfi1", "AGM_E11.5_EHT", "AGM_E11.5_IAHC",
+                           "AGM_E10.5_Endo_Runx1_KO",
+                           "AGM_E10.5_HE_Runx1_KO", "MES_E10.5_Runx1_KO", "AGM_E10.5_HE_Gfis_KO",
+                           "YS_E10_HE_Gfi1", "YS_E7.5_GPP_neg", "YS_E7.5_GPP_pos")) %>%
+  filter(!SC_project == "WN-S2-1") # Roshana sort 
+
+write.csv(df_next_sel, file.path(outDir_cur, "NextSeq_selected.csv"))
+```
+
+
+
+### NovaSeq
+
+Process the metadata of the NovaSeq runs
+
+```{r}
+df_nova <- read.delim(file.path(dataDir, "preProcessing/manifest_NovaSeq.txt"),header=FALSE)
+
+df_nova <- df_nova %>%
+  select(V1, V3) %>%
+  mutate(FullName = gsub(".*GL69_YS_AGMace\\/", "", V1),
+         FullName = gsub("_R1_.*", "", FullName),
+         SeqRun = "GL69",
+         FullName = gsub(".*\\/", "", FullName)) %>%
+  dplyr::rename( CellID = V3) %>%
+  select(FullName, SeqRun, CellID) 
+head(df_nova)
+
+df_nova <- df_nova %>%
+  mutate(
+    V1 = FullName,
+    V1 = gsub("Plate1", "WN-S6-1",V1),
+    V1 = gsub("Plate2", "WN-S6-2",V1),
+    V1 = gsub("Plate3", "WN-S6-3",V1),
+    V1 = gsub("Plate4", "WN-S6-4",V1),
+    
+    SC_project = gsub(".*WN-S2.*", "WN-S2", V1),
+    SC_project = gsub(".*WN-S6.*", "WN-S6", SC_project),
+    SC_project = gsub(".*WN-S7.*", "WN-S7", SC_project),
+    SC_project = gsub(".*WN-S7.*", "WN-S7", SC_project),
+    SC_project = gsub(".*WN-S8.*", "WN-S8", SC_project),
+    SC_project = gsub(".*WN-S10.*", "WN-S10", SC_project),
+    SC_project = gsub(".*SM1.*", "SM1", SC_project),
+    SC_project = gsub(".*GL43-plate.*", "GL_SC_43",SC_project),
+                      
+    SC_plate = gsub(".*WN-S[2-8]-", "", V1),
+    SC_plate = gsub(".*WN-S10-", "", SC_plate),
+    SC_plate = gsub(".*SM1-S1-1", "1", SC_plate),
+    SC_plate = gsub(".*GL43-plate", "", SC_plate),
+    SC_plate = gsub("_.*", "", SC_plate),
+    
+    FACS_well = gsub(".*WN-S[2-8]-[1-4]_", "", V1),
+    FACS_well = gsub(".*WN-S10-1_", "", FACS_well),
+    FACS_well = gsub(".*GL43-plate[1-2]_", "", FACS_well),
+    FACS_well = gsub(".*SM1-S1-1_", "", FACS_well),
+    FACS_well = gsub("_.*", "", FACS_well),
+    
+    Well_num = gsub('[A-Z]', "", FACS_well),
+    Well_num = as.numeric(Well_num),
+    Well_num = sprintf("%02d", Well_num),
+    Well_letter = gsub('[0-9]', "", FACS_well),
+    FACS_well = paste0(Well_letter, Well_num),
+    
+    
+    FilePop =  gsub(".*_YS_", "YS_", V1),
+    FilePop =  gsub(".*_AGM_", "AGM_", FilePop),
+    FilePop =  gsub(".*_Empty_Well", "Empty_Well", FilePop),
+    FilePop =  gsub(".*_Roshana_", "Roshana_", FilePop),
+    FilePop =  gsub("_S.*", "", FilePop)
+    
+)
+df_nova$FilePop[df_nova$SC_project == "SM1"] <- "Steve"
+```
+
+
+We modify the Sequencing run to indicate which of the GL69 run was it
+
+```{r}
+df_tmp <- data.frame(
+  FullName = df_nova$FullName) %>%
+  dplyr::mutate(
+    SeqRuns = gsub("_WN.*", "", FullName),
+    SeqRuns = gsub("_GL43.*", "", SeqRuns),
+    SeqRuns = gsub("_SM.*", "", SeqRuns),
+    CellNum = gsub(".*_", "", SeqRuns),
+    CellNum = as.numeric(CellNum),
+    SeqBatch = case_when(
+      CellNum <= 767 ~  "GL69_1",
+      between(CellNum, 769, 1091) ~  "GL69_2",
+      between(CellNum, 1092, 1475) ~  "GL69_3",
+      CellNum >= 1476 ~  "GL69_4")
+    )
+
+
+
+df_nova$SeqRun <- df_tmp$SeqBatch
+```
+
+
+Lets fix the name of the populations and make it easier
+
+```{r}
+# Some files are sperated with - others with _, so we make all the names consistent
+df_nova <- df_nova %>%
+  mutate(condition = FilePop) %>%
+  dplyr::mutate(condition =
+                  case_when(condition == 'AGM_E10-5_Endo' ~ "AGM_E10.5_Endo",
+                            condition == 'AGM_E10.5_Endo_double' ~ "AGM_E10.5_Endo_d",
+                            condition == 'AGM_E10-5_Endo_double' ~ "AGM_E10.5_Endo_d",
+                            condition == 'AGM_E10-5_ACE_pos' ~ "AGM_E10.5_ACE_pos",
+                            condition == 'AGM_E10-5_HE_Runx1' ~ "AGM_E10.5_HE_Runx1",
+                            condition == 'AGM_E10.5_HE_Gfi1' ~ "AGM_E10.5_HE_Gfi1",
+                            condition == 'AGM_E10-5_HE_Gfi1' ~ "AGM_E10.5_HE_Gfi1",
+                            
+                            condition == 'YS_E9-0_Endo' ~ "YS_E9.0_Endo",
+                            condition == 'YS_E9-0_Endo_double' ~ "YS_E9.0_Endo",
+                            condition == 'YS_E9.0_Endo_double' ~ "YS_E9.0_Endo",
+                            condition == 'YS_E9.0_HE_Runx1' ~ "YS_E9.0_HE_Runx1",
+                            condition == 'YS_E9-0_HE_Runx1' ~ "YS_E9.0_HE_Runx1",
+                            condition == 'YS_E9.0_HE_Gfi1' ~ "YS_E9.0_HE_Gfi1",
+                            condition == 'YS_E9-0_HE_Gfi1' ~ "YS_E9.0_HE_Gfi1",
+                            
+                            condition == 'YS_E9-5_Endo' ~ "YS_E9.5_Endo",
+                            condition == 'YS_E9-5_Endo_double' ~ "YS_E9.5_Endo",
+                            condition == 'YS_E9-5_HE_Runx1' ~ "YS_E9.5_HE_Runx1",
+                            condition == 'YS_E9-5_HE_Gfi1' ~ "YS_E9.5_HE_Gfi1",
+                            
+                            condition == 'YS_E10-5_Endo' ~ "YS_E10.5_Endo",
+                            condition == 'YS_E10-5_Endo_double' ~ "YS_E10.5_Endo",
+                            condition == 'YS_E10-5_HE_Runx1' ~ "YS_E10.5_HE_Runx1",
+                            condition == 'YS_E10-5_HE_Gfi1' ~ "YS_E10.5_HE_Gfi1",
+                            
+                            #condition == '' ~ "YS_E9.5_LMP_PE",
+                            #condition == '' ~ "YS_E9.5_EMP_eF450",
+                            #condition == '' ~ "YS_E9.5_EMP_PE",
+                            condition == 'YS_E9-5_LMP_PE' ~ "YS_E9.5_LMP",
+                            condition == 'YS_E9-5_EMP_PE' ~ "YS_E9.5_EMP",
+                            condition == 'YS_E9-5_EMP_eF450' ~ "YS_E9.5_EMP",
+                            
+                            condition == 'YS_E10-5_LMP_PE' ~ "YS_E10.5_LMP",
+                            condition == 'YS_E10-5_EMP_PE' ~ "YS_E10.5_EMP",
+                            condition == 'YS_E10-5_EMP_eF450' ~ "YS_E10.5_EMP",
+                            
+                            # Steve
+                            condition == 'Steve' ~ "Steve",
+                          
+                            # Empty
+                            condition == 'Empty_Well' ~ "Empty_Well",
+                            
+                            # Roshana
+                            condition == 'Roshana_Gfi1_IAHC' ~ "Roshana"
+                  ))
+
+
+# Save
+write.csv(df_nova, file.path(outDir_cur, "NovaSeq_full.csv"))
+#write.csv(df_nova,  "~/Desktop/NovaSeq_full.csv")
+```
+
+
+#### Remvove un-related populations
+
+```{r}
+df_nova_sel <- df_nova %>%
+  filter(!SC_project == "SM1") %>%
+  filter(!FilePop %in% c("Empty_Well", "Roshana_Gfi1_IAHC"))
+
+write.csv(df_nova_sel, file.path(outDir_cur, "NovaSeq_selected.csv"))
+```
+
+#### Additional metaData
+
+We also have information of the FACS 
+
+> To be completed
+
+## Session Info
+
+```{r}
+sessionInfo()
+```

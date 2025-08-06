@@ -1,0 +1,2249 @@
+---
+title: "In house data"
+subtitle: "Merge YS and AGM"
+author: "Zaki"
+date: "01/09/2021"
+output:
+  html_document:
+    self_contained: yes
+    toc: true
+    toc_float: true
+    df_print: paged
+    number_sections: false
+editor_options: 
+  chunk_output_type: inline
+---
+
+```{r setup, echo=FALSE, message=FALSE, results='hide'}
+library(knitr)
+knitr::opts_chunk$set(cache=TRUE, error=FALSE, cache.lazy = TRUE)
+```
+
+
+
+# In house data
+
+
+## Objective
+
+  * In Chapter 03, we analysed YS data alone
+  * Here we would like to integrate the AGM and YS data
+
+
+## Conclusion
+
+
+## Set-up
+
+Load required library
+
+```{r, warning=FALSE, message=FALSE}
+library(scater)
+library(Seurat)
+library(patchwork)
+library(ggplot2)
+library(dplyr)
+library(reshape2)
+library(ggbeeswarm)
+library(gghighlight)
+library(ggrepel)
+library(paletteer)
+#library(DropletUtils)
+#library(Matrix)
+#library(schex)
+
+# Scater
+library(scater)
+library(scran)
+library(dendextend)
+library(dynamicTreeCut)
+
+# DE
+library(edgeR)
+library(limma)
+```
+
+Specify the work space
+
+```{r}
+workDir <- getwd()
+workDir <- gsub("/scripts", "", workDir)
+dataDir <- file.path(workDir, "data")
+outDir <- file.path(workDir, "output")
+
+# out data
+outData_dir <- file.path(outDir, "out_data")
+
+outDir_cur <- file.path(outDir, "Chapter_04_InHouse_YS_AGM")
+dir.create(outDir_cur)
+set.seed(123)
+
+source(file.path(workDir, "functions.R"))
+```
+
+Load the integrated object
+
+```{r}
+load(file=file.path(outData_dir, "ForIntegration_InHouse_Public.Rdata"))
+```
+
+We have read the original single cell exp object 
+
+```{r}
+se_next <- readRDS(file.path(outData_dir, "Se_Next_allGenes_ENSID.RDS"))
+se_nova <- readRDS(file.path(outData_dir, "Se_Nova_allGenes_ENSID.RDS"))
+```
+
+Load the procesed YS data
+
+```{r}
+se_YS <- readRDS(file.path(outData_dir, "se_YS_only_fullInfo.RDS"))
+```
+
+Load the AGM data from the blood paper
+
+```{r}
+# Now we load the single cell experiment object
+seObjDir <- "/Users/zfadlullah/Dropbox (The University of Manchester)/zaki/PhD/sequencing_runs/2019/191001_MZ_009/output/Chapter_04_E10.5"
+load(file=file.path(seObjDir, "se.block_f.Rdata"))
+```
+
+
+We did a previous clustering and PAGA with the LMP and EMP data previously. Lets re-run the analysis
+
+```{r}
+df_dim_pogen <- readRDS(file.path(outData_dir, "MetaData_YS_AGM_with_LMPs.RDS"))
+```
+
+List of cell cycle
+
+```{r}
+kegg_cc <- read.csv(file.path(dataDir, "Others/kegg_cell_cycle.csv"))
+```
+
+
+Load INDEX sort data
+
+```{r}
+# We know all cell sorted in this plate is Runx1 / Gfi1 reporter
+df_inx_WN_S6 <- read.csv(file.path(dataDir, "INDEX_data/Metadata_WNs6_AGM060.csv")) %>%
+  dplyr::rename(FACS_well = OriWell) %>%
+  mutate(Plate = gsub("Plate", "", Plate),
+         SC_project = 'WN-S6',
+         UniqID = paste(SC_project, Plate, FACS_well, sep="_")) %>%
+dplyr::select(UniqID, Population2, Runx1b_RFP, Gfi1_GFP) %>%
+  mutate(Allele = "RG")
+
+# plate WN S7
+df_inx_WN_S7 <- read.csv(file.path(dataDir, "INDEX_data/Metadata_WNs7_WNs8_AGM068.csv")) %>%
+  dplyr::rename(FACS_well = OriWell) %>%
+  mutate(tmp = Plate,
+         SC_project = gsub("_p[1-5]", "", tmp),
+         SC_project = gsub("_", "-", SC_project),
+         Plate = gsub(".*_p", "", tmp),
+         UniqID = paste(SC_project, Plate, FACS_well, sep="_")) %>%
+  dplyr::select(UniqID, Population2, Runx1b_RFP, Gfi1_GFP,FACS_well)
+
+# We know which well is only the Gfi1 reporter (based on plate layout excel file)
+Gfi_mouse_well <- c(
+  paste0(rep("G", each = ),sprintf("%02d",5:12)),
+  paste0(rep(LETTERS[8:15], each = 23),sprintf("%02d",1:12)),
+  paste0(rep("P", each=3),sprintf("%02d",10:13)))
+
+df_inx_WN_S7 <- df_inx_WN_S7 %>%
+  mutate(Allele = if_else(FACS_well %in% Gfi_mouse_well, "G", "RG")) %>%
+  dplyr::select(-FACS_well)
+
+df_indx <- rbind(df_inx_WN_S6, df_inx_WN_S7)
+
+```
+
+Load list of CC genes
+
+```{r}
+s.genes <- cc.genes.updated.2019$s.genes
+g2m.genes <- cc.genes.updated.2019$g2m.genes
+```
+
+Read list of cell surface genes
+
+```{r}
+df_cs <- read.delim(file.path(dataDir, "Others/RM_cur_CS_mouse.txt"), stringsAsFactors = FALSE)
+```
+
+
+
+## Merging (combine two objects)
+
+We tested the Seurat integration workflow and find that it potentially over-integrate the data. So we will just stick with simply merging the data
+
+
+```{r}
+outDir_inHouse1 <- file.path(outDir_cur, "01_Scater_analysis_YS_AGM_allCells")
+dir.create(outDir_inHouse1)
+```
+
+
+We loaded the single cell object in the Set-up section. Simply merge the two objects
+
+```{r}
+dat1 <- assay(se_next, "counts")
+dat2 <- assay(se_nova, "counts")
+dat <- cbind(dat1,dat2)
+
+c.anno1 <- colData(se_next)
+c.anno2 <- colData(se_nova)
+c.anno <- rbind(c.anno1, c.anno2)
+
+g.anno <- rowData(se_next)
+colnames(g.anno)[5] <- "chr_name"
+
+se <- 
+  SingleCellExperiment(
+  assays = list(counts = dat),
+  colData = c.anno,
+  rowData = g.anno)
+
+se$condition <- factor(se$condition, levels=com_popFac)
+```
+
+We remove the Gfi1/1b KO as we are not interested in this
+
+```{r}
+AnoSite <- se$condition
+AnoSite <- gsub("_.*", "", AnoSite)
+table(AnoSite)
+
+se$Site <- AnoSite
+
+
+# Remove Gfi1/1b KO
+se <- se[,!se$condition == "YS_E9.5_HE_Gfi1s_KO"]
+```
+
+
+Lets remove tech duplicates, we select the ones with the most genes to keep. 
+
+
+```{r}
+cD <- as.data.frame(colData(se))
+
+cD <- cD %>%
+  # Find the lane in which the sample was sequenced on
+  mutate(Lane = gsub("*.L001", "L1", FullName),
+         Lane = gsub(".*L002", "L2", Lane),
+         Lane = gsub("GL.*", "L1", Lane),
+         SeqBatch = paste(SeqRun, Lane, sep="_"),
+  # Find the Uniq ID
+         Plate_Well = paste(SC_project, SC_plate, FACS_well, sep="_"))
+
+# Identify tech replicates
+df_com_twice <- as_tibble(cD) %>%
+  dplyr::count(Plate_Well) %>% dplyr::filter(n > 1)
+
+qc_cell <- perCellQCMetrics(se)
+cD <- cbind(cD, qc_cell)
+
+cD_noTech <- cD %>%
+  arrange(desc(detected)) %>%
+  distinct(Plate_Well,.keep_all = TRUE)
+
+# Subset
+se <- se[,se$Barcode %in% cD_noTech$Barcode]
+```
+
+
+
+
+#### Filtering lowly-expressed genes
+
+Remove all ENS with 0 counts
+
+```{r}
+row_sub <- rowSums(dat)
+row_sub <- names(row_sub)[row_sub > 0]
+```
+
+Convert to gene names
+
+```{r}
+se <- se[row_sub, ]
+
+new.row.names <- uniquifyFeatureNames(
+    rowData(se)$ID,
+    rowData(se)$Symbol
+)
+
+rownames(se) <- new.row.names
+head(rownames(se), 5)
+
+```
+
+#### Normalisation
+
+```{r}
+set.seed(123)
+clust.se <- quickCluster(se) 
+se <- computeSumFactors(se, cluster=clust.se, min.mean=0.1)
+se <- logNormCounts(se)
+se <- logNormCounts(se,transform="none")
+```
+
+
+#### Feature selection
+
+```{r}
+set.seed(123)
+dec.se <- modelGeneVar(se)
+
+# Visualizing the fit:
+fit.se <- metadata(dec.se)
+plot(fit.se$mean, fit.se$var, xlab="Mean of log-expression",
+    ylab="Variance of log-expression")
+curve(fit.se$trend(x), col="dodgerblue", add=TRUE, lwd=2)
+```
+
+#### Cell cycle assginment
+
+```{r}
+mm.pairs <- readRDS(system.file("exdata", "mouse_cycle_markers.rds", 
+    package="scran"))
+
+
+# Using Ensembl IDs to match up with the annotation in 'mm.pairs'.
+assignments <- cyclone(se, mm.pairs, gene.names=rowData(se)$ID)
+se$Phase <- assignments$phases
+
+saveRDS(se, file.path(outDir_cur, "seNorm_YS_AGM.RDS"))
+```
+
+
+
+
+#### Dim reduction
+
+Select the most variable genes
+
+```{r}
+set.seed(123)
+top.prop <- getTopHVGs(dec.se, prop=0.1)
+top.se <- getTopHVGs(dec.se, n=2000)
+length(top.prop)
+length(top.se)
+
+chosen <- top.se
+```
+
+Run dim reduction
+
+```{r}
+se <- runPCA(se, subset_row=chosen) 
+
+percent.var <- attr(reducedDim(se), "percentVar")
+plot(percent.var, log="y", xlab="PC", ylab="Variance explained (%)")
+```
+
+
+UMAP
+
+```{r}
+set.seed(123)
+se <- runUMAP(se, dimred="PCA", subset_row=chosen,
+              pca=30,
+              n_neighbors=30,
+              min_dist=0.5)
+plotUMAP(se, colour_by="condition")
+```
+
+
+#### Clustering
+
+We use graph-based for quick cluster
+
+```{r}
+# Graph based
+
+g <- buildSNNGraph(se, k=10, use.dimred = 'PCA')
+clust <- igraph::cluster_walktrap(g)$membership
+se$GraphBased <- paste0("g_", sprintf("%02d",clust))
+```
+
+
+### Visualise
+
+Visualise UMAP better
+
+```{r}
+umap.df.int <- reducedDim(se, "UMAP") %>%
+  cbind(colData(se)) %>%
+  as.data.frame() %>%
+  dplyr::rename(UMAP_1 = V1,
+                UMAP_2 = V2)
+```
+
+Plot 
+
+```{r}
+p1 <- 
+  ggplot(umap.df.int, aes(x=UMAP_1, y=UMAP_2, colour=SeqRun)) +
+  geom_point() +
+  gghighlight(use_direct_label = FALSE) +
+  theme(legend.position = "right") +
+  facet_wrap(~SeqRun) +
+  theme_custom +
+  #scale_colour_manual(values=tableau20) + 
+  labs(title="Highlighting the Sequencing batch")
+
+p2 <-        
+  ggplot(umap.df.int, aes(x=UMAP_1, y=UMAP_2, colour=SeqRun)) +
+  geom_point() +
+  gghighlight(use_direct_label = FALSE) +
+  theme_custom +
+  theme(legend.position = "none") +
+  facet_wrap(~condition) +
+  #scale_colour_manual(values=g_hue) + 
+  #scale_colour_manual(values=tableau20) + 
+  labs(title="Highlighting the FACS population")
+
+p3 <-        
+  ggplot(umap.df.int, aes(x=UMAP_1, y=UMAP_2, colour=GraphBased)) +
+  geom_point() +
+  gghighlight(use_direct_label = FALSE) +
+  theme_custom +
+  theme(legend.position = "right") +
+  facet_wrap(~GraphBased) +
+  #scale_colour_manual(values=g_hue) + 
+  #scale_colour_manual(values=tableau20) + 
+  labs(title="Highlighting the in-silico clusters")
+
+p4 <-        
+  ggplot(umap.df.int, aes(x=UMAP_1, y=UMAP_2, colour=Phase)) +
+  geom_point() +
+  gghighlight(use_direct_label = FALSE) +
+  theme(legend.position = "right") +
+  facet_wrap(~Phase) +
+  theme_custom +
+  #scale_colour_manual(values=g_hue) + 
+  #scale_colour_manual(values=tableau20) + 
+  labs(title="Highlighting the cell cycle")
+
+
+png(file.path(outDir_inHouse1, "facet_SeqBatch.png"), height=350, width = 850)
+p1
+dev.off()
+
+png(file.path(outDir_inHouse1, "facet_FACS.png"), height=950, width = 1200)
+p2
+dev.off()
+
+png(file.path(outDir_inHouse1, "facet_cluster.png"), height=950, width = 1200)
+p3
+dev.off()
+
+png(file.path(outDir_inHouse1, "facet_CC.png"), height=350, width = 850)
+p4
+dev.off()
+```
+
+We can check the expression of the following genes 
+
+```{r}
+plotUMAP(se, colour_by=c("Folr1"))
+plotUMAP(se, colour_by=c("Acta2"))
+plotUMAP(se, colour_by=c("Ptn"))
+plotUMAP(se, colour_by=c("Hbb-y"))
+seOri <- se
+```
+
+Save the se object at this stage
+
+```{r}
+saveRDS(seOri, file.path(outDir_inHouse1, "se_allCell.RDS"))
+#seOri <- readRDS(file.path(outDir_inHouse1, "se_allCell.RDS"))
+```
+
+
+
+## Subset data
+
+```{r}
+outDir_inHouse2 <- file.path(outDir_cur, "02_Scater_analysis_YS_AGM_subset")
+dir.create(outDir_inHouse2)
+```
+
+
+We now subset to the population of interest
+
+First, we overlay the previously lablled YS data
+
+```{r}
+# Extract data from AGM + YS
+umap.df.int <- reducedDim(seOri, "UMAP") %>%
+  cbind(colData(seOri)) %>%
+  as.data.frame() %>%
+  dplyr::rename(UMAP_1 = V1,
+                UMAP_2 = V2)
+
+# Extract data from YS only
+cD_YS <- as.data.frame(colData(se_YS)) %>%
+  dplyr::select(Barcode, TreeCut_re) %>%
+  dplyr::rename(YS_clus = TreeCut_re)
+
+umap.df.int <- umap.df.int %>%
+  dplyr::left_join(cD_YS) %>%
+  dplyr::mutate(
+    YS_clus = case_when(
+      condition %in% c("YS_E9.0_HE_Gfi1_Kneg", "YS_E9.5_HE_Gfi1_Kneg", "YS_E10_HE_Gfi1_Kneg") ~ "YS_others",
+      is.na(YS_clus) ~ "AGM",
+      TRUE ~ YS_clus))
+
+seOri$YS_clus <- umap.df.int$YS_clus
+```
+
+
+Begin removing the cells we are not interested in. Start with MES
+
+```{r}
+umap.df.int_sub <- umap.df.int %>%
+  dplyr::filter(UMAP_1 > -5) %>%
+  dplyr::filter(!condition %in% c("MES_E10.5_Runx1"))
+```
+
+Now remove the Hbb cells
+
+```{r}
+umap.df.int_sub <- umap.df.int_sub %>%
+  dplyr::filter(!GraphBased %in% c("g_03", "g_17", "g_16"))
+```
+
+
+Also remove cells from the ACE sorted experiment 
+
+```{r,eval=FALSE}
+umap.df.int_sub <- umap.df.int_sub %>%
+  mutate(TempCat = paste(condition, SeqRun, sep="_")) %>%
+  #dplyr::filter(!TempCat == "AGM_E10.5_ACE_pos_GL69") %>%
+  ##dplyr::filter(!TempCat == "AGM_E10.5_HE_Runx1_GL69") %>%
+  dplyr::filter(!TempCat == "AGM_E10.5_HE_Gfi1_GL69")
+  
+```
+
+Exclude the YS Gfi1 pos Kit Neg population
+
+```{r}
+umap.df.int_sub <- umap.df.int_sub %>%
+  dplyr::filter(!condition %in% c("YS_E9.0_HE_Gfi1_Kneg", "YS_E9.5_HE_Gfi1_Kneg", "YS_E10_HE_Gfi1_Kneg"))
+```
+
+Remove Folr1 expressing cells
+
+```{r}
+plot(assay(seOri, "logcounts")["Folr1",])
+# Make a cut off of ~7
+#Folr1_high <- seOri$Barcode[assay(seOri, "logcounts")["Folr1",] > 6.5]
+Folr1_high <- seOri$Barcode[assay(seOri, "logcounts")["Folr1",] > 2]
+
+umap.df.int_sub <- umap.df.int_sub %>%
+  dplyr::filter(!Barcode %in% Folr1_high)
+
+```
+
+For the YS data, we previously identified which cell to discard. We read in the file to ensure these cells are discarded
+
+```{r}
+toRemove <- readRDS(file.path(outData_dir, "Cells_to_exclude.csv"))
+
+umap.df.int_sub <- umap.df.int_sub %>%
+  dplyr::filter(!Barcode %in% toRemove)
+```
+
+
+
+Also remove the LMP and EMP population
+
+```{r}
+LMP_EMPs_1 <- as.data.frame(colData(se_YS)) %>%
+  dplyr::filter(TreeCut_re %in% c("k_4", "k_5")) %>%
+  dplyr::pull(Barcode)
+
+LMP_EMPs_2 <- as.data.frame(colData(se_YS)) %>%
+  dplyr::filter(condition %in% c("YS_E9.5_EMP", "YS_E10.5_EMP", "YS_E9.5_LMP", "YS_E10.5_LMP")) %>%
+  dplyr::pull(Barcode)
+
+
+umap.df.int_sub <- umap.df.int_sub %>%
+  dplyr::filter(!Barcode %in% c(LMP_EMPs_1, LMP_EMPs_2) )
+```
+
+
+
+Remove cells from AGM paper clustered as the KO cluster or as mesenchyme
+
+```{r,eval=FALSE}
+AGM_rm <- as.data.frame(colData(se.block_f)) %>%
+  dplyr::filter(finalCluster2 %in% c("C04", "C06_KO", "C09", "C10")) 
+
+
+# Create a link between names in AGM paper with names in the clusters
+## SeqRun + Plate layout + SC_ploate + Well
+AGM_rm <- AGM_rm %>%
+  dplyr::mutate(TmpUniqID = paste(SequencingRun, SC_project, paste0("p", SC_plate), FACS_well, sep="_")) %>%
+  pull(TmpUniqID)
+
+umap.df.int_sub <- umap.df.int_sub %>%
+  dplyr::mutate(TmpUniqID = paste(SeqRun, SC_project, paste0("p", SC_plate), FACS_well, sep="_")) #%>%
+  #dplyr::filter(TmpUniqID %in% c(AGM_rm) )
+```
+
+
+Show which cells were selected 
+
+```{r}
+umap.df.int <- umap.df.int %>%
+  dplyr::mutate(isSel = if_else(Barcode %in% umap.df.int_sub$Barcode, "Retain", "Discard"))
+
+
+p1 <- 
+  ggplot(umap.df.int, aes(x=UMAP_1, y=UMAP_2, colour=isSel)) +
+  geom_point() +
+  theme(legend.position = "right") +
+  theme_custom +
+  NULL
+
+p1
+png(file.path(outDir_inHouse1, "Selected_cells.png"), height=350, width = 450)
+p1
+dev.off()
+```
+
+There is a cluster of cells in the region of where most of the cells were removed. Not sure what this cells are. It does not belong to a specific clsuter. It seem to express high lvls of Mito
+
+```{r,eval=FALSE}
+# Manually remove them
+man_remove <- umap.df.int_sub %>%
+  dplyr::filter(GraphBased == "g_04" & UMAP_1 <=-1)  %>%
+  pull(Barcode)
+  
+umap.df.int_sub <- umap.df.int_sub %>%
+  dplyr::filter(!Barcode %in% man_remove)
+```
+  
+```{r,eval=FALSE}
+umap.df.int <- umap.df.int %>%
+  dplyr::mutate(isSel = if_else(Barcode %in% umap.df.int_sub$Barcode, "Retain", "Discard"))
+
+
+p1 <- 
+  ggplot(umap.df.int, aes(x=UMAP_1, y=UMAP_2, colour=isSel)) +
+  geom_point() +
+  theme(legend.position = "right") +
+  theme_custom +
+  NULL
+
+p1
+png(file.path(outDir_inHouse1, "Selected_cells.png"), height=350, width = 450)
+p1
+dev.off()
+```
+
+
+We create another version of the selected cells. We remove Hbb and contaminating cells. But retain everything else (mesenchyme, etc)
+
+```{r}
+# Remove Hbb in cluster g_03 
+hbb_remove <- umap.df.int %>%
+  dplyr::filter(GraphBased == "g_03") %>%
+  dplyr::filter(UMAP_1 > -5) %>%
+  pull(Barcode)
+
+umap.df.int_withEMP <- umap.df.int %>%
+  # Remove Hbb
+  dplyr::filter(!GraphBased %in% c("g_17", "g_16")) %>%
+  dplyr::filter(!Barcode %in% Folr1_high) %>%
+  # Remove Folr1 high cells
+  dplyr::filter(!Barcode %in% hbb_remove) %>%
+  # Remove cells demmed low quality from YS analysis
+  dplyr::filter(!Barcode %in% toRemove) %>%
+  # Remove kit negative cells
+  dplyr::filter(!condition %in% c("YS_E9.0_HE_Gfi1_Kneg", "YS_E9.5_HE_Gfi1_Kneg", "YS_E10_HE_Gfi1_Kneg"))
+
+# Show cells in a Map
+umap.df.int2 <- umap.df.int %>%
+  dplyr::mutate(isSel = if_else(Barcode %in% umap.df.int_withEMP$Barcode, "Retain", "Discard"))
+
+p1 <- 
+  ggplot(umap.df.int2, aes(x=UMAP_1, y=UMAP_2, colour=isSel)) +
+  geom_point() +
+  theme(legend.position = "right") +
+  theme_custom +
+  NULL
+p1
+
+
+
+png(file.path(outDir_inHouse1, "Selected_cells_with_EMP_LMP.png"), height=350, width = 450)
+p1
+dev.off()
+
+se_AGM_YS_prog <- seOri[,seOri$Barcode %in% umap.df.int_withEMP$Barcode]
+
+saveRDS(se_AGM_YS_prog, file=file.path(outData_dir, "se_YS_AGM_with_prog.RDS"))
+#se_AGM_YS_prog <- readRDS(file=file.path(outData_dir, "se_YS_AGM_with_prog.RDS"))
+```
+
+
+Subset and Re-do all the steps 
+
+```{r}
+se <- seOri[,seOri$Barcode %in% umap.df.int_sub$Barcode]
+
+set.seed(123)
+dec.se <- modelGeneVar(se)
+
+# Visualizing the fit:
+fit.se <- metadata(dec.se)
+plot(fit.se$mean, fit.se$var, xlab="Mean of log-expression",
+    ylab="Variance of log-expression")
+curve(fit.se$trend(x), col="dodgerblue", add=TRUE, lwd=2)
+
+
+top.se <- getTopHVGs(dec.se, n=2500)
+chosen <- top.se
+
+se <- runPCA(se, subset_row=chosen) 
+se <- runUMAP(se, dimred="PCA", subset_row=chosen,
+              pca=30,
+              n_neighbors=30,
+              min_dist=0.3)
+plotUMAP(se, colour_by="condition")
+```
+
+Run clustering
+
+```{r}
+# Re-run clusters
+g <- buildSNNGraph(se, k=10, use.dimred = 'PCA')
+clust <- igraph::cluster_walktrap(g)$membership
+se$GraphBased_noOutlier <- paste0("g_", sprintf("%02d",clust))
+```
+
+
+Hirarch clustering
+
+```{r,eval=FALSE}
+top.se <- getTopHVGs(dec.se, n=3500)
+chosen <- top.se
+
+# ------------------ HC ---------------- #
+chosen.exprs <- assay(se, "logcounts")[chosen,]
+my.dist = dist(as.matrix(t(chosen.exprs)), method = "euclidean")
+my.tree <- hclust(my.dist, method="ward.D2")
+my.dend <- as.dendrogram(my.tree, hang=0.1)
+my.clusters <- unname(cutreeDynamic(my.tree, distM=as.matrix(my.dist), verbose=0, minClusterSize=10, deepSplit=2))
+#my.clusters <- paste0("k_", my.clusters)
+length(unique(my.clusters))
+se$TmpClust <- paste0("k_", sprintf("%02d",my.clusters))
+
+
+plotUMAP(se, colour="TmpClust")
+table(se$condition, se$TmpClust)
+
+# Making a prettier dendrogram.
+my.tree$labels <- seq_along(my.tree$labels)
+#dend <- as.dendrogram(my.tree, hang=0.1)
+numClus <- length(unique(my.clusters))
+coltree <- gg_color_hue(n=numClus)
+
+my.tree_or <- my.clusters[order.dendrogram(my.dend)]
+
+# Setting up colours for the FACS population
+cFACS <- coltree[as.factor(se$TreeCut)]
+cFACS <- coltree[as.factor(se$TreeCut)[order.dendrogram(my.dend)]]
+
+no0_unique <- 
+  function(x) {
+    u_x <- unique(x)
+    u_x[u_x != 0]
+  }
+
+clusters_numbers <- no0_unique(my.tree_or)
+n_clusters <- length(clusters_numbers)
+cols <- gg_color_hue(n=n_clusters)
+dend2 <- branches_attr_by_clusters(my.dend, my.tree_or, values = cols) %>%
+  set("labels_col", "black")
+plot(dend2)
+colored_bars(cFACS, dend2, sort_by_labels_order = FALSE, y_shift=10)
+
+UniqClus <- unique(my.tree_or)
+
+pdf(file.path(outDir_noLMP, "Dend_HC.pdf"),height = 4, width = 12)
+plot(dend2)
+colored_bars(cFACS, dend2, sort_by_labels_order = FALSE, y_shift=10)
+
+plot(UniqClus, ylim = c(-1, length(UniqClus)))
+text(x =1:length(UniqClus), y=-1, UniqClus)
+
+dev.off()
+
+se$TreeCut <- paste0("k_", sprintf("%02d",my.clusters))
+```
+
+
+UMAP when CC is removed
+
+```{r}
+diff <- getVarianceExplained(se, "Phase")
+discard <- diff > 5
+
+top.hvgs2 <- getTopHVGs(se[which(!discard),], n=2500)
+se.nocycle <- runPCA(se, subset_row=top.hvgs2)
+
+se.nocycle <- runUMAP(se.nocycle, dimred="PCA", subset_row=top.hvgs2,
+              pca=30,
+              n_neighbors=30,
+              min_dist=0.3)
+plotUMAP(se.nocycle, colour_by="condition")
+
+
+
+
+```
+
+
+Save either the UMAP with CC removed or not
+
+```{r}
+saveRDS(se, file=file.path(outData_dir, "se_YS_AGM.RDS"))
+#se <- readRDS(file.path(outData_dir, "se_YS_AGM.RDS"))
+```
+
+
+
+### Visualise
+
+Visualise UMAP better
+
+```{r}
+umap.df.int <- reducedDim(se, "UMAP") %>%
+  cbind(colData(se)) %>%
+  as.data.frame() %>%
+  dplyr::rename(UMAP_1 = V1,
+                UMAP_2 = V2)
+```
+
+Plot 
+
+```{r}
+p1 <- 
+  ggplot(umap.df.int, aes(x=UMAP_1, y=UMAP_2, colour=SeqRun)) +
+  geom_point() +
+  gghighlight(use_direct_label = FALSE) +
+  theme(legend.position = "right") +
+  facet_wrap(~SeqRun) +
+  theme_custom +
+  #scale_colour_manual(values=tableau20) + 
+  labs(title="Highlighting the Sequencing batch")
+
+p2 <-        
+  ggplot(umap.df.int, aes(x=UMAP_1, y=UMAP_2, colour=SeqRun)) +
+  geom_point() +
+  gghighlight(use_direct_label = FALSE) +
+  theme(legend.position = "right") +
+  facet_wrap(~condition) +
+  theme_custom +
+  #scale_colour_manual(values=g_hue) + 
+  #scale_colour_manual(values=tableau20) + 
+  labs(title="Highlighting the FACS population")
+
+p3 <-        
+  ggplot(umap.df.int, aes(x=UMAP_1, y=UMAP_2, colour=GraphBased_noOutlier)) +
+  geom_point() +
+  gghighlight(use_direct_label = FALSE) +
+  theme(legend.position = "right") +
+  facet_wrap(~GraphBased_noOutlier) +
+  theme_custom +
+  #scale_colour_manual(values=g_hue) + 
+  #scale_colour_manual(values=tableau20) + 
+  labs(title="Highlighting the in-silico clusters")
+
+p4 <-        
+  ggplot(umap.df.int, aes(x=UMAP_1, y=UMAP_2, colour=Phase)) +
+  geom_point() +
+  gghighlight(use_direct_label = FALSE) +
+  theme(legend.position = "right") +
+  facet_wrap(~Phase) +
+  theme_custom +
+  #scale_colour_manual(values=g_hue) + 
+  #scale_colour_manual(values=tableau20) + 
+  labs(title="Highlighting the cell cycle")
+
+
+png(file.path(outDir_inHouse2, "facet_SeqBatch.png"), height=350, width = 850)
+p1
+dev.off()
+
+png(file.path(outDir_inHouse2, "facet_FACS.png"), height=950, width = 1200)
+p2
+dev.off()
+
+png(file.path(outDir_inHouse2, "facet_cluster.png"), height=950, width = 1200)
+p3
+dev.off()
+
+png(file.path(outDir_inHouse2, "facet_CC.png"), height=350, width = 850)
+p4
+dev.off()
+```
+
+Overlay the previously lablled YS data
+
+```{r}
+cD_YS <- as.data.frame(colData(se_YS)) %>%
+  dplyr::select(Barcode, TreeCut_re, Cond_fac) %>%
+  dplyr::rename(TreeCut_re = TreeCut_re)
+
+umap.df.int2 <- umap.df.int %>%
+  dplyr::left_join(cD_YS) %>%
+  dplyr::mutate(UniqID = paste(SC_project, SC_plate, FACS_well, sep="_"))
+
+p1 <-        
+  ggplot(umap.df.int2, aes(x=UMAP_1, y=UMAP_2, colour=TreeCut_re)) +
+  geom_point() +
+  gghighlight(use_direct_label = FALSE) +
+  theme(legend.position = "right") +
+  facet_wrap(~TreeCut_re) +
+  theme_custom +
+  #scale_colour_manual(values=g_hue) + 
+  #scale_colour_manual(values=tableau20) + 
+  labs(title="Highlighting the in-silico clusters")
+
+
+
+
+png(file.path(outDir_inHouse2, "facet_cluster_YS_AGM_highlight_YS.png"), height=550, width = 950)
+p1
+dev.off()
+```
+
+Overlay the AGM data
+
+```{r}
+cD_AGM <- as.data.frame(colData(se.block_f)) %>%
+  dplyr::mutate(
+    tmp1 = gsub('([a-zA-Z])', "", FACS_well),
+    tmp1 = sprintf("%02d", as.numeric(tmp1)),
+    tmp2 = gsub('[0-9]', "", FACS_well),
+    FACS_well = paste0(tmp2, tmp1),
+    UniqID = paste(SC_project, SC_plate, FACS_well, sep="_")) %>%
+  dplyr::select(UniqID, finalCluster2)
+  
+umap.df.int2 <- umap.df.int2 %>%
+  dplyr::left_join(cD_AGM) %>%
+  mutate(finalCluster2 = as.character(finalCluster2))
+
+
+p1 <-        
+  ggplot(umap.df.int2, aes(x=UMAP_1, y=UMAP_2, colour=finalCluster2)) +
+  geom_point() +
+  gghighlight(use_direct_label = FALSE) +
+  theme(legend.position = "right") +
+  facet_wrap(~finalCluster2) +
+  theme_custom +
+  #scale_colour_manual(values=g_hue) + 
+  #scale_colour_manual(values=tableau20) + 
+  labs(title="Highlighting the in-silico clusters")
+
+
+png(file.path(outDir_inHouse2, "facet_cluster_YS_AGM_highlight_AGM.png"), height=550, width = 950)
+p1
+dev.off()
+```
+
+Save the metaData
+
+```{r}
+write.csv(umap.df.int2, file.path(outDir_inHouse2, "Metadata_YS_AGM.csv"))
+```
+
+
+## Correcting batch effects
+
+```{r}
+BatchDir <- file.path(outDir_cur, "BatchDir")
+dir.create(BatchDir)
+```
+
+Using the populations that was sequenced in both the NovaSeq and NextSeq, we can use this as a batch correction. The AGM populations: FACS-ENDO and FACS-HE-Runx1 was sequenced in both
+
+We can correct batch effects ;
+
+1) Examining the difference in the gene detected in the same population across different sequencing run
+2) DE between the same populations across different sequencing run
+
+
+Lets do approach 1 first
+
+### Gene detection
+
+Find the genes detected. Start with the FACS-ENDO
+
+```{r}
+sde <- se
+
+# Remove the Endo that cluster far away (this may be differentiated)
+sde2 <- sde[,sde$GraphBased_noOutlier == "g_02"]
+sde2 <- sde2[,sde2$condition == "AGM_E10.5_Endo"]
+
+# Group the cells by Seq batch and population
+cD <- as.data.frame(colData(sde2))
+NewCat <- cD %>%
+  dplyr::mutate(SeqRun2 = case_when(SeqRun %in% c("GL34", "GL36", "GL37", "GL43") ~ "NextSeq",
+                                    SeqRun %in% c("GL69", "GL69_1", "GL69_2", "GL69_3", "GL69_4") ~ "NovaSeq")) %>%
+  dplyr::mutate(SeqBatch_pop = paste(SeqRun2, condition, sep="_")) %>%
+  pull(SeqBatch_pop)
+sde2$SeqBatch <- NewCat
+
+# Calculate dropout rate
+p_list <- unique(NewCat)
+dpt_list <- list()
+
+# Find the percentage expressing gene per-cluster
+for (i in seq_along(p_list)){
+  x <- dropOut_SeqBatch(sde2, p_list[i])
+  dpt_list[[i]] <- x
+}
+dpt_df <- as.data.frame(do.call(cbind, dpt_list))
+colnames(dpt_df) <- paste0("pct_detect_", p_list)
+dpt_df$UniqGeneID <- row.names(sde)
+
+dpt_df_endo <- dpt_df
+```
+
+Repeat for FACS-HE Runx1
+
+```{r}
+sde <- se
+
+# Exclude endo cluster
+sde2 <- sde[,!sde$GraphBased_noOutlier == "g_02"]
+sde2 <- sde2[,sde2$condition == "AGM_E10.5_HE_Runx1"]
+
+# Group the cells by Seq batch and population
+cD <- as.data.frame(colData(sde2))
+NewCat <- cD %>%
+  dplyr::mutate(SeqRun2 = case_when(SeqRun %in% c("GL34", "GL36", "GL37", "GL43") ~ "NextSeq",
+                                    SeqRun %in% c("GL69", "GL69_1", "GL69_2", "GL69_3", "GL69_4") ~ "NovaSeq")) %>%
+  dplyr::mutate(SeqBatch_pop = paste(SeqRun2, condition, sep="_")) %>%
+  pull(SeqBatch_pop)
+sde2$SeqBatch <- NewCat
+
+# Calculate dropout rate
+p_list <- unique(NewCat)
+dpt_list <- list()
+
+# Find the percentage expressing gene per-cluster
+for (i in seq_along(p_list)){
+  x <- dropOut_SeqBatch(sde2, p_list[i])
+  dpt_list[[i]] <- x
+}
+dpt_df <- as.data.frame(do.call(cbind, dpt_list))
+colnames(dpt_df) <- paste0("pct_detect_", p_list)
+dpt_df$UniqGeneID <- row.names(sde)
+
+
+dpt_df_runx1 <- dpt_df
+```
+
+
+Repeat for FACS-HE Gfi1
+
+```{r}
+sde <- se
+
+# Exclude endo cluster & the more advanced HE
+sde2 <- sde[,!sde$GraphBased_noOutlier %in% c("g_02", "g_05")]
+sde2 <- sde2[,sde2$condition == "AGM_E10.5_HE_Gfi1"]
+
+# Group the cells by Seq batch and population
+cD <- as.data.frame(colData(sde2))
+NewCat <- cD %>%
+  dplyr::mutate(SeqRun2 = case_when(SeqRun %in% c("GL34", "GL36", "GL37", "GL43") ~ "NextSeq",
+                                    SeqRun %in% c("GL69", "GL69_1", "GL69_2", "GL69_3", "GL69_4") ~ "NovaSeq")) %>%
+  dplyr::mutate(SeqBatch_pop = paste(SeqRun2, condition, sep="_")) %>%
+  pull(SeqBatch_pop)
+sde2$SeqBatch <- NewCat
+
+# Calculate dropout rate
+p_list <- unique(NewCat)
+dpt_list <- list()
+
+# Find the percentage expressing gene per-cluster
+for (i in seq_along(p_list)){
+  x <- dropOut_SeqBatch(sde2, p_list[i])
+  dpt_list[[i]] <- x
+}
+dpt_df <- as.data.frame(do.call(cbind, dpt_list))
+colnames(dpt_df) <- paste0("pct_detect_", p_list)
+dpt_df$UniqGeneID <- row.names(sde)
+
+
+dpt_df_gfi1 <- dpt_df
+```
+
+
+
+Now we have a table of the detected genes per batch. Lets decide on which genes to remove
+
+Criteria ;
+
+1) Remove genes detected more in 40%
+
+```{r}
+# What genes are found x% detected in one or the ot
+thre_val <- 50
+dpt_df_endo <-  dpt_df_endo %>%
+  dplyr::mutate(Diff = pct_detect_NextSeq_AGM_E10.5_Endo - pct_detect_NovaSeq_AGM_E10.5_Endo,
+                Diff_ID = 
+                  case_when(Diff >= thre_val  ~ "Next",
+                            Diff <= -thre_val   ~ "Nova",
+                            TRUE ~ "noDiff"))
+dpt_df_runx1 <-  dpt_df_runx1 %>%
+  dplyr::mutate(Diff = pct_detect_NextSeq_AGM_E10.5_HE_Runx1 - pct_detect_NovaSeq_AGM_E10.5_HE_Runx1,
+                Diff_ID = 
+                  case_when(Diff >= thre_val  ~ "Next",
+                            Diff <= -thre_val   ~ "Nova",
+                            TRUE ~ "noDiff"))
+
+dpt_df_gfi1 <-  dpt_df_gfi1 %>%
+  dplyr::mutate(Diff = pct_detect_NextSeq_AGM_E10.5_HE_Gfi1 - pct_detect_NovaSeq_AGM_E10.5_HE_Gfi1,
+                Diff_ID = 
+                  case_when(Diff >= thre_val  ~ "Next",
+                            Diff <= -thre_val   ~ "Nova",
+                            TRUE ~ "noDiff"))
+
+e_1 <- dpt_df_endo %>% dplyr::filter(Diff_ID %in% c("Next", "Nova")) %>% pull(UniqGeneID)
+r_1 <- dpt_df_runx1 %>% dplyr::filter(Diff_ID %in% c("Next", "Nova")) %>% pull(UniqGeneID)
+g_1 <- dpt_df_gfi1 %>% dplyr::filter(Diff_ID %in% c("Next", "Nova")) %>% pull(UniqGeneID)
+# Criteria 1
+cri_1 <- unique(c(e_1, r_1, g_1))
+```
+
+
+### DE
+
+Now we find genes differentially expressed between batches
+
+In the FACS-ENDO
+
+```{r}
+# Set treshold for significance
+up_thresh <- 1.5
+dwn_thresh <- -1.5
+FDR_thresh <- 0.05
+
+
+
+sde <- se
+
+# Only the endo cluster
+sde2 <- sde[,sde$GraphBased_noOutlier == "g_02"]
+sde2 <- sde2[,sde2$condition == "AGM_E10.5_Endo"]
+
+sde <- sde2
+
+# Do the DE
+cD <- as.data.frame(colData(sde))
+NewCat <- cD %>%
+  dplyr::mutate(SeqRun2 = case_when(SeqRun %in% c("GL34", "GL36", "GL37", "GL43") ~ "NextSeq",
+                                    SeqRun %in% c("GL69") ~ "NovaSeq")) %>%
+  dplyr::mutate(SeqBatch_pop = paste(SeqRun2, condition, sep="_")) %>%
+  pull(SeqBatch_pop)
+
+group <- as.character(NewCat)
+
+
+
+
+cts <- as.matrix(assay(sde, "counts"))
+colnames(cts) <- sde$Barcode
+
+
+dge <- DGEList(counts = cts, group =group)
+dge <- calcNormFactors(dge)
+
+# Do the DE
+design <- model.matrix(~0 + group, cD)
+vm <- voom(dge, design = design, plot = TRUE)
+fit <- lmFit(vm, design)
+
+# comparison of interest
+contrast.matrix <- makeContrasts(groupNextSeq_AGM_E10.5_Endo-groupNovaSeq_AGM_E10.5_Endo, levels=design)
+fit2 <- contrasts.fit(fit, contrast.matrix)
+fit2 <- eBayes(fit2)
+# We extract the DE genes in each comparison.
+dge_g1 <- 
+  topTable(fit2, n = Inf, adjust.method = "BH", coef=1) %>%
+  tibble::rownames_to_column(var = "UniqGeneID")
+
+# Filter
+dge_g1_sub <- dge_g1 %>%
+  dplyr::filter(adj.P.Val < FDR_thresh) %>%
+  dplyr::filter(logFC >= up_thresh | logFC <= dwn_thresh)
+
+write.csv(dge_g1, file.path(BatchDir, "DE_full_Next_vs_Nova_Endo.csv"))
+write.csv(dge_g1_sub, file.path(BatchDir, "DE_full_Next_vs_Nova_Endo_filter.csv"))
+
+de_endo <- dge_g1_sub
+
+```
+
+
+
+Compare Runx1 HE
+
+```{r}
+sde <- se
+
+# Remove the Runx1 HE  that cluster with endo
+sde2 <- sde[,!sde$GraphBased_noOutlier == "g_02"]
+#sde2 <- sde2[,sde2$GraphBased_noOutlier == "g_01"] # This is the cluster with most Runx1 HE
+sde2 <- sde2[,sde2$condition == "AGM_E10.5_HE_Runx1"]
+
+sde <- sde2
+
+# Do the DE
+cD <- as.data.frame(colData(sde))
+NewCat <- cD %>%
+  dplyr::mutate(SeqRun2 = case_when(SeqRun %in% c("GL34", "GL36", "GL37", "GL43") ~ "NextSeq",
+                                    SeqRun %in% c("GL69") ~ "NovaSeq")) %>%
+  dplyr::mutate(SeqBatch_pop = paste(SeqRun2, condition, sep="_")) %>%
+  pull(SeqBatch_pop)
+
+group <- as.character(NewCat)
+
+cts <- as.matrix(assay(sde, "counts"))
+colnames(cts) <- sde$Barcode
+
+
+dge <- DGEList(counts = cts, group =group)
+dge <- calcNormFactors(dge)
+
+# Do the DE
+design <- model.matrix(~0 + group, cD)
+vm <- voom(dge, design = design, plot = TRUE)
+fit <- lmFit(vm, design)
+
+# comparison of interest
+contrast.matrix <- makeContrasts(groupNextSeq_AGM_E10.5_HE_Runx1-groupNovaSeq_AGM_E10.5_HE_Runx1, levels=design)
+fit2 <- contrasts.fit(fit, contrast.matrix)
+fit2 <- eBayes(fit2)
+# We extract the DE genes in each comparison.
+dge_g1 <- 
+  topTable(fit2, n = Inf, adjust.method = "BH", coef=1) %>%
+  tibble::rownames_to_column(var = "UniqGeneID")
+
+# Filter
+dge_g1_sub <- dge_g1 %>%
+  dplyr::filter(adj.P.Val < FDR_thresh) %>%
+  dplyr::filter(logFC >= up_thresh | logFC <= dwn_thresh)
+
+write.csv(dge_g1, file.path(BatchDir, "DE_full_Next_vs_Nova_Runx1HE.csv"))
+write.csv(dge_g1_sub, file.path(BatchDir, "DE_full_Next_vs_Nova_Runx1HE_filter.csv"))
+
+de_runx1 <- dge_g1_sub
+```
+
+
+Compare Gfi1 HE
+
+```{r}
+sde <- se
+
+# Exclude endo cluster & the more advanced HE
+sde2 <- sde[,!sde$GraphBased_noOutlier %in% c("g_02", "g_05")]
+sde2 <- sde2[,sde2$condition == "AGM_E10.5_HE_Gfi1"]
+
+sde <- sde2
+
+# Do the DE
+cD <- as.data.frame(colData(sde))
+NewCat <- cD %>%
+  dplyr::mutate(SeqRun2 = case_when(SeqRun %in% c("GL34", "GL36", "GL37", "GL43") ~ "NextSeq",
+                                    SeqRun %in% c("GL69") ~ "NovaSeq")) %>%
+  dplyr::mutate(SeqBatch_pop = paste(SeqRun2, condition, sep="_")) %>%
+  pull(SeqBatch_pop)
+
+group <- as.character(NewCat)
+
+
+cts <- as.matrix(assay(sde, "counts"))
+colnames(cts) <- sde$Barcode
+
+
+dge <- DGEList(counts = cts, group =group)
+dge <- calcNormFactors(dge)
+
+# Do the DE
+design <- model.matrix(~0 + group, cD)
+vm <- voom(dge, design = design, plot = TRUE)
+fit <- lmFit(vm, design)
+
+# comparison of interest
+contrast.matrix <- makeContrasts(groupNextSeq_AGM_E10.5_HE_Gfi1-groupNovaSeq_AGM_E10.5_HE_Gfi1, levels=design)
+fit2 <- contrasts.fit(fit, contrast.matrix)
+fit2 <- eBayes(fit2)
+# We extract the DE genes in each comparison.
+dge_g1 <- 
+  topTable(fit2, n = Inf, adjust.method = "BH", coef=1) %>%
+  tibble::rownames_to_column(var = "UniqGeneID")
+
+# Filter
+dge_g1_sub <- dge_g1 %>%
+  dplyr::filter(adj.P.Val < FDR_thresh) %>%
+  dplyr::filter(logFC >= up_thresh | logFC <= dwn_thresh)
+
+write.csv(dge_g1, file.path(BatchDir, "DE_full_Next_vs_Nova_Gfi1HE.csv"))
+write.csv(dge_g1_sub, file.path(BatchDir, "DE_full_Next_vs_Nova_Gfi1HE_filter.csv"))
+
+de_gfi1 <- dge_g1_sub
+```
+
+
+Find the intersecting genes
+
+```{r}
+int_1 <- intersect(de_endo$UniqGeneID, de_runx1$UniqGeneID)
+int_2 <- intersect(de_endo$UniqGeneID, de_gfi1$UniqGeneID)
+int_3 <- intersect(de_runx1$UniqGeneID, de_gfi1$UniqGeneID)
+
+```
+
+
+### Final batch genes to remove
+
+
+```{r}
+int_all <- unique(c(int_1, int_2, int_3))
+
+
+genes_to_remove <- data.frame(
+  genes = c(int_all, cri_1),
+  cat = c(rep("batch", length(int_all)),
+          rep("dropout", length(cri_1))))
+
+write.csv(genes_to_remove, file.path(outData_dir, "genes_to_remove_batch_dropout.csv"))
+```
+
+## Other genees to remove
+
+Poteitally we can remove genes associated with cell cycle
+
+```{r}
+# Alternative way of finding cell cycle genes
+s.genes <- cc.genes.updated.2019$s.genes
+g2m.genes <- cc.genes.updated.2019$g2m.genes
+
+cc.genes_com <- c(s.genes, g2m.genes, kegg_cc$KEGG_CELL_CYCLE)
+cc.genes_com <- unique(as.character(mapply(simpleCap, cc.genes_com)) )
+
+write.csv(cc.genes_com, file.path(outData_dir, "genes_associated_with_cell_cycle.csv"))
+
+```
+
+
+
+Other considerations for gene exclusion
+
+1) Lowly expressed genes. Retain those more than 5% expressed
+2) Remove added locus (RFP, GFP, dTomato)
+3) Remove mitrochondial genes
+4) Remove non-chromosome genes (keep chr 1-20, x and y)
+5) Remove cell cycle genes
+
+
+We create a csv file of genes to be discarded. This can be loaded in scanoy 
+
+```{r}
+# Step 1 
+# Calculate the dropout rate in the overall single cell object
+drp_all <- scater::perFeatureQCMetrics(se_AGM_YS_prog) %>%
+  as.data.frame() %>%
+  tibble::rownames_to_column(var = "UniqGeneID") %>%
+  dplyr::rename(otherPop_detc = detected)
+
+remove1 <- drp_all %>%
+  dplyr::filter(otherPop_detc <= 1) %>%
+  dplyr::pull(UniqGeneID)
+
+# Step 2
+# Remove RFP, GFP, Tomato
+#keep2 <- keep1 %>%
+#  dplyr::filter(!UniqGeneID %in% c("GFP", "RFP", "dTomato"))
+
+# Step 3 & 4
+# Remove mito genes and non-chrom genes
+chrKeep <- c(paste0("chr", 1:19), "chrX", "chrY")
+rD <- rowData(se_AGM_YS_prog)
+gene_to_remove <- as.data.frame(rD) %>%
+  tibble::rownames_to_column(var = "gene") %>%
+  dplyr::filter(!chr_name %in% chrKeep)
+
+remove2 <- gene_to_remove %>%
+  dplyr::pull(gene)
+
+remove_all <- unique(c(remove1, remove2))
+
+
+genes_to_remove2 <- data.frame(
+  genes = c(remove1, remove2),
+  cat = c(rep("droupout_5Perc", length(remove1)),
+          rep("nonChr", length(remove2))))
+
+write.csv(genes_to_remove2, file.path(outData_dir, "genes_to_remove_nonChr_Mt_nonExpressing.csv"))
+
+# Step 5
+# The genes associated with cell cycel was previously identitifed
+#diff <- getVarianceExplained(se, "Phase")
+#discard <- diff > 5
+gene_to_discard <- as.data.frame(diff) %>%
+  tibble::rownames_to_column(var = "gene") %>%
+  dplyr::filter(Phase > 5)
+keep4 <- keep3 %>%
+  dplyr::filter(!UniqGeneID %in% gene_to_discard$gene)
+
+# Alternative way of finding cell cycle genes
+s.genes <- cc.genes.updated.2019$s.genes
+g2m.genes <- cc.genes.updated.2019$g2m.genes
+
+cc.genes_com <- c(s.genes, g2m.genes, kegg_cc$KEGG_CELL_CYCLE)
+cc.genes_com <- unique(as.character(mapply(simpleCap, cc.genes_com)) )
+
+keep4 <- keep3 %>%
+  dplyr::filter(!UniqGeneID %in% cc.genes_com)
+
+# Step 6 remove batch genes
+keep5 <- keep4 %>%
+  dplyr::filter(!UniqGeneID %in% dge_g1_sub$UniqGeneID)
+
+write.csv(keep4, file.path(outData_dir, "Gene_retained.csv"))
+
+```
+
+
+
+
+Plot some genes
+
+```{r}
+plotUMAP(sde, colour_by="Gm3636")
+```
+
+
+
+
+## Seurat
+
+
+```{r}
+outDir_inHouse3 <- file.path(outDir_cur, "03_Seurat_analysis_YS_AGM_subset")
+dir.create(outDir_inHouse3)
+```
+
+Lets try use seurat to analyse the data
+
+
+
+```{r}
+inhouse.combined <- merge(seuset_nova, y = seuset_next, add.cell.ids = c("nova", "next"), project = "inhouse")
+```
+
+Do normal processing
+
+```{r}
+#se <- se.nocycle
+seuset <- inhouse.combined
+seuset <- seuset[,seuset$Barcode %in% se$Barcode ]
+
+# Match the order
+dd <- seuset[[]]
+cD <- as.data.frame(colData(se)) %>%
+  dplyr::select(Barcode, GraphBased )
+
+dd <- dd %>%
+  dplyr::left_join(cD)
+
+seuset$GraphBased <- factor(dd$GraphBased, levels=paste0("g_", sprintf("%02d",1:length(unique(dd$GraphBased)))))
+```
+
+Do normal processing
+
+
+```{r}
+# Feature selections
+seuset <- NormalizeData(seuset)
+seuset <- 
+  FindVariableFeatures(object = seuset, selection.method = "vst", nfeatures = 2500)
+# Scaling the data
+all.genes <- rownames(x = seuset)
+seuset <- CellCycleScoring(seuset, s.features = s.genes, g2m.features = g2m.genes, set.ident = FALSE)
+
+# Add either originated from nova or next
+Seq_name <- colnames(seuset)
+Seq_name <- gsub("_.*", "", Seq_name)
+seuset$Sequencer <- Seq_name
+
+# Dont need to regress anything at this stage as we only want to remove the tech rep and outlier
+seuset <- ScaleData(seuset, 
+                    #vars.to.regress = c("S.Score", "G2M.Score", "Sequencer"), 
+                    features = rownames(seuset))
+seuset <- RunPCA(seuset, verbose = FALSE)
+seuset <- RunUMAP(seuset, dims = 1:30, verbose = FALSE)
+
+seuset <- FindNeighbors(seuset, dims = 1:30, verbose = FALSE)
+seuset <- FindClusters(seuset, verbose = FALSE)
+
+
+```
+
+Plot Seurat output
+
+```{r}
+DimPlot(seuset)
+FeaturePlot(seuset, c("Ace", "Lyve1"))
+```
+
+
+
+
+### Visualise
+
+Visualise UMAP better
+
+```{r}
+umap.df.int <- as.data.frame(Embeddings(seuset, reduction="umap"))  %>%
+  cbind(seuset[[]]) %>%
+  as.data.frame() %>%
+  mutate(condition = factor(condition, levels=com_popFac))
+```
+
+Plot 
+
+```{r}
+p1 <- 
+  ggplot(umap.df.int, aes(x=UMAP_1, y=UMAP_2, colour=SeqRun)) +
+  geom_point() +
+  gghighlight(use_direct_label = FALSE) +
+  theme(legend.position = "right") +
+  facet_wrap(~SeqRun) +
+  theme_custom +
+  #scale_colour_manual(values=tableau20) + 
+  labs(title="Highlighting the Sequencing batch")
+
+p2 <-        
+  ggplot(umap.df.int, aes(x=UMAP_1, y=UMAP_2, colour=SeqRun)) +
+  geom_point() +
+  gghighlight(use_direct_label = FALSE) +
+  theme(legend.position = "right") +
+  facet_wrap(~condition) +
+  theme_custom +
+  #scale_colour_manual(values=g_hue) + 
+  #scale_colour_manual(values=tableau20) + 
+  labs(title="Highlighting the FACS population")
+
+p3 <-        
+  ggplot(umap.df.int, aes(x=UMAP_1, y=UMAP_2, colour=seurat_clusters)) +
+  geom_point() +
+  gghighlight(use_direct_label = FALSE) +
+  theme(legend.position = "right") +
+  facet_wrap(~seurat_clusters) +
+  theme_custom +
+  #scale_colour_manual(values=g_hue) + 
+  #scale_colour_manual(values=tableau20) + 
+  labs(title="Highlighting the in-silico clusters")
+
+p4 <-        
+  ggplot(umap.df.int, aes(x=UMAP_1, y=UMAP_2, colour=Phase)) +
+  geom_point() +
+  gghighlight(use_direct_label = FALSE) +
+  theme(legend.position = "right") +
+  facet_wrap(~Phase) +
+  theme_custom +
+  #scale_colour_manual(values=g_hue) + 
+  #scale_colour_manual(values=tableau20) + 
+  labs(title="Highlighting the cell cycle")
+
+
+png(file.path(outDir_inHouse3, "facet_SeqBatch.png"), height=350, width = 850)
+p1
+dev.off()
+
+png(file.path(outDir_inHouse3, "facet_FACS.png"), height=950, width = 1200)
+p2
+dev.off()
+
+png(file.path(outDir_inHouse3, "facet_cluster.png"), height=950, width = 1200)
+p3
+dev.off()
+
+png(file.path(outDir_inHouse3, "facet_CC.png"), height=350, width = 850)
+p4
+dev.off()
+```
+
+
+## Paga prepare v3
+
+
+We prepare paga with all the genes, but we will discard them later
+
+```{r}
+# --- Generate seurat ----- #
+seu <- Seurat::as.Seurat(se)
+
+#seu <- seuset
+# Clean up the column annotaion
+dd <- seu[[]] 
+dd2 <- dd %>%
+  dplyr::select(Barcode, condition) 
+
+seu@meta.data <- dd2
+# Remove the graph # https://github.com/theislab/scanpy/issues/598
+seu@graphs <- list()
+
+kk1 <- GetAssayData(object = seu, slot = "counts")
+
+kk_name <- gsub("nova_", "", colnames(kk1))
+kk_name <- gsub("next_", "", kk_name)
+
+colnames(kk1) <- kk_name
+
+kk2 <- seu[[]]
+rownames(kk2) <- kk_name
+
+seu <- 
+  Seurat::CreateSeuratObject(counts = kk1, 
+                     project = "InHouse", 
+                     meta.data = kk2,
+                     min.cells = 3, min.features = 200)
+seu <- NormalizeData(
+  object = seu, 
+  normalization.method = "LogNormalize", 
+  scale.factor = 10000
+)
+seu@graphs <- list()
+
+seu <- 
+  FindVariableFeatures(object = seu, selection.method = "vst", nfeatures = 2500)
+# Scaling the data
+all.genes <- rownames(x = seu)
+seu <- ScaleData(object = seu, features = all.genes)
+
+
+saveRDS(seu, file.path(outData_dir, "seu_inHouse_YS_AGM_forLoom_allGenes_no_LMP_no_EMP.RDS"))
+```
+
+
+Paga with all the cells including progenitors & mesenchyme
+
+```{r}
+# --- Generate seurat ----- #
+seu <- Seurat::as.Seurat(se_AGM_YS_prog)
+
+#seu <- seuset
+# Clean up the column annotaion
+dd <- seu[[]] 
+dd2 <- dd %>%
+  dplyr::select(Barcode, condition, YS_clus) 
+
+seu@meta.data <- dd2
+# Remove the graph # https://github.com/theislab/scanpy/issues/598
+seu@graphs <- list()
+
+kk1 <- GetAssayData(object = seu, slot = "counts")
+
+kk_name <- gsub("nova_", "", colnames(kk1))
+kk_name <- gsub("next_", "", kk_name)
+
+colnames(kk1) <- kk_name
+
+kk2 <- seu[[]]
+rownames(kk2) <- kk_name
+
+seu <- 
+  Seurat::CreateSeuratObject(counts = kk1, 
+                     project = "InHouse", 
+                     meta.data = kk2,
+                     min.cells = 3, min.features = 200)
+seu <- NormalizeData(
+  object = seu, 
+  normalization.method = "LogNormalize", 
+  scale.factor = 10000
+)
+seu@graphs <- list()
+
+seu <- 
+  FindVariableFeatures(object = seu, selection.method = "vst", nfeatures = 2500)
+# Scaling the data
+all.genes <- rownames(x = seu)
+seu <- ScaleData(object = seu, features = all.genes)
+
+
+saveRDS(seu, file.path(outData_dir, "seu_inHouse_YS_AGM_forLoom_allGenes_with_LMP_EMP_MES.RDS"))
+```
+
+### Excluding genes
+
+We can exclude some genes for PAGA preparation. Genes to exclude are as follows ;
+
+1) Lowly expressed genes. Retain those more than 5% expressed
+2) Remove added locus (RFP, GFP, dTomato)
+3) Remove mitrochondial genes
+4) Remove non-chromosome genes (keep chr 1-20, x and y)
+5) Remove cell cycle genes
+
+
+We create a csv file of genes to be discarded. This can be loaded in scanoy 
+
+```{r}
+# Step 1 
+# Calculate the dropout rate in the overall single cell object
+drp_all <- scater::perFeatureQCMetrics(se) %>%
+  as.data.frame() %>%
+  tibble::rownames_to_column(var = "UniqGeneID") %>%
+  dplyr::rename(otherPop_detc = detected)
+
+keep1 <- drp_all %>%
+  dplyr::filter(otherPop_detc >= 5)
+
+# Step 2
+# Remove RFP, GFP, Tomato
+keep2 <- keep1 %>%
+  dplyr::filter(!UniqGeneID %in% c("GFP", "RFP", "dTomato"))
+
+# Step 3 & 4
+# Remove mito genes and non-chrom genes
+chrKeep <- c(paste0("chr", 1:19), "chrX", "chrY")
+rD <- rowData(se)
+gene_to_keep <- as.data.frame(rD) %>%
+  tibble::rownames_to_column(var = "gene") %>%
+  dplyr::filter(!chr_name == "chrM") %>%
+  dplyr::filter(chr_name %in% chrKeep)
+
+keep3 <- keep2 %>%
+  dplyr::filter(UniqGeneID %in% gene_to_keep$gene)
+
+# Step 5
+# The genes associated with cell cycel was previously identitifed
+#diff <- getVarianceExplained(se, "Phase")
+#discard <- diff > 5
+gene_to_discard <- as.data.frame(diff) %>%
+  tibble::rownames_to_column(var = "gene") %>%
+  dplyr::filter(Phase > 5)
+keep4 <- keep3 %>%
+  dplyr::filter(!UniqGeneID %in% gene_to_discard$gene)
+
+# Alternative way of finding cell cycle genes
+s.genes <- cc.genes.updated.2019$s.genes
+g2m.genes <- cc.genes.updated.2019$g2m.genes
+
+cc.genes_com <- c(s.genes, g2m.genes, kegg_cc$KEGG_CELL_CYCLE)
+cc.genes_com <- unique(as.character(mapply(simpleCap, cc.genes_com)) )
+
+keep4 <- keep3 %>%
+  dplyr::filter(!UniqGeneID %in% cc.genes_com)
+
+# Step 6 remove batch genes
+keep5 <- keep4 %>%
+  dplyr::filter(!UniqGeneID %in% dge_g1_sub$UniqGeneID)
+
+write.csv(keep4, file.path(outData_dir, "Gene_retained.csv"))
+
+```
+
+
+
+## Paga preparation 
+
+
+If we are starting from single cell experiment object we convert the single cell experiment to seurat
+
+
+```{r}
+#se_tmp <- se
+
+GFP_loc <- grep("GFP", row.names(se))
+se <- se[-GFP_loc,]
+
+RFP_loc <- grep("RFP", row.names(se))
+se <- se[-RFP_loc,]
+
+dTom_loc <- grep("dTomato", row.names(se))
+se <- se[-dTom_loc,]
+
+seu <- Seurat::as.Seurat(se)
+```
+
+
+We need to clean up the Seurat object a little bit. We can not have any NA vales in columns and need to remove the 'graph' object.
+
+
+```{r,eval=FALSE}
+#seu <- seuset
+# Clean up the column annotaion
+dd <- seu[[]]
+dd2 <- dd %>%
+  dplyr::select(Barcode, condition, GraphBased) %>%
+  dplyr::rename(cluster = GraphBased)
+  #dplyr::select(cluster) %>%
+  #mutate(tmpID = "test")
+
+seu@meta.data <- dd2
+# Remove the graph # https://github.com/theislab/scanpy/issues/598
+seu@graphs <- list()
+```
+
+
+In the case we have prior clustering information, we add it to the Seurat object
+
+```{r}
+# Extract the piror clustering
+df_dim <- df_dim_pogen %>%
+  dplyr::select(Barcode, in_silico_clusters)
+
+#seu <- seuset
+# Clean up the column annotaion
+dd <- seu[[]] %>%
+  dplyr::left_join(df_dim)
+dd2 <- dd %>%
+  #dplyr::select(Barcode, condition, in_silico_clusters) %>%
+  #dplyr::rename(cluster = in_silico_clusters)
+  dplyr::select(Barcode, condition) 
+
+seu@meta.data <- dd2
+# Remove the graph # https://github.com/theislab/scanpy/issues/598
+seu@graphs <- list()
+```
+
+
+
+Create a new seurat object. 
+
+
+```{r}
+kk1 <- GetAssayData(object = seu, slot = "counts")
+
+kk_name <- gsub("nova_", "", colnames(kk1))
+kk_name <- gsub("next_", "", kk_name)
+
+colnames(kk1) <- kk_name
+
+kk2 <- seu[[]]
+rownames(kk2) <- kk_name
+
+seu <- 
+  Seurat::CreateSeuratObject(counts = kk1, 
+                     project = "InHouse", 
+                     meta.data = kk2,
+                     min.cells = 3, min.features = 200)
+seu <- NormalizeData(
+  object = seu, 
+  normalization.method = "LogNormalize", 
+  scale.factor = 10000
+)
+seu@graphs <- list()
+
+seu <- 
+  FindVariableFeatures(object = seu, selection.method = "vst", nfeatures = 2500)
+# Scaling the data
+all.genes <- rownames(x = seu)
+seu <- ScaleData(object = seu, features = all.genes)
+```
+
+
+Save the object as RDS
+
+```{r}
+saveRDS(seu, file.path(outData_dir, "seu_inHouse_YS_AGM_forLoom_noLMP_noEMP_allACE_allGenes.RDS"))
+```
+
+
+2) Transfer the RDS file to the cluster. Read the R object in the R Studio version on the cluster
+
+```{r,eval=FALSE}
+# Transfer
+# scp seu_inHouse_noTechRep_forLoom.RDS zfadlullah@192.168.203.4
+
+# Using the R session 4.0.3
+# Seurat version 3.9.9.9010
+# Need to load hdf5 http://scicom.picr.man.ac.uk/issues/6046#change-12123
+
+dyn.load('/lmod/libs/hdf5/1.10.4/lib/libhdf5_hl.so.100')
+library(hdf5r)
+library(Seurat)
+library(hdf5r)
+library(loomR)
+library(dplyr)
+
+seu <- readRDS("seu_inHouse_forLoom.RDS")
+as.loom(seu, filename = "seu_inHouse.loom")
+```
+
+
+3) Transfer back to seu.loom file from the cluster to our local machine. Now we run the juypter notebook. 
+
+```{r}
+# scp zfadlullah@192.168.203.4:/home/zfadlullah/seu.loom ~/Desktop/PAGA_inHouse_merge
+```
+
+
+
+## Paga prepare v2
+
+### Prepare PAGA
+
+We prepare paga same way as above, with the lowly expressed genes removed and genes with strong batch effects removed
+
+First remove lowly expressed genes
+
+```{r}
+# Calculate the dropout rate in the overall single cell object
+drp_all <- scater::perFeatureQCMetrics(se) %>%
+  as.data.frame() %>%
+  tibble::rownames_to_column(var = "UniqGeneID") %>%
+  dplyr::rename(otherPop_detc = detected)
+
+
+keepGenes <- drp_all %>%
+  #dplyr::filter(otherPop_detc >= 1) %>%
+  dplyr::filter(!UniqGeneID %in% c(dge_g1_sub$UniqGeneID, dge_g2_sub$UniqGeneID)) %>%
+  dplyr::pull(UniqGeneID) 
+
+
+```
+
+Prepare and save seurat object
+
+```{r}
+se_new <- se
+
+# ---- Removing genes ------ #
+GFP_loc <- grep("GFP", row.names(se_new))
+se_new <- se_new[-GFP_loc,]
+RFP_loc <- grep("RFP", row.names(se_new))
+se_new <- se_new[-RFP_loc,]
+dTom_loc <- grep("dTomato", row.names(se_new))
+se_new <- se_new[-dTom_loc,]
+
+keepGenes <- keepGenes[keepGenes %in% row.names(se_new)]
+
+se_new <- se_new[keepGenes,]
+
+
+# --- Generate seurat ----- #
+seu <- Seurat::as.Seurat(se_new)
+
+#seu <- seuset
+# Clean up the column annotaion
+dd <- seu[[]] 
+dd2 <- dd %>%
+  dplyr::select(Barcode, condition) 
+
+seu@meta.data <- dd2
+# Remove the graph # https://github.com/theislab/scanpy/issues/598
+seu@graphs <- list()
+
+kk1 <- GetAssayData(object = seu, slot = "counts")
+
+kk_name <- gsub("nova_", "", colnames(kk1))
+kk_name <- gsub("next_", "", kk_name)
+
+colnames(kk1) <- kk_name
+
+kk2 <- seu[[]]
+rownames(kk2) <- kk_name
+
+seu <- 
+  Seurat::CreateSeuratObject(counts = kk1, 
+                     project = "InHouse", 
+                     meta.data = kk2,
+                     min.cells = 3, min.features = 200)
+seu <- NormalizeData(
+  object = seu, 
+  normalization.method = "LogNormalize", 
+  scale.factor = 10000
+)
+seu@graphs <- list()
+
+seu <- 
+  FindVariableFeatures(object = seu, selection.method = "vst", nfeatures = 2500)
+# Scaling the data
+all.genes <- rownames(x = seu)
+seu <- ScaleData(object = seu, features = all.genes)
+
+
+saveRDS(seu, file.path(outData_dir, "seu_inHouse_YS_AGM_forLoom_noLMP_noEMP_allACE_subGenes.RDS"))
+```
+
+
+
+
+
+
+## Others
+
+We can also do a few other things
+
+### Using DE genes
+
+For UMAP and hiearchical clustering
+
+
+```{r,eval=FALSE}
+# Find unique genes
+colLabels(se) <- se$condition
+
+# We can change the pval.type="all" to be more stringent
+markers.se <- findMarkers(se, pval.type="some", direction="up")
+
+# For each cluster 
+#intClus <- c(paste0("l_", sprintf("%02d", 1:14)))
+intClus <- unique(se$condition)
+
+
+# Write function
+topGene <- function(markers.se, chosen_clus){
+  interesting <- markers.se[[chosen_clus]]
+  best.set <- as.data.frame(interesting) %>%
+    tibble::rownames_to_column(var = "Gene") %>%
+    dplyr::filter(summary.logFC >= 1) %>%
+    dplyr::filter(p.value <=0.05) %>%
+    dplyr::mutate(group = chosen_clus) %>%
+    dplyr::select(Gene, summary.logFC, p.value, FDR, group)
+  
+  return(best.set)
+}
+
+# Repeat for each clusters
+df_list <- list()
+
+for (i in seq_along(intClus)){
+  df <- topGene(markers.se, intClus[i])
+  df_list[[i]] <- df
+}
+
+# Make into one big df
+df_de <- do.call(rbind, df_list)
+
+# Filter
+df_de_sub <- df_de %>%
+  dplyr::filter(FDR < 0.05) %>%
+  dplyr::filter(summary.logFC >= 2)
+
+#dplyr::filter(df_de_sub, Gene == "Runx1")
+
+UniqGenes <- unique(df_de_sub$Gene)
+length(UniqGenes)
+chosen <- UniqGenes
+
+```
+
+Find the UMAP
+
+```{r,eval=FALSE}
+# ------------------ UMAP ---------------- #
+# Using the Top DEG
+# Calculate PCA
+exp.sub <- assay(se2, "logcounts")[chosen,]
+exp.sub <- t(exp.sub)
+pca <- prcomp(exp.sub,scale=TRUE)
+numPCA <- 1:30
+df_PCA <- as.data.frame(pca$x)[,numPCA]
+
+
+# UMAP parameter
+n_neig <- c(16, 32, 64, 128)
+min_di <- c(0.01, 0.05, 0.1, 0.5, 0.8, 1)
+ran_state <- as.integer(999)
+n_dim <- 2
+
+colp <- df.col_FACS$Pal
+cond_ID <- se2$condition
+
+# Run the UMAP 
+min_di %>% 
+  map_df(~umap(as.matrix(df_PCA), min_dist = .x,
+               n_components = n_dim,
+               random_state = ran_state)$layout %>% 
+           as.data.frame() %>%
+           dplyr::rename(UMAP1 = V1, UMAP2=V2) %>%
+           dplyr::mutate(condition = cond_ID, Distance = .x)) %>% 
+  ggplot(aes(UMAP1, UMAP2, color = condition)) + 
+  geom_point(size=1) +
+  theme_bw() +
+  scale_colour_manual(values=colp) +
+  facet_wrap(~Distance, scales = "free")
+
+# 0.5 looks good
+
+# Run the UMAP
+n_neig %>% 
+  map_df(~umap(as.matrix(df_PCA), n_neighbors = .x,
+               #min_dist = 0.1,
+               n_components = n_dim,
+               random_state = ran_state)$layout %>% 
+           as.data.frame() %>%
+           dplyr::rename(UMAP1 = V1, UMAP2=V2) %>%
+           dplyr::mutate(condition = cond_ID, Neighbor = .x)) %>% 
+  ggplot(aes(UMAP1, UMAP2, color = condition)) + 
+  geom_point(size=1) +
+  theme_bw() +
+  scale_colour_manual(values=colp) +
+  facet_wrap(~Neighbor, scales = "free")
+
+
+
+# Parameters
+n_neig <- 64
+min_di <- 0.5
+n_dim <- 2
+
+set.seed(123)
+umap.mat <- uwot::umap(df_PCA,ret_model = TRUE,
+                       n_neighbors=n_neig,
+                       min_dist=min_di,
+                       n_components = n_dim)
+umap.df <- as.data.frame(umap.mat$embedding)
+#colnames(umap.df) <- c("V1", "V2", "V3")
+colnames(umap.df) <- c("V1", "V2")
+
+umap.df <- umap.df %>%
+  dplyr::mutate(condition = se2$condition,
+                cluster = se2$TmpClust)
+
+ggplot(umap.df, aes(x=V1, y=V2,colour=condition)) +
+  geom_point() +
+  gghighlight() +
+  facet_wrap(~condition) +
+  theme_bw() +
+  scale_colour_manual(values=colp)
+
+
+ggplot(umap.df, aes(x=V1, y=V2,colour=cluster)) +
+  geom_point() +
+  gghighlight() +
+  facet_wrap(~cluster) +
+  theme_bw() 
+```
+
+
+3D plot
+
+```{r,eval=FALSE}
+
+# 3D plot
+x1 <- umap.df$V1
+x2 <- umap.df$V2
+x3 <- umap.df$V3
+
+df_pal <- df.col_FACS %>%
+  dplyr::filter(FACS %in% umap.df$condition)
+pal <- df_pal$Pal
+
+kk <- umap.df$condition
+kk.1 <- unique(umap.df$condition)
+kk <- factor(as.character(kk), 
+                levels=c(
+                  "AGM_E10.5_Endo", "AGM_E10.5_HE_Runx1", "AGM_E10.5_HE_Gfi1", "AGM_E10.5_EHT", "AGM_E10.5_IAHC",
+                
+                "YS_E9.0_Endo", "YS_E9.5_Endo", "YS_E10.5_Endo", 
+                "YS_E9.0_HE_Gfi1_Kneg", "YS_E9.5_HE_Gfi1_Kneg", "YS_E10_HE_Gfi1_Kneg",
+                
+                "YS_E9.0_HE_Runx1", "YS_E9.5_HE_Runx1", "YS_E10.5_HE_Runx1", 
+                "YS_E9.0_HE_Gfi1", "YS_E9.5_HE_Gfi1", "YS_E10.5_HE_Gfi1",
+                
+                "YS_E9.5_EMP","YS_E10.5_EMP",
+                "YS_E9.5_LMP", "YS_E10.5_LMP"))
+kk[is.na(pal[kk])] %>% unique()
+
+pal <- pal[kk]
+
+plot3d(x1, x2, x3, col = pal)
+
+
+# Or use plotly
+plot_ly(umap.df, x= ~V1, y= ~V2, z= ~V3, color =  ~Cluster)
+
+```
+
+
+Hierarchcial clustering
+
+```{r,eval=FALSE}
+
+# ------------------ HC ---------------- #
+chosen.exprs <- assay(se2, "logcounts")[chosen,]
+my.dist = dist(as.matrix(t(chosen.exprs)), method = "euclidean")
+my.tree <- hclust(my.dist, method="ward.D2")
+my.dend <- as.dendrogram(my.tree, hang=0.1)
+my.clusters <- unname(cutreeDynamic(my.tree, distM=as.matrix(my.dist), verbose=0, minClusterSize=10, deepSplit=2))
+#my.clusters <- paste0("k_", my.clusters)
+length(unique(my.clusters))
+se2$TmpClust <- paste0("k_", sprintf("%02d",my.clusters))
+
+
+plotUMAP(se2, colour="TmpClust")
+table(se2$condition, se2$TmpClust)
+
+# Making a prettier dendrogram.
+my.tree$labels <- seq_along(my.tree$labels)
+#dend <- as.dendrogram(my.tree, hang=0.1)
+numClus <- length(unique(my.clusters))
+coltree <- gg_color_hue(n=numClus)
+
+my.tree_or <- my.clusters[order.dendrogram(my.dend)]
+
+# Setting up colours for the FACS population
+cFACS <- coltree[as.factor(se$TreeCut)]
+cFACS <- coltree[as.factor(se$TreeCut)[order.dendrogram(my.dend)]]
+
+no0_unique <- 
+  function(x) {
+    u_x <- unique(x)
+    u_x[u_x != 0]
+  }
+
+clusters_numbers <- no0_unique(my.tree_or)
+n_clusters <- length(clusters_numbers)
+cols <- gg_color_hue(n=n_clusters)
+dend2 <- branches_attr_by_clusters(my.dend, my.tree_or, values = cols) %>%
+  set("labels_col", "black")
+plot(dend2)
+colored_bars(cFACS, dend2, sort_by_labels_order = FALSE, y_shift=10)
+
+UniqClus <- unique(my.tree_or)
+
+pdf(file.path(outDir_noLMP, "Dend.pdf"),height = 4, width = 12)
+plot(dend2)
+colored_bars(cFACS, dend2, sort_by_labels_order = FALSE, y_shift=10)
+
+plot(UniqClus, ylim = c(-1, length(UniqClus)))
+text(x =1:length(UniqClus), y=-1, UniqClus)
+
+dev.off()
+
+se$TreeCut <- paste0("k_", sprintf("%02d",my.clusters))
+```
+
+
+
+
+
+## Session Info
+
+```{r}
+sessionInfo()
+```
+
+
+
+

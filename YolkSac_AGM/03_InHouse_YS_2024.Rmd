@@ -1,0 +1,4418 @@
+---
+title: "In house data of YS"
+subtitle: "Only YS data"
+author: "Zaki"
+date: "01/09/2021"
+output:
+  html_document:
+    self_contained: yes
+    toc: true
+    toc_float: true
+    df_print: paged
+    number_sections: false
+editor_options: 
+  chunk_output_type: console
+---
+
+
+# In house data
+
+
+## Objective
+
+  * Clean up our in house data. The NextSeq run and NovaSeq run contains technical replicates. We would like to remove the tech rep.
+  * Prepare data for PAGA analysis
+
+
+## Conclusion
+
+
+## Set-up
+
+Load required library
+
+```{r, warning=FALSE, message=FALSE}
+library(scater)
+library(Seurat)
+library(patchwork)
+library(ggplot2)
+library(dplyr)
+library(reshape2)
+library(ggbeeswarm)
+library(gghighlight)
+library(ggrepel)
+library(viridis)
+library(ggforce)
+
+library(paletteer)
+library(pheatmap)
+# Scater
+library(scater)
+library(scran)
+library(dendextend)
+library(dynamicTreeCut)
+```
+
+Specify the work space
+
+```{r}
+workDir <- getwd()
+workDir <- gsub("/scripts", "", workDir)
+dataDir <- file.path(workDir, "data")
+outDir <- file.path(workDir, "output")
+
+# out data
+outData_dir <- file.path(outDir, "out_data")
+
+outDir_cur <- file.path(outDir, "Chapter_03_InHouse_YS")
+dir.create(outDir_cur)
+set.seed(123)
+
+source(file.path(workDir, "functions.R"))
+```
+
+
+Load the integrated object
+
+```{r}
+load(file=file.path(outData_dir, "ForIntegration_InHouse_Public.Rdata"))
+```
+
+We have read the original single cell exp object 
+
+```{r}
+se_next <- readRDS(file.path(outData_dir, "Se_Next_allGenes_ENSID.RDS"))
+se_nova <- readRDS(file.path(outData_dir, "Se_Nova_allGenes_ENSID.RDS"))
+```
+
+Load cell QC 
+
+```{r}
+df_cData_nova <- readRDS(file.path(outData_dir, "cellQC_NovaSeq.RDS"))
+```
+
+
+
+Load INDEX sort data
+
+```{r}
+# We know all cell sorted in this plate is Runx1 / Gfi1 reporter
+df_inx_WN_S6 <- read.csv(file.path(dataDir, "INDEX_data/Metadata_WNs6_AGM060.csv")) %>%
+  dplyr::rename(FACS_well = OriWell) %>%
+  mutate(Plate = gsub("Plate", "", Plate),
+         SC_project = 'WN-S6',
+         UniqID = paste(SC_project, Plate, FACS_well, sep="_")) %>%
+dplyr::select(UniqID, Population2, Runx1b_RFP, Gfi1_GFP) %>%
+  mutate(Allele = "RG")
+
+# plate WN S7
+df_inx_WN_S7 <- read.csv(file.path(dataDir, "INDEX_data/Metadata_WNs7_WNs8_AGM068.csv")) %>%
+  dplyr::rename(FACS_well = OriWell) %>%
+  mutate(tmp = Plate,
+         SC_project = gsub("_p[1-5]", "", tmp),
+         SC_project = gsub("_", "-", SC_project),
+         Plate = gsub(".*_p", "", tmp),
+         UniqID = paste(SC_project, Plate, FACS_well, sep="_")) %>%
+  dplyr::select(UniqID, Population2, Runx1b_RFP, Gfi1_GFP,FACS_well)
+
+# We know which well is only the Gfi1 reporter (based on plate layout excel file)
+Gfi_mouse_well <- c(
+  paste0(rep("G", each = ),sprintf("%02d",5:12)),
+  paste0(rep(LETTERS[8:15], each = 23),sprintf("%02d",1:12)),
+  paste0(rep("P", each=3),sprintf("%02d",10:13)))
+
+df_inx_WN_S7 <- df_inx_WN_S7 %>%
+  mutate(Allele = if_else(FACS_well %in% Gfi_mouse_well, "G", "RG")) %>%
+  dplyr::select(-FACS_well)
+
+df_indx <- rbind(df_inx_WN_S6, df_inx_WN_S7)
+
+# Lets also read INDEX data for EMP and LMP
+df_inx_WN_S10 <- read.csv(file.path(dataDir, "INDEX_data/Metadata_WNs10_AGM083.csv")) %>%
+  dplyr::rename(FACS_well = OriWell) %>%
+  mutate(Plate = "1",
+         SC_project = 'WN-S10',
+         UniqID = paste(SC_project, Plate, FACS_well, sep="_")) %>%
+dplyr::select(UniqID, Population, CD127_eF450:LIN, CD127_PE:CD41_PECy7) %>%
+  mutate(Allele = "WT")
+
+```
+
+Load list of CC genes
+
+```{r}
+s.genes <- cc.genes.updated.2019$s.genes
+g2m.genes <- cc.genes.updated.2019$g2m.genes
+```
+
+Read list of cell surface genes
+
+```{r}
+df_cs <- read.delim(file.path(dataDir, "Others/RM_cur_CS_mouse.txt"), stringsAsFactors = FALSE)
+```
+
+
+Read list of transcription factors
+
+```{r}
+tf_dat <- read.csv(file.path(dataDir, "Others/TF_listRiken.csv"))
+tf_dat2 <- read.delim(file.path(dataDir, "Others/TF_list.txt"))
+
+tf_dat$Symbol <- toupper(tf_dat$Symbol)
+tf_dat2$Symbol <- toupper(tf_dat2$Symbol)
+tf_all <- unique(c(tf_dat$Symbol, tf_dat2$Symbol))
+# Lower case
+tf_all2 <- tolower(tf_all)
+tf_all2 <- as.character(mapply(simpleCap, tf_all2))
+```
+
+
+
+## Using scater
+
+```{r}
+outDir_inHouse6_scater <- file.path(outDir_cur, "Scater_analysis_YS_only")
+dir.create(outDir_inHouse6_scater)
+```
+
+
+
+We use the Scater object where Gfi1/1b KO and TechRep were removed and re-run the analysis in scater
+Simply merge the two objects
+
+
+We loaded the single cell object in the Set-up section. Simply merge the two objects
+
+
+```{r}
+dat1 <- assay(se_next, "counts")
+dat2 <- assay(se_nova, "counts")
+dat <- cbind(dat1,dat2)
+
+c.anno1 <- colData(se_next)
+c.anno2 <- colData(se_nova)
+c.anno <- rbind(c.anno1, c.anno2)
+
+g.anno <- rowData(se_next)
+colnames(g.anno)[5] <- "chr_name"
+
+se <- 
+  SingleCellExperiment(
+  assays = list(counts = dat),
+  colData = c.anno,
+  rowData = g.anno)
+
+se$condition <- factor(se$condition, levels=com_popFac)
+
+seFull <- se
+```
+
+Retain only the YS cells and remove Gfi1/1b KOs
+
+```{r}
+AnoSite <- se$condition
+AnoSite <- gsub("_.*", "", AnoSite)
+table(AnoSite)
+
+se$Site <- AnoSite
+se <- se[, se$Site == "YS"]
+
+# Remove Gfi1/1b KO
+se <- se[,!se$condition == "YS_E9.5_HE_Gfi1s_KO"]
+
+# Number of YS cells includding the kit negative
+print(ncol(se))
+
+# Remove the KIT negative sorted cells
+se <- se[,!se$condition %in% c("YS_E9.0_HE_Gfi1_Kneg", "YS_E9.5_HE_Gfi1_Kneg", "YS_E10_HE_Gfi1_Kneg")]
+
+```
+
+Remove tech duplciate
+
+
+Now remove technical replicate, we select the ones with the most genes to keep. 
+
+
+```{r}
+cD <- as.data.frame(colData(se))
+
+  
+cD <- cD %>%
+  # Create the Uniq ID
+  mutate(
+    Plate_Well = paste(SC_project, SC_plate, FACS_well, sep="_"))
+
+# Identify tech replicates
+df_com_twice <- as_tibble(cD) %>%
+  dplyr::count(Plate_Well) %>% dplyr::filter(n > 1)
+
+qc_cell <- perCellQCMetrics(se)
+cD <- cbind(cD, qc_cell)
+
+cD_noTech <- cD %>%
+  arrange(desc(detected)) %>%
+  distinct(Plate_Well,.keep_all = TRUE)
+
+# Subset
+se <- se[,se$Barcode %in% cD_noTech$Barcode]
+```
+
+
+
+
+
+#### Filtering lowly-expressed genes
+
+Remove all ENS with 0 counts
+
+```{r}
+row_sub <- rowSums(dat)
+row_sub <- names(row_sub)[row_sub > 0]
+```
+
+Convert to gene names
+
+```{r}
+se <- se[row_sub, ]
+
+new.row.names <- uniquifyFeatureNames(
+    rowData(se)$ID,
+    rowData(se)$Symbol
+)
+
+rownames(se) <- new.row.names
+head(rownames(se), 5)
+
+```
+
+#### Normalisation
+
+```{r}
+set.seed(123)
+clust.se <- quickCluster(se) 
+se <- computeSumFactors(se, cluster=clust.se, min.mean=0.1)
+se <- logNormCounts(se)
+#assay(se,"logcounts")["Runx1",]
+```
+
+
+#### Feature selection
+
+```{r}
+set.seed(123)
+dec.se <- modelGeneVar(se)
+
+# Visualizing the fit:
+fit.se <- metadata(dec.se)
+plot(fit.se$mean, fit.se$var, xlab="Mean of log-expression",
+    ylab="Variance of log-expression")
+curve(fit.se$trend(x), col="dodgerblue", add=TRUE, lwd=2)
+```
+
+#### Cell cycle assginment
+
+```{r}
+mm.pairs <- readRDS(system.file("exdata", "mouse_cycle_markers.rds", 
+    package="scran"))
+
+
+# Using Ensembl IDs to match up with the annotation in 'mm.pairs'.
+assignments <- cyclone(se, mm.pairs, gene.names=rowData(se)$ID)
+se$Phase <- assignments$phases
+
+saveRDS(se, file.path(outDir_cur, "seNorm_YS.RDS"))
+```
+
+
+
+
+#### Dim reduction
+
+Select the most variable genes
+
+```{r}
+set.seed(123)
+top.prop <- getTopHVGs(dec.se, prop=0.1)
+top.se <- getTopHVGs(dec.se, n=2000)
+length(top.prop)
+length(top.se)
+
+chosen <- top.se
+```
+
+Run dim reduction
+
+```{r}
+se <- runPCA(se, subset_row=chosen) 
+
+percent.var <- attr(reducedDim(se), "percentVar")
+plot(percent.var, log="y", xlab="PC", ylab="Variance explained (%)")
+```
+
+
+UMAP
+
+```{r}
+set.seed(123)
+se <- runUMAP(se, dimred="PCA", subset_row=chosen,
+              pca=30,
+              n_neighbors=30,
+              min_dist=0.4)
+plotUMAP(se, colour_by="condition")
+```
+
+
+#### Clustering
+
+Graph based clustering
+
+```{r}
+# Graph based
+g <- buildSNNGraph(se, k=10, use.dimred = 'PCA')
+clust <- igraph::cluster_walktrap(g)$membership
+se$GraphBased_all <- paste0("g_", sprintf("%02d",clust))
+```
+
+
+
+
+### Visualise
+
+Visualise UMAP better
+
+```{r}
+umap.df.int <- reducedDim(se, "UMAP") %>%
+  cbind(colData(se)) %>%
+  as.data.frame() %>%
+  dplyr::rename(UMAP_1 = V1,
+                UMAP_2 = V2)
+```
+
+Plot 
+
+```{r}
+p1 <- 
+  ggplot(umap.df.int, aes(x=UMAP_1, y=UMAP_2, colour=SeqRun)) +
+  geom_point() +
+  gghighlight(use_direct_label = FALSE) +
+  theme(legend.position = "right") +
+  facet_wrap(~SeqRun) +
+  theme_custom +
+  #scale_colour_manual(values=tableau20) + 
+  labs(title="Highlighting the Sequencing batch")
+
+p2 <-        
+  ggplot(umap.df.int, aes(x=UMAP_1, y=UMAP_2, colour=condition)) +
+  geom_point() +
+  gghighlight(use_direct_label = FALSE) +
+  theme(legend.position = "right") +
+  facet_wrap(~condition) +
+  theme_custom +
+  #scale_colour_manual(values=g_hue) + 
+  #scale_colour_manual(values=tableau20) + 
+  labs(title="Highlighting the FACS population")
+
+p3 <-        
+  ggplot(umap.df.int, aes(x=UMAP_1, y=UMAP_2, colour=GraphBased_all)) +
+  geom_point() +
+  gghighlight(use_direct_label = FALSE) +
+  theme(legend.position = "right") +
+  facet_wrap(~GraphBased_all) +
+  theme_custom +
+  #scale_colour_manual(values=g_hue) + 
+  #scale_colour_manual(values=tableau20) + 
+  labs(title="Highlighting the in-silico clusters")
+
+p4 <-        
+  ggplot(umap.df.int, aes(x=UMAP_1, y=UMAP_2, colour=Phase)) +
+  geom_point() +
+  gghighlight(use_direct_label = FALSE) +
+  theme(legend.position = "right") +
+  facet_wrap(~Phase) +
+  theme_custom +
+  #scale_colour_manual(values=g_hue) + 
+  #scale_colour_manual(values=tableau20) + 
+  labs(title="Highlighting the cell cycle")
+
+
+png(file.path(outDir_inHouse6_scater, "facet_SeqBatch.png"), height=350, width = 850)
+p1
+dev.off()
+
+png(file.path(outDir_inHouse6_scater, "facet_FACS.png"), height=950, width = 1200)
+p2
+dev.off()
+
+png(file.path(outDir_inHouse6_scater, "facet_cluster.png"), height=950, width = 1200)
+p3
+dev.off()
+
+png(file.path(outDir_inHouse6_scater, "facet_CC.png"), height=350, width = 850)
+p4
+dev.off()
+```
+
+
+
+We can check the expression of the following genes 
+
+```{r}
+plotUMAP(se, colour_by=c("Folr1"))
+plotUMAP(se, colour_by=c("Dlk1"))
+plotUMAP(se, colour_by=c("Ptn"))
+plotUMAP(se, colour_by=c("Hbb-y"))
+```
+
+Save the single cell object
+
+```{r}
+seOri <- se
+saveRDS(seOri, file.path(outDir_inHouse6_scater, "SeNotFiltered.RDS"))
+#seOri <- readRDS(file.path(outDir_inHouse6_scater, "SeNotFiltered.RDS"))
+```
+
+
+
+## Remove outlier
+
+
+```{r}
+outDir_inHouse6_scater_outlier <- file.path(outDir_inHouse6_scater, "Outlier_removed")
+dir.create(outDir_inHouse6_scater_outlier)
+```
+
+
+Things we remove ;
+
+1) There is a small cluster expressing Folr1
+2) Remove the Hbb expressing cluster
+3) Remove the mesenchymal cluster (expressing Ptn)
+4) Remove cells with high Ribo and low genes 
+
+
+Folr1 - https://pubmed.ncbi.nlm.nih.gov/19180647/
+
+
+By selecting regions on the UMAP we can remove the cells above
+
+```{r}
+# Remove the Hbb clusters
+toRemove_1 <- umap.df.int %>%
+  dplyr::filter(GraphBased_all == "g_12") %>%
+  pull(Barcode)
+```
+
+
+Recluster
+
+```{r}
+se <- se[,!se$GraphBased_all == "g_12"]
+g <- buildSNNGraph(se, k=5, use.dimred = 'PCA')
+clust <- igraph::cluster_walktrap(g)$membership
+length(unique(clust))
+se$GraphBased_all <- paste0("g_", sprintf("%02d",clust))
+```
+
+Re-plot
+
+```{r}
+umap.df.int2 <- reducedDim(se, "UMAP") %>%
+  cbind(colData(se)) %>%
+  as.data.frame() %>%
+  dplyr::rename(UMAP_1 = V1,
+                UMAP_2 = V2)
+p5 <- 
+ggplot(
+  umap.df.int2,
+  aes(x=UMAP_1, y=UMAP_2, colour=GraphBased_all)) +
+  geom_point() +
+  gghighlight(use_direct_label = FALSE) +
+  theme(legend.position = "right") +
+  facet_wrap(~GraphBased_all) +
+  theme_custom +
+  #scale_colour_manual(values=g_hue) + 
+  #scale_colour_manual(values=tableau20) + 
+  labs(title="Highlighting the in-silico clusters")
+
+
+png(file.path(outDir_inHouse6_scater, "facet_cluster_noHbb.png"), height=950, width = 1200)
+p5
+dev.off()
+```
+
+Remove additional cells
+
+````{r}
+plotUMAP(se, colour_by=c("Folr1"))
+plotUMAP(se, colour_by=c("Dlk1"))
+plotUMAP(se, colour_by=c("Ptn"))
+
+# Remove MES (ptn expressing cells)
+toRemove_2 <- umap.df.int2 %>%
+  dplyr::filter(GraphBased_all == "g_13") %>%
+  pull(Barcode)
+
+# Remove Folr1 expressing cells
+toRemove_3 <- umap.df.int2 %>%
+  dplyr::filter(GraphBased_all == "g_11") %>%
+  pull(Barcode)
+```
+
+Find cells in the cluster with high Ribo and low numebr of genes detected
+
+```{r}
+#se <- seOri
+rD <- as.data.frame(rowData(se))
+
+# Specific the location
+MT_gene <- rD$chr_name == "chrM"
+Hbbs <- rD[grepl("Hb[a-b]", rD$Symbol),] %>% pull(Symbol)
+Hbbs <- c(Hbbs, "Gypa")
+Ribos_1 <- rD[grepl("Rps", rD$Symbol),] %>% pull(Symbol)
+Ribos_2 <- rD[grepl("Rpl", rD$Symbol),] %>% pull(Symbol)
+Ribos <- c(Ribos_1, Ribos_2)
+
+# Get the Ens ID
+Hb_ens <- rD %>%
+  dplyr::filter(Symbol %in% Hbbs)
+Hbb_gene <- rowData(se)$ID %in% Hb_ens$ID
+
+Ribo_ens <- rD %>%
+  dplyr::filter(Symbol %in% Ribos)
+Ribo_gene <- rowData(se)$ID %in% Ribo_ens$ID
+
+#We examine the distibution of the data in all the run
+
+
+df_cData <- 
+  perCellQCMetrics(se,
+                   subsets=list(Mito=MT_gene,
+                                Hbb=Hbb_gene,
+                                Ribo=Ribo_gene)) %>%
+  cbind(as.data.frame(colData(se))) %>%
+  as.data.frame() %>%
+  dplyr::mutate(Cell = colnames(se))
+
+
+se$detected <- df_cData$detected
+se$RiboPerc <- df_cData$subsets_Ribo_percent
+se$MitoPerc <- df_cData$subsets_Mito_percent
+
+plotColData(se, x="GraphBased_all", y="MitoPerc")
+plotColData(se, x="GraphBased_all", y="RiboPerc")
+plotColData(se, x="GraphBased_all", y="detected")
+
+# Remove the cluster with highest Ribo which also has lowest number of detected genes
+toRemove_4 <- umap.df.int2 %>%
+  filter(GraphBased_all == "g_12") %>%
+  pull(Barcode)
+
+```
+
+Theres another cluster (g_10) that has low genes and high Riba as well. 
+
+
+```{r, eval=FALSE}
+# ----- Scran -------- #
+# Quick check what is expressed in g_10
+colLabels(se) <- se$GraphBased_all
+
+# We can change the pval.type="all" to be more stringent
+markers.se <- findMarkers(se, pval.type="some", direction="up")
+
+chosen_clus <- "g_10"
+interesting <- markers.se[[chosen_clus]]
+#best.set <- interesting[interesting$Top <= 10,]
+
+plotUMAP(se, colour_by=c("Nutf2-ps1"))
+
+
+# ------ Seurat -------- #
+seuset <- Seurat::as.Seurat(se)
+seuset <- NormalizeData(seuset)
+
+Idents(seuset) <- seuset$GraphBased_all
+
+su.markers <- 
+  Seurat::FindMarkers(seuset, only.pos = FALSE, 
+                       ident.1 = c("g_10"),
+                       #ident.2 = c("C05"),
+                       min.pct = 0.25, logfc.threshold = 0.25)
+
+top_x <- su.markers %>% 
+  tibble::rownames_to_column(var = "gene") %>%
+  dplyr::filter(p_val_adj < 0.05) %>%
+  top_n(n = 10, wt = avg_log2FC)
+
+FeaturePlot(seuset, top_x$gene)
+FeaturePlot(seuset, row.names(interesting)[1:10])
+
+```
+
+
+We remove this cluster as well 
+
+```{r}
+toRemove_5 <- umap.df.int2 %>%
+  filter(GraphBased_all == "g_10") %>%
+  pull(Barcode)
+
+```
+
+
+
+Remove the selected cells
+
+```{r}
+toRemove <- unique(c(toRemove_1, toRemove_2, toRemove_3, toRemove_4, toRemove_5))
+```
+
+
+
+Plot the selected cells
+
+```{r}
+umap.df.int3 <- umap.df.int %>%
+  dplyr::mutate(isSel = if_else(Barcode %in% toRemove, "Discard", "Retain"))
+
+p1 <-        
+  ggplot(umap.df.int3, aes(x=UMAP_1, y=UMAP_2, colour=isSel)) +
+  geom_point() +
+  #gghighlight(use_direct_label = FALSE) +
+  theme(legend.position = "right") +
+  #facet_wrap(~cluster) +
+  theme_custom 
+
+
+png(file.path(outDir_inHouse6_scater, "SelectedCells.png"), height=300, width = 450)
+p1
+dev.off()
+```
+
+
+Subset to the selected cells
+
+```{r}
+SelctedCells <- umap.df.int3 %>%
+  dplyr::filter(isSel == "Retain")
+se <- se[,se$Barcode %in% SelctedCells$Barcode]
+
+seGeneName_nonKit_neg <- se
+```
+
+## Creating YS only data
+
+As we are interested in the Kit negative population, for a start lets add this population back
+
+```{r}
+# Select the KIT cnegative cells to retain
+seKit_neg <- seFull[, seFull$condition %in% c("YS_E9.0_HE_Gfi1_Kneg", "YS_E9.5_HE_Gfi1_Kneg", "YS_E10_HE_Gfi1_Kneg")]
+
+
+# Select the filtered cells
+se_nonKit_neg <- seFull[, seFull$Barcode %in% SelctedCells$Barcode]
+
+
+# Generate a new scRNA-seq object
+dat1 <- assay(seKit_neg, "counts")
+dat2 <- assay(se_nonKit_neg, "counts")
+dat <- cbind(dat1,dat2)
+
+c.anno1 <- colData(seKit_neg)
+c.anno2 <- colData(se_nonKit_neg)
+c.anno <- rbind(c.anno1, c.anno2)
+
+g.anno <- rowData(seKit_neg)
+colnames(g.anno)[5] <- "chr_name"
+
+seNew <- 
+  SingleCellExperiment(
+  assays = list(counts = dat),
+  colData = c.anno,
+  rowData = g.anno)
+
+seNew$condition <- factor(seNew$condition, levels=com_popFac)
+
+
+# Repeat gene conversion name and removal of non-expressing genes
+row_sub <- rowSums(dat)
+row_sub <- names(row_sub)[row_sub > 0]
+
+
+seNew <- seNew[row_sub, ]
+
+new.row.names <- uniquifyFeatureNames(
+    rowData(seNew)$ID,
+    rowData(seNew)$Symbol
+)
+
+rownames(seNew) <- new.row.names
+```
+
+
+### Normalizations
+
+
+Subset to the selected cells, and re-do the normalizaions HVG selection, dim reduction etc
+
+```{r}
+se <- seNew # ------- IMPORTANT TO DO THIS
+
+set.seed(123)
+clust.se <- quickCluster(se) 
+se <- computeSumFactors(se, cluster=clust.se, min.mean=0.1)
+se <- logNormCounts(se)
+
+set.seed(123)
+dec.se <- modelGeneVar(se)
+top.se <- getTopHVGs(dec.se, n=2500)
+chosen <- top.se
+
+se <- runPCA(se, subset_row=chosen) 
+
+set.seed(123)
+se <- runUMAP(se, dimred="PCA", subset_row=chosen,
+              pca=30,
+              n_neighbors=30,
+              min_dist=0.3)
+plotUMAP(se, colour_by="condition")
+
+# Save UMAP coordinates
+umap.df.int <- reducedDim(se, "UMAP") %>%
+  cbind(colData(se)) %>%
+  as.data.frame() %>%
+  dplyr::rename(UMAP_1 = V1,
+                UMAP_2 = V2)
+```
+
+## Remove contaminating "LMP" 
+
+```{r}
+outDir_noLMP <- file.path(outDir_inHouse6_scater, "no_Platelet")
+dir.create(outDir_noLMP)
+```
+
+
+We noticed an the LMP population split into two. Based on expression of key genes this is the Platelet popualtion, in other words contamination.
+
+```{r}
+geneDir <- file.path(outDir_noLMP, "gene_exp")
+dir.create(geneDir)
+```
+
+
+```{r}
+gg <- "Pf4"
+expInt <- assay(se, "logcounts")[gg,]
+
+df_plot <- umap.df.int %>%
+  mutate(gene = expInt)
+
+ggplot(df_plot, aes(x=UMAP_1, y=UMAP_2, colour=gene)) +
+  geom_point() +
+  theme_custom +
+  theme(axis.text = element_blank(),
+        axis.ticks = element_blank(),
+        axis.title = element_blank(),
+        legend.position = "right") +
+  scale_colour_viridis(option = "plasma", na.value = "grey80", begin = 0, end = 1) +
+  labs(colour = gg) +
+  NULL
+
+ggsave(filename = file.path(geneDir, paste0(gg, "_UMAP.png")), device = "png", width = 6, height = 4, dpi = 300)
+```
+
+
+Lets remove the contaminating cluster. We can remove it by the in silico cluster or we use the INDEX FACS data. Lets use the INDEX data and merge it
+
+```{r}
+cD <- as.data.frame(colData(se))
+
+# Join with index FACS info
+dd <- cD %>%
+  mutate(UniqID = paste(SC_project, SC_plate, FACS_well, sep="_")) %>%
+  left_join(df_inx_WN_S10)
+
+
+
+umap.df.int <- umap.df.int %>%
+  dplyr::mutate(Barcode = se$Barcode)
+
+dd_sub <- dd %>%
+  dplyr::filter(condition %in% c("YS_E9.5_EMP", "YS_E10.5_EMP",
+                                 "YS_E9.5_LMP", "YS_E10.5_LMP")) %>%
+  #dplyr::filter(Allele == "RG") %>%
+  mutate(lCD127_eF450 = log10(CD127_eF450 + 200) ,
+         lCD127_PE = log10(CD127_PE + 200),
+         
+         lCD41_PE = log10(CD41_PE+ 200) ,
+         lCD41_PECy7 = log10(CD41_PECy7 + 200)) %>%
+  mutate(lCD41_PECy7_cutOff = if_else(lCD41_PECy7 >= 4.5, "high", "low")) %>%
+  dplyr::left_join(dplyr::select(umap.df.int, UMAP_1, UMAP_2, Barcode)) 
+```
+
+Plot CD41 in UMAP
+
+```{r}
+ggplot(dd_sub, aes(x=UMAP_1, y=UMAP_2, colour=lCD127_PE)) +
+  geom_point() +
+  theme_custom +
+  theme(axis.text = element_blank(),
+        axis.ticks = element_blank(),
+        axis.title = element_blank(),
+        legend.position = "right") +
+  scale_colour_viridis(option = "plasma", na.value = "grey80", begin = 0, end = 1) +
+  NULL
+
+
+ggplot(dd_sub, aes(x=UMAP_1, y=UMAP_2, colour=lCD41_PECy7)) +
+  geom_point() +
+  theme_custom +
+  theme(axis.text = element_blank(),
+        axis.ticks = element_blank(),
+        axis.title = element_blank(),
+        legend.position = "right") +
+  scale_colour_viridis(option = "plasma", na.value = "grey80", begin = 0, end = 1) +
+  NULL
+
+ggplot(dd_sub, aes(x=UMAP_1, y=UMAP_2, colour=lCD41_PECy7_cutOff)) +
+  geom_point() +
+  theme_custom +
+  theme(axis.text = element_blank(),
+        axis.ticks = element_blank(),
+        axis.title = element_blank(),
+        legend.position = "right") +
+  #scale_colour_viridis(option = "plasma", na.value = "grey80", begin = 0, end = 1) +
+  NULL
+
+```
+
+Plot FACS
+
+```{r}
+ggplot(dd_sub, aes(x=lCD41_PECy7, y=lCD127_PE, colour=condition)) +
+  geom_point() +
+  theme_custom
+
+ggplot(dd_sub, aes(x=lCD41_PECy7, y=lCD127_PE, colour=lCD41_PECy7_cutOff)) +
+  geom_point() +
+  theme_custom
+```
+
+
+Now lets remove cells which have high CD41 based on INDEX sort
+
+```{r}
+toRemove_nonLMP <- dd_sub %>%
+  dplyr::filter(lCD41_PECy7_cutOff == "high") %>%
+  pull(Barcode)
+```
+
+## Re-run HVG & cluster
+
+```{r}
+se <- se[,!se$Barcode %in% toRemove_nonLMP]
+
+set.seed(123)
+dec.se <- modelGeneVar(se)
+top.se <- getTopHVGs(dec.se, n=3500)
+chosen <- top.se
+
+se <- runPCA(se, subset_row=chosen) 
+
+set.seed(123)
+se <- runUMAP(se, dimred="PCA", subset_row=chosen,
+              pca=30,
+              n_neighbors=35,
+              min_dist=0.25,
+              
+              #n_neighbors=30,
+              #min_dist=0.3,
+              
+              ncomponents = 2)
+plotUMAP(se, colour_by="condition")
+```
+
+
+## QC plots
+
+Print the cell number per-population
+
+```{r}
+table(se$condition)
+```
+
+Plot the numnber of genes detected
+
+```{r}
+df_cData <- 
+  perCellQCMetrics(se,
+                   subsets=list(Mito=MT_gene,
+                                Hbb=Hbb_gene,
+                                Ribo=Ribo_gene)) %>%
+  cbind(as.data.frame(colData(se))) %>%
+  as.data.frame() %>%
+  dplyr::mutate(Cell = colnames(se))
+
+df_cData_sub <- df_cData 
+
+# Data manipulation for plot
+df_plot <- df_cData_sub %>%
+  dplyr::mutate(Estage = gsub("_Endo", "", condition),
+                Estage = gsub("_HE.*", "", Estage),
+                Estage = gsub("_EMP.*", "", Estage),
+                Estage = gsub("_LMP.*", "", Estage),
+                Estage = gsub("YS_", "", Estage),
+                Estage = gsub("^E10$", "E10.5", Estage),
+                Estage = factor(Estage, levels=c("E9.0", "E9.5", "E10.5")),
+
+                Cond_fac = gsub(".*_Endo", "Endo", condition),
+                Cond_fac = gsub(".*_HE.*", "HE", Cond_fac),
+                Cond_fac = gsub(".*_EMP", "EMP", Cond_fac),
+                Cond_fac = gsub(".*_LMP", "LMP", Cond_fac),
+                Cond_fac = factor(Cond_fac, levels = c("Endo", "HE", "EMP", "LMP")),
+                
+                Cond_fac2 = gsub(".*_Endo", "Endo", condition),
+                Cond_fac2 = gsub(".*HE_Gfi1_Kneg", "HE_Kneg", Cond_fac2),
+                Cond_fac2 = gsub(".*_HE_Runx1|.*_HE_Gfi1", "HE_Kpos", Cond_fac2),
+                Cond_fac2 = gsub(".*_EMP", "EMP", Cond_fac2),
+                Cond_fac2 = gsub(".*_LMP", "LMP", Cond_fac2),
+                Cond_fac2 = factor(Cond_fac2, levels = c("Endo", "HE_Kneg","HE_Kpos", "EMP", "LMP"))
+                )
+
+
+se$SeqRun <- df_plot$SeqRun
+se$Estage <- df_plot$Estage
+se$Cond_fac <- df_plot$Cond_fac
+
+# Get n number on top of the plot
+df_nNum <- 
+
+# Plot
+p2 <- 
+  ggplot(df_plot, aes(x=Cond_fac2, y=detected, colour=Cond_fac2)) +
+  geom_quasirandom(dodge.width=0.75) +
+  geom_boxplot(aes(),fill=NA, colour="black", outlier.alpha = 0) +
+  theme_bw()  +
+  theme_custom +
+  facet_wrap(~Estage) +
+  scale_colour_manual(values=pal.YS_basic_kit) +
+  ylab("Total Features") +
+  #theme_custom +
+  theme(legend.position = "bottom") +
+  scale_y_continuous(labels = scales::comma) +
+  NULL
+p2
+
+table(df_plot$Cond_fac2)
+table(df_plot$Estage, df_plot$Cond_fac2)
+median(df_plot$detected)
+
+ggsave(filename = file.path(outDir_inHouse6_scater_outlier, "NumGenes_perPop.pdf"), device = "pdf", width = 8, height = 5, dpi = 300)
+
+```
+
+
+# Save the file metadata
+
+
+
+```{r}
+
+```
+
+
+# Analysis with KIT negative cells
+
+```{r}
+outDir_inHouse6_scater_outlier <- file.path(outDir_inHouse6_scater, "YS_with_KIT")
+dir.create(outDir_inHouse6_scater_outlier)
+```
+
+
+```{r}
+# Hierarch by gene exp
+set.seed(123)
+dec.se <- modelGeneVar(se)
+top.se <- getTopHVGs(dec.se, n=3500)
+top.se <- getTopHVGs(dec.se, prop=0.1)
+chosen <- top.se
+
+
+chosen.exprs <- assay(se, "logcounts")[chosen,]
+my.dist = dist(as.matrix(t(chosen.exprs)), method = "euclidean")
+my.tree <- hclust(my.dist, method="ward.D2")
+my.dend <- as.dendrogram(my.tree, hang=0.1)
+my.clusters <- unname(cutreeDynamic(my.tree, distM=as.matrix(my.dist), verbose=0, minClusterSize=10, deepSplit=1))
+#my.clusters <- paste0("k_", my.clusters)
+length(unique(my.clusters))
+
+# Making a prettier dendrogram.
+my.tree$labels <- seq_along(my.tree$labels)
+#dend <- as.dendrogram(my.tree, hang=0.1)
+numClus <- length(unique(my.clusters))
+coltree <- gg_color_hue(n=numClus)
+
+my.tree_or <- my.clusters[order.dendrogram(my.dend)]
+
+# Setting up colours for the FACS population
+cFACS <- coltree[as.factor(se$TreeCut)]
+cFACS <- coltree[as.factor(se$TreeCut)[order.dendrogram(my.dend)]]
+
+no0_unique <- 
+function(x) {
+    u_x <- unique(x)
+    u_x[u_x != 0]
+}
+
+clusters_numbers <- no0_unique(my.tree_or)
+n_clusters <- length(clusters_numbers)
+cols <- gg_color_hue(n=n_clusters)
+dend2 <- branches_attr_by_clusters(my.dend, my.tree_or, values = cols) %>%
+  set("labels_col", "black")
+plot(dend2)
+colored_bars(cFACS, dend2, sort_by_labels_order = FALSE, y_shift=10)
+
+UniqClus <- unique(my.tree_or)
+
+pdf(file.path(outDir_inHouse6_scater_outlier, "Dend_withKIT.pdf"),height = 4, width = 12)
+plot(dend2)
+colored_bars(cFACS, dend2, sort_by_labels_order = FALSE, y_shift=10)
+
+plot(UniqClus, ylim = c(-1, length(UniqClus)))
+text(x =1:length(UniqClus), y=-1, UniqClus)
+
+dev.off()
+
+se$TreeCut <- paste0("k_", sprintf("%02d",my.clusters))
+```
+
+
+
+Graph based
+
+```{r}
+# Re-run clusters
+g <- buildSNNGraph(se, k=10, use.dimred = 'PCA')
+clust <- igraph::cluster_walktrap(g)$membership
+se$GraphBased <- paste0("g_", sprintf("%02d",clust))
+
+```
+
+
+### Visualise
+
+Visualise UMAP better
+
+```{r}
+umap.df.int <- reducedDim(se, "UMAP") %>%
+  cbind(colData(se)) %>%
+  as.data.frame() %>%
+  dplyr::rename(UMAP_1 = V1,
+                UMAP_2 = V2) %>%
+  dplyr::mutate(UMAP_1 = -1 * UMAP_1)
+                #UMAP_2 = -1 * UMAP_2)
+```
+
+Plot 
+
+```{r}
+p1 <- 
+  ggplot(umap.df.int, aes(x=UMAP_1, y=UMAP_2, colour=SeqRun)) +
+  geom_point() +
+  gghighlight(use_direct_label = FALSE) +
+  theme(legend.position = "right") +
+  facet_wrap(~SeqRun) +
+  theme_custom +
+  #scale_colour_manual(values=tableau20) + 
+  labs(title="Highlighting the Sequencing batch")
+
+p2 <-        
+  ggplot(umap.df.int, aes(x=UMAP_1, y=UMAP_2, colour=SeqRun)) +
+  geom_point() +
+  gghighlight(use_direct_label = FALSE) +
+  theme(legend.position = "right") +
+  facet_wrap(~condition) +
+  theme_custom +
+  #scale_colour_manual(values=g_hue) + 
+  #scale_colour_manual(values=tableau20) + 
+  labs(title="Highlighting the FACS population")
+
+p3 <-        
+  ggplot(umap.df.int, aes(x=UMAP_1, y=UMAP_2, colour=TreeCut)) +
+  geom_point() +
+  gghighlight(use_direct_label = FALSE) +
+  theme(legend.position = "right") +
+  facet_wrap(~TreeCut) +
+  theme_custom +
+  #scale_colour_manual(values=g_hue) + 
+  #scale_colour_manual(values=tableau20) + 
+  labs(title="Highlighting the in-silico clusters")
+
+
+p3.5 <-        
+  ggplot(umap.df.int, aes(x=UMAP_1, y=UMAP_2, colour=GraphBased)) +
+  geom_point() +
+  gghighlight(use_direct_label = FALSE) +
+  theme(legend.position = "right") +
+  facet_wrap(~GraphBased) +
+  theme_custom +
+  #scale_colour_manual(values=g_hue) + 
+  #scale_colour_manual(values=tableau20) + 
+  labs(title="Highlighting the in-silico clusters")
+
+# p4 <-        
+#   ggplot(umap.df.int, aes(x=UMAP_1, y=UMAP_2, colour=Phase)) +
+#   geom_point() +
+#   gghighlight(use_direct_label = FALSE) +
+#   theme(legend.position = "right") +
+#   facet_wrap(~Phase) +
+#   theme_custom +
+#   #scale_colour_manual(values=g_hue) + 
+#   #scale_colour_manual(values=tableau20) + 
+#   labs(title="Highlighting the cell cycle")
+
+
+png(file.path(outDir_inHouse6_scater_outlier, "facet_SeqBatch.png"), height=350, width = 850)
+p1
+dev.off()
+
+png(file.path(outDir_inHouse6_scater_outlier, "facet_FACS.png"), height=950, width = 1200)
+p2
+dev.off()
+
+png(file.path(outDir_inHouse6_scater_outlier, "facet_cluster_tree.png"), height=950, width = 1200)
+p3
+dev.off()
+
+png(file.path(outDir_inHouse6_scater_outlier, "facet_cluster_graph_default.png"), height=950, width = 1200)
+p3.5
+dev.off()
+
+# png(file.path(outDir_inHouse6_scater_outlier, "facet_CC.png"), height=350, width = 850)
+# p4
+# dev.off()
+```
+
+Nicer UMAP. Showing the FACS
+
+```{r}
+umap.df.int <- umap.df.int %>%
+  dplyr::mutate(Estage_Cond = paste(Estage, Cond_fac, sep="_"),
+                Estage_Cond = factor(Estage_Cond, levels=
+                  c(
+                    "E9.0_Endo", "E9.5_Endo", "E10.5_Endo",
+                    "E9.0_HE", "E9.5_HE", "E10.5_HE",
+                    "E9.5_EMP","E10.5_EMP",
+                    "E9.5_LMP","E10.5_LMP"
+                    )))
+
+p1 <-        
+  ggplot(umap.df.int, aes(x=UMAP_1, y=UMAP_2, colour=Estage)) +
+  geom_point(size=1) +
+  gghighlight(use_direct_label = FALSE) +
+  theme_custom +
+  facet_wrap(~Cond_fac, ncol=2) +
+  theme(
+    axis.text = element_blank(),
+    axis.ticks = element_blank(),
+    legend.position = "right") +
+  scale_colour_manual(values=df_pal_eStg$Col) + 
+  labs(title="Highlighting the FACS")
+
+ggsave(filename = file.path(outDir_inHouse6_scater_outlier, "facet_FACSmain_eStage.pdf"), device = "pdf", width = 8, height = 7, dpi = 300)
+```
+
+
+Another plot showing batch
+
+```{r}
+#pal.seqRun <- c("#00468B", "#ED0000", "#42B540")
+#pal.seqRun <- paletteer_d(palette = "ggsci::lanonc_lancet", n = 4)
+pal.seqRun <- c("#00468BFF", "#ED0000FF",  "#0099B4FF", "#42B540FF")
+p6 <-        
+  ggplot(umap.df.int, aes(x=UMAP_1, y=UMAP_2, colour=SeqRun)) +
+  geom_point(size=1) +
+  gghighlight(use_direct_label = FALSE) +
+  theme_custom +
+  facet_wrap(~Cond_fac, ncol=2) +
+  theme(
+    axis.text = element_blank(),
+    axis.ticks = element_blank(),
+    legend.position = "right") +
+  scale_colour_manual(values=pal.seqRun) + 
+  labs(title="Highlighting the FACS")
+
+ggsave(filename = file.path(outDir_inHouse6_scater_outlier, "facet_FACSmain_SeqRun.pdf"), device = "pdf", width = 8, height = 7, dpi = 300)
+
+# Zoom into endo
+p7 <-        
+  ggplot(umap.df.int, aes(x=UMAP_1, y=UMAP_2, colour=SeqRun, size=Cond_fac)) +
+  geom_point() +
+  gghighlight(use_direct_label = FALSE) +
+  theme_custom +
+  facet_wrap(~Cond_fac, ncol=2) +
+  theme(
+    axis.text = element_blank(),
+    axis.ticks = element_blank(),
+    legend.position = "right") +
+  scale_colour_manual(values=pal.seqRun) + 
+  scale_size_manual(values=c(1,0.2,0.2,0.2)) +
+  labs(title="Highlighting the FACS")
+
+ggsave(filename = file.path(outDir_inHouse6_scater_outlier, "facet_FACSmain_SeqRun_2.pdf"), device = "pdf", width = 8, height = 7, dpi = 300)
+
+```
+
+
+Make a nice UMAP plot
+
+```{r,eval=FALSE}
+umap.df.int <- umap.df.int %>%
+  dplyr::mutate(Estage = gsub("_Endo", "", condition),
+                Estage = gsub("_HE.*", "", Estage),
+                Estage = gsub("_EMP.*", "", Estage),
+                Estage = gsub("_LMP.*", "", Estage),
+                Estage = gsub("YS_", "", Estage),
+                Estage_fac = case_when(Estage == "E9.0" ~ "g1",
+                                       Estage == "E9.5" ~ "g2",
+                                       Estage == "E10" ~ "g3",
+                                       Estage == "E10.5" ~ "g3"),
+                Cond_fac = gsub(".*_Endo", "Endo", condition),
+                Cond_fac = gsub(".*Kneg", "Kneg", Cond_fac),
+                Cond_fac = gsub(".*_HE.*", "HE", Cond_fac),
+                Cond_fac = gsub(".*_EMP", "EMP", Cond_fac),
+                Cond_fac = gsub(".*_LMP", "LMP", Cond_fac),
+                Cond_fac = factor(Cond_fac, levels = c("Endo", "Kneg", "HE", "EMP", "LMP"))
+                )
+
+pal.YS <- c(
+  
+  rep("#4E79A7", 3), # Endo
+  #rep("#F28E2B", 3), # Kit Neg
+  rep("#D82526", 6), # Runx1 & GFi1
+  #rep("#69B764", 3), # Gfi1
+  rep("#7a0177", 2), # EMP
+  rep("#f768a1", 2) # LMP
+)
+  
+  
+p1 <-        
+  ggplot(umap.df.int, aes(x=UMAP_1, y=UMAP_2, colour=condition)) +
+  geom_point(size=1) +
+  gghighlight(use_direct_label = FALSE) +
+  theme_custom +
+  facet_wrap( Cond_fac ~ Estage_fac, ncol=3) +
+  theme(
+    axis.text = element_blank(),
+    axis.ticks = element_blank(),
+    legend.position = "none") +
+  scale_colour_manual(values=pal.YS) + 
+  #scale_colour_manual(values=tableau20) + 
+  labs(title="Highlighting the FACS")
+
+p1
+
+pdf(file.path(outDir_inHouse6_scater_outlier, "facet_eStage_pop.pdf"), height=10, width = 14)
+p1
+dev.off()
+
+ggsave(filename = file.path(outDir_inHouse6_scater_outlier, "facet_eStage_pop2.pdf"), device = "pdf", width = 8, height = 12, dpi = 300)
+```
+
+
+
+## Fine cluster adjustment  
+
+Lets simplify the hierachical clustering
+
+
+```{r,eval=TRUE}
+#my.clusters <- cutree(my.tree, k=3)
+#my.clusters <- unname(cutreeDynamic(my.tree, distM=as.matrix(my.dist), verbose=0, minClusterSize=10, deepSplit=2))
+
+umap.df.int <- umap.df.int %>%
+  dplyr::mutate(TreeCut_re = TreeCut,
+                TreeCut_re = 
+                  case_when(
+                    TreeCut_re == "k_01" ~ 'k_4',
+                    TreeCut_re == "k_02" ~ 'k_2',
+                    TreeCut_re == "k_03" ~ 'k_6',
+                    TreeCut_re == "k_04" ~ 'k_5',
+                    TreeCut_re == "k_05" ~ 'k_1',
+                    TreeCut_re == "k_06" ~ 'k_3'
+                    ))
+
+se$TreeCut_re <- umap.df.int$TreeCut_re
+```
+
+
+
+Plot the UMAP
+
+```{r}
+p3.5 <-        
+  ggplot(umap.df.int, aes(x=UMAP_1, y=UMAP_2, colour=TreeCut_re)) +
+  geom_point() +
+  gghighlight(use_direct_label = FALSE) +
+  theme(legend.position = "right") +
+  facet_wrap(~TreeCut_re) +
+  theme_custom +
+  scale_colour_manual(values=pal.YS_clust_simple) + 
+  #scale_colour_manual(values=tableau20) + 
+  labs(title="Highlighting the in-silico clusters")
+
+png(file.path(outDir_inHouse6_scater_outlier, "facet_cluster_tree_refactor.png"), height=750, width = 1200)
+p3.5
+dev.off()
+```
+
+#### Dendogram
+
+Re-draw the dendogram. Re draw as it is
+
+
+```{r,eval=TRUE}
+                # TreeCut_re = 
+                #   case_when(
+                #     TreeCut_re == "k_01" ~ 'k_4',
+                #     TreeCut_re == "k_02" ~ 'k_2',
+                #     TreeCut_re == "k_03" ~ 'k_6',
+                #     TreeCut_re == "k_04" ~ 'k_5',
+                #     TreeCut_re == "k_05" ~ 'k_1',
+                #     TreeCut_re == "k_06" ~ 'k_3'
+                #     ))
+
+clust_num <- as.integer(gsub("k_", "", umap.df.int$TreeCut_re))
+
+clusters_numbers <- no0_unique(clust_num)
+n_clusters <- length(clusters_numbers)
+my.tree_or2 <- 
+  case_when(
+    my.tree_or == "1" ~ '4',
+    my.tree_or == "2" ~ '2',
+    my.tree_or == "3" ~ '6',
+    my.tree_or == "4" ~ '5',
+    my.tree_or == "5" ~ '1',
+    my.tree_or == "6" ~ '3') %>%
+  as.integer()
+
+
+# Add a colour to show HE kit negative
+df_tmp <- umap.df.int %>% 
+  dplyr::mutate(Cond_fac = gsub(".*_Endo", "Endo", condition),
+                Cond_fac = gsub(".*HE_Gfi1_Kneg", "HE_Kneg", Cond_fac),
+                Cond_fac = gsub(".*_HE_Runx1|.*_HE_Gfi1", "HE_Kpos", Cond_fac),
+                Cond_fac = gsub(".*_EMP", "EMP", Cond_fac),
+                Cond_fac = gsub(".*_LMP", "LMP", Cond_fac),
+                Cond_fac = factor(Cond_fac, levels = c("Endo", "HE_Kneg","HE_Kpos", "EMP", "LMP"))
+                )
+
+my.tree_or_facs <- df_tmp$Cond_fac[order.dendrogram(my.dend)]
+my.tree_or_eStage <- se$Estage[order.dendrogram(my.dend)]
+my.tree_or_Barcode <- se$Barcode[order.dendrogram(my.dend)]
+
+
+df_order <- data.frame(
+  TreeLab = my.dend %>% labels(),
+  Clust = my.tree_or2,
+  FACS = my.tree_or_facs,
+  Estage = my.tree_or_eStage,
+  Barcode = my.tree_or_Barcode
+  ) %>%
+  dplyr::arrange(Clust)
+
+pal.YS_clust_simple_dupe <- pal.YS_clust_simple
+
+cols <- pal.YS_clust_simple[c(5, 6, 1, 2, 3,4)]
+dend2 <- branches_attr_by_clusters(my.dend, my.tree_or2, values = cols) %>%
+  set("labels_col", "black") %>%
+  rotate(as.character(df_order$TreeLab)) 
+plot(dend2)
+
+
+df_order2 <- data.frame(
+  TreeLab = dend2 %>% labels()
+) %>%
+  left_join(df_order)
+
+UniqClus <- unique(df_order2$Clust)
+
+
+pdf(file.path(outDir_inHouse6_scater_outlier, "Dend_reOrder.pdf"),height = 4, width = 12)
+plot(dend2)
+plot(UniqClus, ylim = c(-1, length(UniqClus)))
+text(x =1:length(UniqClus), y=-1, UniqClus)
+
+dev.off()
+
+
+# Specific colours
+pal.YS_basic_1 <- c(pal.YS_basic_kit[1], rep("#FFFFFF", 4)) # Only endo
+pal.YS_basic_2 <- c(rep("#FFFFFF", 1), pal.YS_basic_kit[2], rep("#FFFFFF", 3)) # Only HE Kit Neg
+pal.YS_basic_3 <- c(rep("#FFFFFF", 2), pal.YS_basic_kit[3], rep("#FFFFFF", 2)) # Only HE Kit Pos
+pal.YS_basic_4 <- c(rep("#FFFFFF", 3), pal.YS_basic_kit[4], rep("#FFFFFF", 2)) # Only EMP
+pal.YS_basic_5 <- c(rep("#FFFFFF", 4), pal.YS_basic_kit[5]) # Only LMP
+
+
+# Lets put a coloured bar under the tree
+c.clust <- pal.YS_clust_simple[df_order$Clust] # Cluster colour
+c.eStage <- df_pal_eStg$Col[df_order$Estage] # FACS colour
+c.FACS <- pal.YS_basic[df_order$FACS] # FACS colour all population
+c.FACS_1 <- pal.YS_basic_1[df_order$FACS] # FACS colour all population
+c.FACS_2 <- pal.YS_basic_2[df_order$FACS] 
+c.FACS_3 <- pal.YS_basic_3[df_order$FACS] 
+c.FACS_4 <- pal.YS_basic_4[df_order$FACS] 
+c.FACS_5 <- pal.YS_basic_5[df_order$FACS] 
+
+pdf(file.path(outDir_inHouse6_scater_outlier, "Dend_reOrder.pdf"),height = 4, width = 12)
+plot(dend2)
+
+#colored_bars(c.eStage, dend2, sort_by_labels_order = FALSE, y_shift=10) # Colour eStage
+#colored_bars(c.FACS, dend2, sort_by_labels_order = FALSE, y_shift=-200) # Colour all FACs
+
+colored_bars(c.clust, dend2, sort_by_labels_order = FALSE, y_shift=10)
+colored_bars(c.FACS_1, dend2, sort_by_labels_order = FALSE, y_shift=-100)
+colored_bars(c.FACS_2, dend2, sort_by_labels_order = FALSE, y_shift=-200)
+colored_bars(c.FACS_3, dend2, sort_by_labels_order = FALSE, y_shift=-300)
+colored_bars(c.FACS_4, dend2, sort_by_labels_order = FALSE, y_shift=-400)
+colored_bars(c.FACS_5, dend2, sort_by_labels_order = FALSE, y_shift=-500)
+
+plot(UniqClus, ylim = c(-1, length(UniqClus)))
+text(x =1:length(UniqClus), y=-1, UniqClus)
+
+dev.off()
+```
+
+
+#### Percentage of cells
+
+What percentage of a cell population is in each cluster
+
+```{r}
+df_popPerc <- df_tmp %>% 
+  group_by(Cond_fac, TreeCut_re) %>% 
+  dplyr::summarise(count=n()) %>% 
+  dplyr::mutate(perc=(count/sum(count)*100)) 
+
+df_popPerc
+```
+
+
+#### Heatmap 
+
+Lets make a heatmap. We use a set of known genes. Read the gene list into R.
+
+```{r}
+gene_df <- readxl::read_excel(file.path(dataDir, "Others/Genes_edit_v2.xlsx"))
+gene_df <- as.data.frame(gene_df)
+gene_x <- gene_df %>%
+  # Make the first letter of the gene capital  
+  dplyr::mutate(Gene = mapply(simpleCap, Gene)) 
+row.names(gene_x) <- gene_x$Gene
+gene_x <- dplyr::select(gene_x, Class) 
+
+
+#gene_df <- readxl::read_excel(file.path(dataDir, "Others/Genes_edit.xlsx"))
+#gene_df <- as.data.frame(gene_df)
+#gene_x <- gene_df %>%
+#  # Make the first letter of the gene capital  
+#  dplyr::mutate(Gene = mapply(simpleCap, Gene)) %>%
+#  dplyr::distinct(.keep_all = TRUE)
+#row.names(gene_x) <- gene_x$Gene
+#gene_x <- dplyr::select(gene_x, Class) 
+```
+
+
+Processing to draw heatmap. Note want to maintain the order in the dendogram
+
+```{r}
+# Extract expression
+EXP <-  assay(se, "logcounts")
+selGene <- row.names(EXP)[row.names(EXP) %in% row.names(gene_x)]
+EXP <- EXP[selGene,]
+EXP <- as.matrix(EXP)
+colnames(EXP) <- se$Barcode
+EXP <- EXP[gene_df$Gene,df_order2$Barcode]
+
+# --------- Details for heatmap ------------- #
+# Gene colour (endo / hemto)
+colGene <- paletteer_d(palette = "ggthemes::wsj_dem_rep", n = 2)
+# Expression colour
+mycolor2 <- as.vector(paletteer_c(palette = "viridis::cividis", n = 255))
+
+# Columns (Population colour)
+# This does not have to be ordered. can use any metadata
+ann_col <- data.frame(Cell = df_order2$Barcode,
+                      Cluster = paste0("k",df_order2$Clust),
+                      FACS = df_order2$FACS,
+                      Estage = df_order2$Estage)
+row.names(ann_col) <- ann_col$Cell
+ann_col <- dplyr::select(ann_col, Cluster:Estage)
+
+
+# Specify colours
+pal.Estage <- c("#F7DC05", "#EC0B88", "#5E35B1")
+ann_list <- list(Cluster = 
+                   c("k1" = pal.YS_clust_simple[1],
+                     "k2" = pal.YS_clust_simple[2],
+                     "k3" = pal.YS_clust_simple[3],
+                     "k4" = pal.YS_clust_simple[4],
+                     "k5" = pal.YS_clust_simple[5],
+                     "k6" = pal.YS_clust_simple[6]),
+                 FACS = 
+                   c("Endo" = pal.YS_basic_kit[1],
+                     "HE_Kneg" = pal.YS_basic_kit[2],
+                     "HE_Kpos" = pal.YS_basic_kit[3],
+                     "EMP" = pal.YS_basic_kit[4],
+                     "LMP" = pal.YS_basic_kit[5]),
+                 Stage = 
+                   c("E9.0" = pal.Estage[1],
+                     "E9.5" = pal.Estage[2],
+                     "E10.5" = pal.Estage[3]),
+                 Class = 
+                   c("Endo" = "#006a8e",
+                     "Hema" =  "#b1283a"))
+
+# Find lenth of each cluster (how many cells in each cluster)
+l_clus <- as.vector(table(ann_col$Cluster))
+l_clus <- cumsum(l_clus) # Get the cummulative sum
+
+
+# ------ Scale expression mattrix -------- #
+# A way to normalise the data
+mat2 = t(apply(EXP, 1, function(x) {
+    q10 = quantile(x, 0.1)
+    q90 = quantile(x, 0.9)
+    x[x < q10] = q10
+    x[x > q90] = q90
+    scale(x)
+}))
+colnames(mat2) <- colnames(EXP)
+# Some NA because of the normalisation, so we remove them
+x <- mat2[,1]
+y <- x[is.na(x)]
+mat22 <- mat2[!row.names(mat2) %in% names(y),]
+
+
+# -------- Plot heatmap ------------- #
+pdf(file.path(outDir_inHouse6_scater_outlier, "Heatmap_CustomGenes.pdf"), width = 11, height = 7)
+pheatmap(mat22,
+         cluster_rows = FALSE, 
+         cluster_cols = FALSE,
+
+         col=mycolor2,
+         key=TRUE, keysize = 1.5, 
+         density.info = "none",
+         trace="none",
+        
+         annotation_row = gene_x,
+         annotation_col = ann_col,
+         annotation_colors = ann_list,
+         gaps_col = l_clus,
+         
+         symkey=FALSE, scale="none",
+         show_colnames =F,
+         show_rownames = T,
+         fontsize_row = 7,
+         width = 6,
+         height = 5)
+dev.off()
+```
+
+
+
+### Multiple genes
+
+We make a violin plot of key genes expressed in each cluster
+
+```{r}
+geneToPlot <- c(
+
+  "Pecam1",
+  "Cdh5",
+  "Kdr",
+  "Procr",
+  
+  "Runx1",
+  "Myb",
+  
+  "Ptprc"
+  )
+
+#geneToPlot <- row.names(se)[grep("Fcg", row.names(se))]
+```
+
+Lets try to make a nice violin plot of these genes
+
+```{r}
+setmp <- se
+setmp$finalCluster2 <- setmp$TreeCut_re
+pal <- pal.YS_clust_simple
+expInt <- assay(setmp, "logcounts")[geneToPlot,]
+m <- as.data.frame(expInt)
+colnames(m) <- setmp$Barcode
+m$gene <- row.names(m)
+m <- melt(m)
+m$gene <- factor(m$gene, levels=geneToPlot)
+dftmp <- as.data.frame(colData(setmp)) 
+cD_sub <- dftmp %>%
+  dplyr::select(Barcode, finalCluster2) # %>%
+#dplyr::filter(cell_cycle %in% "G1")
+m <- m %>%
+  dplyr::left_join(cD_sub, by = c("variable" = "Barcode"))
+# Plot
+p_viol_gene <- 
+  m %>%
+  ggplot(aes(x = finalCluster2, y = value, colour = finalCluster2)) +
+  geom_violin(fill=NA, scale="width") +
+    geom_quasirandom(groupOnX=TRUE, size = 0.8, alpha = 0.5, width = 0.4) +
+    stat_summary(fun.y = mean, fun.ymin = mean, fun.ymax = mean,
+                 geom = "crossbar", width = 0.3, alpha = 0.8, colour="black") +
+
+  facet_grid(gene ~ .) +
+  scale_colour_manual(values=pal) +
+  theme_bw() +
+  theme(legend.position = "none",
+        panel.grid.major = element_line(linetype = "blank"), 
+        panel.grid.minor = element_line(linetype = "blank"),
+        axis.text.x = element_text(angle = 45, hjust = 1)) +
+  scale_y_continuous(limits = c(0,15),
+                     breaks = c(0,5,10, 15)) +
+  xlab("") +
+  NULL
+
+# 45w 77h
+ggsave(filename = file.path(outDir_inHouse6_scater_outlier, "SelectedGenes.pdf"), device = "pdf", width = 6, height = 8, dpi = 300)
+```
+
+
+
+
+### Nice Vis
+
+We make a nicer UMAP for publication
+
+```{r,eval=FALSE}
+umap.df.int <- umap.df.int %>%
+  dplyr::mutate(Estage = gsub("_Endo", "", condition),
+                Estage = gsub("_HE.*", "", Estage),
+                Estage = gsub("_EMP.*", "", Estage),
+                Estage = gsub("_LMP.*", "", Estage),
+                Estage = gsub("YS_", "", Estage),
+                Estage_fac = case_when(Estage == "E9.0" ~ "g1",
+                                       Estage == "E9.5" ~ "g2",
+                                       Estage == "E10" ~ "g3",
+                                       Estage == "E10.5" ~ "g3"),
+                Cond_fac = gsub(".*_Endo", "Endo", condition),
+                Cond_fac = gsub(".*Kneg", "Kneg", Cond_fac),
+                Cond_fac = gsub(".*_HE.*", "HE", Cond_fac),
+                Cond_fac = gsub(".*_EMP", "EMP", Cond_fac),
+                Cond_fac = gsub(".*_LMP", "LMP", Cond_fac),
+                Cond_fac = factor(Cond_fac, levels = c("Endo", "Kneg", "HE", "EMP", "LMP"))
+                )
+
+pal.YS <- c(
+  
+  rep("#4E79A7", 3), # Endo
+  #rep("#F28E2B", 3), # Kit Neg
+  rep("#D82526", 6), # Runx1 & GFi1
+  #rep("#69B764", 3), # Gfi1
+  rep("#7a0177", 2), # EMP
+  rep("#f768a1", 2) # LMP
+)
+  
+  
+p1 <-        
+  ggplot(umap.df.int, aes(x=UMAP_1, y=UMAP_2, colour=condition)) +
+  geom_point(size=1) +
+  gghighlight(use_direct_label = FALSE) +
+  theme_custom +
+  facet_wrap( Cond_fac ~ Estage_fac, ncol=3) +
+   theme(
+    axis.text = element_blank(),
+    axis.ticks = element_blank(),
+    legend.position = "none") +
+  scale_colour_manual(values=pal.YS) + 
+  #scale_colour_manual(values=tableau20) + 
+  labs(title="Highlighting the FACS")
+
+p1
+
+pdf(file.path(outDir_noLMP, "facet_eStage_pop.pdf"), height=10, width = 14)
+p1
+dev.off()
+
+ggsave(filename = file.path(outDir_noLMP, "facet_eStage_pop2.pdf"), device = "pdf", width = 8, height = 12, dpi = 300)
+
+```
+
+Nicer UMAP. Showing the FACS
+
+```{r}
+umap.df.int <- umap.df.int %>%
+  dplyr::mutate(Estage_Cond = paste(Estage, Cond_fac, sep="_"),
+                Estage_Cond = factor(Estage_Cond, levels=
+                  c(
+                    "E9.0_Endo", "E9.5_Endo", "E10.5_Endo",
+                    "E9.0_HE", "E9.5_HE", "E10.5_HE",
+                    "E9.5_EMP","E10.5_EMP",
+                    "E9.5_LMP","E10.5_LMP"
+                    )))
+
+p1 <-        
+  ggplot(umap.df.int, aes(x=UMAP_1, y=UMAP_2, colour=Estage)) +
+  geom_point(size=1) +
+  gghighlight(use_direct_label = FALSE) +
+  theme_custom +
+  facet_wrap(~Cond_fac, ncol=2) +
+  theme(
+    axis.text = element_blank(),
+    axis.ticks = element_blank(),
+    legend.position = "right") +
+  scale_colour_manual(values=df_pal_eStg$Col) + 
+  labs(title="Highlighting the FACS")
+
+ggsave(filename = file.path(outDir_noLMP, "facet_FACSmain_eStage.pdf"), device = "pdf", width = 8, height = 7, dpi = 300)
+```
+
+
+
+Show and group clusters
+
+```{r,eval=FALSE}
+umap.df.int <- umap.df.int %>%
+  dplyr::mutate(ClusGroup = 
+                  case_when(TreeCut == "k_02" ~ "g1",
+                            TreeCut == "k_04" ~ "g1",
+                            TreeCut == "k_05" ~ "g1",
+                            TreeCut == "k_08" ~ "g2",
+                            TreeCut == "k_03" ~ "g2",
+                            TreeCut == "k_06" ~ "g2",
+                            TreeCut == "k_07" ~ "g2",
+                            TreeCut == "k_09" ~ "g3",
+                            TreeCut == "k_01" ~ "g3",
+                            ))
+
+p2 <-        
+  ggplot(umap.df.int, aes(x=UMAP_1, y=UMAP_2, colour=TreeCut)) +
+  geom_point() +
+  gghighlight(use_direct_label = FALSE) +
+  theme(legend.position = "right") +
+  facet_wrap(~ ClusGroup, ncol=3) +
+  theme_custom +
+  #scale_colour_manual(values=g_hue) + 
+  #scale_colour_manual(values=tableau20) + 
+  labs(title="Highlighting the cluster")
+
+
+pdf(file.path(outDir_noLMP, "facet_TreeCluster.pdf"), height=3, width = 6)
+p2
+dev.off()
+
+```
+Show the Graph based clustering
+
+```{r,eval=FALSE}
+pal.YS_clus <- c(
+  "#225ea8", "#A0CBE8", # Blue
+  "#F28E2B", "#FFBE7D", "#F1CE63", # Orange-sh
+  "#919C4C", "#C3C377","#BD8A4C", # 6-8 (Green)
+  "#D4A6C8", "#631879", "#A20056" # Pink
+  )
+
+pal.YS_clus <- c(
+  "#225ea8", "#A0CBE8", # Blue
+  "#F28E2B", "#FFBE7D", # Orange-sh
+  "#919C4C", "#C3C377","#BD8A4C", # 6-8 (Green)
+  "#D4A6C8", "#631879", "#A20056" # Pink
+  )
+
+p2 <-        
+  ggplot(umap.df.int, aes(x=UMAP_1, y=UMAP_2, colour=GraphBased)) +
+  geom_point() +
+  gghighlight(use_direct_label = FALSE) +
+  theme(legend.position = "right") +
+  #facet_wrap(~ ClusGroup, ncol=3) +
+  theme_custom +
+  scale_colour_manual(values=pal.YS_clus) + 
+  #scale_colour_manual(values=tableau20) + 
+  labs(title="Highlighting the cluster")
+
+
+# Add text to the plot
+clust_data <- umap.df.int %>%
+  group_by(GraphBased) %>%
+  dplyr::summarise(UMAP_1 = mean(UMAP_1),
+                   UMAP_2 = mean(UMAP_2))
+
+p2.1 <- p2 +
+  geom_point(data = clust_data, aes(fill = GraphBased),
+                 size = 10, shape = 21, colour = "white") +
+      scale_fill_manual(values = pal.YS_clus) +
+      geom_text(data = clust_data, aes(label = GraphBased),
+                colour = "black") +
+  theme(legend.position = "none") 
+
+p2.1
+
+ggsave(filename = file.path(outDir_noLMP, "UMAP_GraphCluster.pdf"), device = "pdf", width = 7, height = 4.5, dpi = 300)
+```
+
+Show the Tree cut
+
+```{r}
+pal.YS_clus <- c(
+  "#225ea8", "#A0CBE8", # Blue
+  "#F28E2B", "#FFBE7D", "#F1CE63", # Orange-sh
+  "#919C4C", "#C3C377","#BD8A4C", # 6-8 (Green)
+  "#D4A6C8", "#631879", "#A20056" # Pink
+  )
+
+pal.YS_clus <- c(
+  "#225ea8", "#A0CBE8", # Blue
+  "#F28E2B", "#FFBE7D", # Orange-sh
+  "#919C4C", "#C3C377","#BD8A4C", # 6-8 (Green)
+  "#D4A6C8", "#631879", "#A20056" # Pink
+  )
+
+
+p2 <-        
+  ggplot(umap.df.int, aes(x=UMAP_1, y=UMAP_2, colour=TreeCut_re)) +
+  geom_point() +
+  gghighlight(use_direct_label = FALSE) +
+  theme(legend.position = "right") +
+  theme_custom +
+  scale_colour_manual(values=pal.YS_clust_simple) + 
+  theme(
+     panel.grid  = element_blank(),
+     axis.ticks = element_blank(),
+     panel.background = element_blank(),
+     panel.border = element_rect(colour = "grey30", fill=NA, size=0.5),
+     strip.background = element_rect(fill="white", colour = "white"),
+     axis.text = element_blank(),
+     axis.title  = element_blank(),
+     legend.position = "none") + 
+  NULL
+
+  
+
+
+# Add text to the plot
+clust_data <- umap.df.int %>%
+  group_by(TreeCut_re) %>%
+  dplyr::summarise(UMAP_1 = mean(UMAP_1),
+                   UMAP_2 = mean(UMAP_2))
+
+p2.1 <- p2 +
+  geom_point(data = clust_data, aes(fill = TreeCut_re),
+                 size = 10, shape = 21, colour = "white") +
+      scale_fill_manual(values = pal.YS_clust_simple) +
+      geom_text(data = clust_data, aes(label = TreeCut_re),
+                colour = "black") +
+  theme(legend.position = "none") 
+
+p2.1
+
+# 35w 25h
+ggsave(p2, filename = file.path(outDir_noLMP, "UMAP_TreeCut.pdf"), device = "pdf", width = 6, height = 4, dpi = 300)
+```
+
+
+### Save
+
+```{r}
+saveRDS(se, file.path(outData_dir, "se_YS_only_fullInfo_2024.RDS"))
+```
+
+
+
+
+
+
+
+
+
+
+
+# Analysis withOUT KIT negative cells
+
+### Clustering 
+
+Re-do clustering
+
+
+```{r,eval=FALSE}
+# Hirarchical clustering
+my.dist  <- dist(reducedDim(se, "PCA")[,1:0])
+my.tree <- hclust(my.dist, "ward.D2")
+```
+
+```{r,eval=FALSE}
+my.dend <- as.dendrogram(my.tree, hang=0.1)
+my.clusters <- unname(cutreeDynamic(my.tree, distM=as.matrix(my.dist), verbose=0, minClusterSize=10, deepSplit=2))
+#my.clusters <- paste0("k_", my.clusters)
+length(unique(my.clusters))
+
+# Making a prettier dendrogram.
+my.tree$labels <- seq_along(my.tree$labels)
+#dend <- as.dendrogram(my.tree, hang=0.1)
+numClus <- length(unique(my.clusters))
+coltree <- gg_color_hue(n=numClus)
+
+my.tree_or <- my.clusters[order.dendrogram(my.dend)]
+
+# Setting up colours for the FACS population
+cFACS <- coltree[as.factor(se$TreeCut)]
+cFACS <- coltree[as.factor(se$TreeCut)[order.dendrogram(dend)]]
+
+no0_unique <- 
+function(x) {
+    u_x <- unique(x)
+    u_x[u_x != 0]
+}
+
+clusters_numbers <- no0_unique(my.tree_or)
+n_clusters <- length(clusters_numbers)
+cols <- gg_color_hue(n=n_clusters)
+dend2 <- branches_attr_by_clusters(my.dend, my.tree_or, values = cols) %>%
+  set("labels_col", "black")
+plot(dend2)
+colored_bars(cFACS, dend2, sort_by_labels_order = FALSE, y_shift=10)
+
+UniqClus <- unique(my.tree_or)
+
+pdf(file.path(outDir_inHouse6_scater_outlier, "Dend_PCA.pdf"),height = 4, width = 12)
+plot(dend2)
+colored_bars(cFACS, dend2, sort_by_labels_order = FALSE, y_shift=10)
+
+plot(UniqClus, ylim = c(-1, length(UniqClus)))
+text(x =1:length(UniqClus), y=-1, UniqClus)
+
+dev.off()
+
+se$TreeCut <- paste0("k_", sprintf("%02d",my.clusters))
+```
+
+```{r}
+# Hierarch by gene exp
+chosen.exprs <- assay(se, "logcounts")[chosen,]
+my.dist = dist(as.matrix(t(chosen.exprs)), method = "euclidean")
+my.tree <- hclust(my.dist, method="ward.D2")
+my.dend <- as.dendrogram(my.tree, hang=0.1)
+my.clusters <- unname(cutreeDynamic(my.tree, distM=as.matrix(my.dist), verbose=0, minClusterSize=10, deepSplit=2))
+#my.clusters <- paste0("k_", my.clusters)
+length(unique(my.clusters))
+
+# Making a prettier dendrogram.
+my.tree$labels <- seq_along(my.tree$labels)
+#dend <- as.dendrogram(my.tree, hang=0.1)
+numClus <- length(unique(my.clusters))
+coltree <- gg_color_hue(n=numClus)
+
+my.tree_or <- my.clusters[order.dendrogram(my.dend)]
+
+# Setting up colours for the FACS population
+cFACS <- coltree[as.factor(se$TreeCut)]
+cFACS <- coltree[as.factor(se$TreeCut)[order.dendrogram(my.dend)]]
+
+no0_unique <- 
+function(x) {
+    u_x <- unique(x)
+    u_x[u_x != 0]
+}
+
+clusters_numbers <- no0_unique(my.tree_or)
+n_clusters <- length(clusters_numbers)
+cols <- gg_color_hue(n=n_clusters)
+dend2 <- branches_attr_by_clusters(my.dend, my.tree_or, values = cols) %>%
+  set("labels_col", "black")
+plot(dend2)
+colored_bars(cFACS, dend2, sort_by_labels_order = FALSE, y_shift=10)
+
+UniqClus <- unique(my.tree_or)
+
+pdf(file.path(outDir_inHouse6_scater_outlier, "Dend.pdf"),height = 4, width = 12)
+plot(dend2)
+colored_bars(cFACS, dend2, sort_by_labels_order = FALSE, y_shift=10)
+
+plot(UniqClus, ylim = c(-1, length(UniqClus)))
+text(x =1:length(UniqClus), y=-1, UniqClus)
+
+dev.off()
+
+se$TreeCut <- paste0("k_", sprintf("%02d",my.clusters))
+```
+
+
+
+Graph based
+
+```{r}
+# Re-run clusters
+g <- buildSNNGraph(se, k=10, use.dimred = 'PCA')
+clust <- igraph::cluster_walktrap(g)$membership
+se$GraphBased <- paste0("g_", sprintf("%02d",clust))
+
+```
+
+
+### Visualise
+
+Visualise UMAP better
+
+```{r}
+umap.df.int <- reducedDim(se, "UMAP") %>%
+  cbind(colData(se)) %>%
+  as.data.frame() %>%
+  dplyr::rename(UMAP_1 = V1,
+                UMAP_2 = V2) %>%
+  dplyr::mutate(UMAP_1 = -1 * UMAP_1)
+                #UMAP_2 = -1 * UMAP_2)
+```
+
+Plot 
+
+```{r}
+p1 <- 
+  ggplot(umap.df.int, aes(x=UMAP_1, y=UMAP_2, colour=SeqRun)) +
+  geom_point() +
+  gghighlight(use_direct_label = FALSE) +
+  theme(legend.position = "right") +
+  facet_wrap(~SeqRun) +
+  theme_custom +
+  #scale_colour_manual(values=tableau20) + 
+  labs(title="Highlighting the Sequencing batch")
+
+p2 <-        
+  ggplot(umap.df.int, aes(x=UMAP_1, y=UMAP_2, colour=SeqRun)) +
+  geom_point() +
+  gghighlight(use_direct_label = FALSE) +
+  theme(legend.position = "right") +
+  facet_wrap(~condition) +
+  theme_custom +
+  #scale_colour_manual(values=g_hue) + 
+  #scale_colour_manual(values=tableau20) + 
+  labs(title="Highlighting the FACS population")
+
+p3 <-        
+  ggplot(umap.df.int, aes(x=UMAP_1, y=UMAP_2, colour=TreeCut)) +
+  geom_point() +
+  gghighlight(use_direct_label = FALSE) +
+  theme(legend.position = "right") +
+  facet_wrap(~TreeCut) +
+  theme_custom +
+  #scale_colour_manual(values=g_hue) + 
+  #scale_colour_manual(values=tableau20) + 
+  labs(title="Highlighting the in-silico clusters")
+
+
+p3.5 <-        
+  ggplot(umap.df.int, aes(x=UMAP_1, y=UMAP_2, colour=GraphBased)) +
+  geom_point() +
+  gghighlight(use_direct_label = FALSE) +
+  theme(legend.position = "right") +
+  facet_wrap(~GraphBased) +
+  theme_custom +
+  #scale_colour_manual(values=g_hue) + 
+  #scale_colour_manual(values=tableau20) + 
+  labs(title="Highlighting the in-silico clusters")
+
+p4 <-        
+  ggplot(umap.df.int, aes(x=UMAP_1, y=UMAP_2, colour=Phase)) +
+  geom_point() +
+  gghighlight(use_direct_label = FALSE) +
+  theme(legend.position = "right") +
+  facet_wrap(~Phase) +
+  theme_custom +
+  #scale_colour_manual(values=g_hue) + 
+  #scale_colour_manual(values=tableau20) + 
+  labs(title="Highlighting the cell cycle")
+
+
+png(file.path(outDir_inHouse6_scater_outlier, "facet_SeqBatch.png"), height=350, width = 850)
+p1
+dev.off()
+
+png(file.path(outDir_inHouse6_scater_outlier, "facet_FACS.png"), height=950, width = 1200)
+p2
+dev.off()
+
+png(file.path(outDir_inHouse6_scater_outlier, "facet_cluster_tree.png"), height=950, width = 1200)
+p3
+dev.off()
+
+png(file.path(outDir_inHouse6_scater_outlier, "facet_cluster_graph_default.png"), height=950, width = 1200)
+p3.5
+dev.off()
+
+png(file.path(outDir_inHouse6_scater_outlier, "facet_CC.png"), height=350, width = 850)
+p4
+dev.off()
+```
+
+Nicer UMAP. Showing the FACS
+
+```{r}
+umap.df.int <- umap.df.int %>%
+  dplyr::mutate(Estage_Cond = paste(Estage, Cond_fac, sep="_"),
+                Estage_Cond = factor(Estage_Cond, levels=
+                  c(
+                    "E9.0_Endo", "E9.5_Endo", "E10.5_Endo",
+                    "E9.0_HE", "E9.5_HE", "E10.5_HE",
+                    "E9.5_EMP","E10.5_EMP",
+                    "E9.5_LMP","E10.5_LMP"
+                    )))
+
+p1 <-        
+  ggplot(umap.df.int, aes(x=UMAP_1, y=UMAP_2, colour=Estage)) +
+  geom_point(size=1) +
+  gghighlight(use_direct_label = FALSE) +
+  theme_custom +
+  facet_wrap(~Cond_fac, ncol=2) +
+  theme(
+    axis.text = element_blank(),
+    axis.ticks = element_blank(),
+    legend.position = "right") +
+  scale_colour_manual(values=df_pal_eStg$Col) + 
+  labs(title="Highlighting the FACS")
+
+ggsave(filename = file.path(outDir_inHouse6_scater_outlier, "facet_FACSmain_eStage.pdf"), device = "pdf", width = 8, height = 7, dpi = 300)
+```
+
+
+Another plot showing batch
+
+```{r}
+#pal.seqRun <- c("#00468B", "#ED0000", "#42B540")
+#pal.seqRun <- paletteer_d(palette = "ggsci::lanonc_lancet", n = 4)
+pal.seqRun <- c("#00468BFF", "#ED0000FF",  "#0099B4FF", "#42B540FF")
+p6 <-        
+  ggplot(umap.df.int, aes(x=UMAP_1, y=UMAP_2, colour=SeqRun)) +
+  geom_point(size=1) +
+  gghighlight(use_direct_label = FALSE) +
+  theme_custom +
+  facet_wrap(~Cond_fac, ncol=2) +
+  theme(
+    axis.text = element_blank(),
+    axis.ticks = element_blank(),
+    legend.position = "right") +
+  scale_colour_manual(values=pal.seqRun) + 
+  labs(title="Highlighting the FACS")
+
+ggsave(filename = file.path(outDir_inHouse6_scater_outlier, "facet_FACSmain_SeqRun.pdf"), device = "pdf", width = 8, height = 7, dpi = 300)
+
+# Zoom into endo
+p7 <-        
+  ggplot(umap.df.int, aes(x=UMAP_1, y=UMAP_2, colour=SeqRun, size=Cond_fac)) +
+  geom_point() +
+  gghighlight(use_direct_label = FALSE) +
+  theme_custom +
+  facet_wrap(~Cond_fac, ncol=2) +
+  theme(
+    axis.text = element_blank(),
+    axis.ticks = element_blank(),
+    legend.position = "right") +
+  scale_colour_manual(values=pal.seqRun) + 
+  scale_size_manual(values=c(1,0.2,0.2,0.2)) +
+  labs(title="Highlighting the FACS")
+
+ggsave(filename = file.path(outDir_inHouse6_scater_outlier, "facet_FACSmain_SeqRun_2.pdf"), device = "pdf", width = 8, height = 7, dpi = 300)
+
+```
+
+
+Make a nice UMAP plot
+
+```{r,eval=FALSE}
+umap.df.int <- umap.df.int %>%
+  dplyr::mutate(Estage = gsub("_Endo", "", condition),
+                Estage = gsub("_HE.*", "", Estage),
+                Estage = gsub("_EMP.*", "", Estage),
+                Estage = gsub("_LMP.*", "", Estage),
+                Estage = gsub("YS_", "", Estage),
+                Estage_fac = case_when(Estage == "E9.0" ~ "g1",
+                                       Estage == "E9.5" ~ "g2",
+                                       Estage == "E10" ~ "g3",
+                                       Estage == "E10.5" ~ "g3"),
+                Cond_fac = gsub(".*_Endo", "Endo", condition),
+                Cond_fac = gsub(".*Kneg", "Kneg", Cond_fac),
+                Cond_fac = gsub(".*_HE.*", "HE", Cond_fac),
+                Cond_fac = gsub(".*_EMP", "EMP", Cond_fac),
+                Cond_fac = gsub(".*_LMP", "LMP", Cond_fac),
+                Cond_fac = factor(Cond_fac, levels = c("Endo", "Kneg", "HE", "EMP", "LMP"))
+                )
+
+pal.YS <- c(
+  
+  rep("#4E79A7", 3), # Endo
+  #rep("#F28E2B", 3), # Kit Neg
+  rep("#D82526", 6), # Runx1 & GFi1
+  #rep("#69B764", 3), # Gfi1
+  rep("#7a0177", 2), # EMP
+  rep("#f768a1", 2) # LMP
+)
+  
+  
+p1 <-        
+  ggplot(umap.df.int, aes(x=UMAP_1, y=UMAP_2, colour=condition)) +
+  geom_point(size=1) +
+  gghighlight(use_direct_label = FALSE) +
+  theme_custom +
+  facet_wrap( Cond_fac ~ Estage_fac, ncol=3) +
+  theme(
+    axis.text = element_blank(),
+    axis.ticks = element_blank(),
+    legend.position = "none") +
+  scale_colour_manual(values=pal.YS) + 
+  #scale_colour_manual(values=tableau20) + 
+  labs(title="Highlighting the FACS")
+
+p1
+
+pdf(file.path(outDir_inHouse6_scater_outlier, "facet_eStage_pop.pdf"), height=10, width = 14)
+p1
+dev.off()
+
+ggsave(filename = file.path(outDir_inHouse6_scater_outlier, "facet_eStage_pop2.pdf"), device = "pdf", width = 8, height = 12, dpi = 300)
+```
+
+
+## Remove contaminating "LMP" 
+
+```{r}
+outDir_noLMP <- file.path(outDir_inHouse6_scater, "no_Platelet")
+dir.create(outDir_noLMP)
+```
+
+
+We noticed an the LMP population split into two. Based on expression of key genes this is the Platelet popualtion, in other words contamination.
+
+```{r}
+geneDir <- file.path(outDir_noLMP, "gene_exp")
+dir.create(geneDir)
+```
+
+
+```{r}
+gg <- "Flt3"
+expInt <- assay(se, "logcounts")[gg,]
+#exp2 <- sacle(expInt)
+#exp2 <- as.vector(exp2)
+df_plot <- umap.df.int %>%
+  mutate(gene = expInt)
+
+ggplot(df_plot, aes(x=UMAP_1, y=UMAP_2, colour=gene)) +
+  geom_point() +
+  theme_custom +
+  theme(axis.text = element_blank(),
+        axis.ticks = element_blank(),
+        axis.title = element_blank(),
+        legend.position = "right") +
+  scale_colour_viridis(option = "plasma", na.value = "grey80", begin = 0, end = 1) +
+  labs(colour = gg) +
+  NULL
+
+ggsave(filename = file.path(geneDir, paste0(gg, "_UMAP.png")), device = "png", width = 6, height = 4, dpi = 300)
+```
+
+
+Lets remove the contaminating cluster. We can remove it by the in silico cluster or we use the INDEX FACS data. Lets use the INDEX data and merge it
+
+```{r}
+cD <- as.data.frame(colData(se))
+
+# Join with index FACS info
+dd <- cD %>%
+  mutate(UniqID = paste(SC_project, SC_plate, FACS_well, sep="_")) %>%
+  left_join(df_inx_WN_S10)
+
+
+
+umap.df.int <- umap.df.int %>%
+  dplyr::mutate(Barcode = se$Barcode)
+
+dd_sub <- dd %>%
+  dplyr::filter(condition %in% c("YS_E9.5_EMP", "YS_E10.5_EMP",
+                                 "YS_E9.5_LMP", "YS_E10.5_LMP")) %>%
+  #dplyr::filter(Allele == "RG") %>%
+  mutate(lCD127_eF450 = log10(CD127_eF450 + 200) ,
+         lCD127_PE = log10(CD127_PE + 200),
+         
+         lCD41_PE = log10(CD41_PE+ 200) ,
+         lCD41_PECy7 = log10(CD41_PECy7 + 200)) %>%
+  mutate(lCD41_PECy7_cutOff = if_else(lCD41_PECy7 >= 4.5, "high", "low")) %>%
+  dplyr::left_join(dplyr::select(umap.df.int, UMAP_1, UMAP_2, Barcode)) 
+```
+
+Plot CD41 in UMAP
+
+```{r}
+ggplot(dd_sub, aes(x=UMAP_1, y=UMAP_2, colour=lCD127_PE)) +
+  geom_point() +
+  theme_custom +
+  theme(axis.text = element_blank(),
+        axis.ticks = element_blank(),
+        axis.title = element_blank(),
+        legend.position = "right") +
+  scale_colour_viridis(option = "plasma", na.value = "grey80", begin = 0, end = 1) +
+  NULL
+
+
+ggplot(dd_sub, aes(x=UMAP_1, y=UMAP_2, colour=lCD41_PECy7)) +
+  geom_point() +
+  theme_custom +
+  theme(axis.text = element_blank(),
+        axis.ticks = element_blank(),
+        axis.title = element_blank(),
+        legend.position = "right") +
+  scale_colour_viridis(option = "plasma", na.value = "grey80", begin = 0, end = 1) +
+  NULL
+
+ggplot(dd_sub, aes(x=UMAP_1, y=UMAP_2, colour=lCD41_PECy7_cutOff)) +
+  geom_point() +
+  theme_custom +
+  theme(axis.text = element_blank(),
+        axis.ticks = element_blank(),
+        axis.title = element_blank(),
+        legend.position = "right") +
+  #scale_colour_viridis(option = "plasma", na.value = "grey80", begin = 0, end = 1) +
+  NULL
+
+```
+
+Plot FACS
+
+```{r}
+ggplot(dd_sub, aes(x=lCD41_PECy7, y=lCD127_PE, colour=condition)) +
+  geom_point() +
+  theme_custom
+
+ggplot(dd_sub, aes(x=lCD41_PECy7, y=lCD127_PE, colour=lCD41_PECy7_cutOff)) +
+  geom_point() +
+  theme_custom
+```
+
+
+Now lets remove cells which have high CD41 based on INDEX sort
+
+```{r}
+toRemove_nonLMP <- dd_sub %>%
+  dplyr::filter(lCD41_PECy7_cutOff == "high") %>%
+  pull(Barcode)
+```
+
+
+
+### Re-run HVG & cluster
+
+```{r}
+#se2 <- se
+se <- se[,!se$Barcode %in% toRemove_nonLMP]
+
+set.seed(123)
+dec.se <- modelGeneVar(se)
+top.se <- getTopHVGs(dec.se, n=3500)
+chosen <- top.se
+
+se <- runPCA(se, subset_row=chosen) 
+
+set.seed(123)
+se <- runUMAP(se, dimred="PCA", subset_row=chosen,
+              pca=30,
+              n_neighbors=35,
+              min_dist=0.25,
+              
+              #n_neighbors=30,
+              #min_dist=0.3,
+              
+              ncomponents = 2)
+plotUMAP(se, colour_by="condition")
+```
+
+Try plot 3D
+
+```{r,eval=FALSE}
+umap.df <- as.data.frame(reducedDim(se, "UMAP")) %>%
+    cbind(colData(se)) %>%
+  as.data.frame() 
+
+# 3D plot
+x1 <- umap.df$V1
+x2 <- umap.df$V2
+x3 <- umap.df$V3
+
+df_pal <- df.col_FACS %>%
+  dplyr::filter(FACS %in% umap.df$condition)
+pal <- df_pal$Pal
+
+kk <- umap.df$condition
+kk.1 <- unique(umap.df$condition)
+kk <- factor(as.character(kk), 
+                levels=c(
+                  "AGM_E10.5_Endo", "AGM_E10.5_HE_Runx1", "AGM_E10.5_HE_Gfi1", "AGM_E10.5_EHT", "AGM_E10.5_IAHC",
+                
+                "YS_E9.0_Endo", "YS_E9.5_Endo", "YS_E10.5_Endo", 
+                "YS_E9.0_HE_Gfi1_Kneg", "YS_E9.5_HE_Gfi1_Kneg", "YS_E10_HE_Gfi1_Kneg",
+                
+                "YS_E9.0_HE_Runx1", "YS_E9.5_HE_Runx1", "YS_E10.5_HE_Runx1", 
+                "YS_E9.0_HE_Gfi1", "YS_E9.5_HE_Gfi1", "YS_E10.5_HE_Gfi1",
+                
+                "YS_E9.5_EMP","YS_E10.5_EMP",
+                "YS_E9.5_LMP", "YS_E10.5_LMP"))
+kk[is.na(pal[kk])] %>% unique()
+
+pal <- pal[kk]
+
+plot3d(x1, x2, x3, col = pal)
+
+
+# Or use plotly
+plot_ly(umap.df, x= ~V1, y= ~V2, z= ~V3, color =  ~condition)
+
+```
+
+
+```{r,eval=FALSE}
+umap.df <- reducedDim(se, "UMAP") %>%
+  cbind(colData(se)) %>%
+  as.data.frame() %>%
+  dplyr::rename(UMAP_1 = V1,
+                UMAP_2 = V2,
+                UMAP_3 = V3) %>%
+  # Add a column to simplify the annotation
+  mutate(
+    MainPop = gsub("AGM_", "", condition),
+    MainPop = gsub("YS_", "", condition),
+    
+    MainPop = gsub("HE_Gfi1", "HE", MainPop),
+    MainPop = gsub("HE_Runx1", "HE", MainPop)
+  )
+
+
+x1 <- umap.df$UMAP_1
+x2 <- umap.df$UMAP_2
+x3 <- umap.df$UMAP_3
+
+library(rgl)
+pal <- df.col_FACS %>%
+  dplyr::filter(FACS %in% umap.df$condition) %>%
+  pull(Pal)
+kk <- umap.df.int$condition
+kk <- as.factor(as.character(kk))
+pal <- pal[kk]
+
+plot3d(x1, x2, x3, col = pal)
+
+```
+
+Cluster with h clustering
+
+```{r}
+set.seed(123)
+dec.se <- modelGeneVar(se)
+top.se <- getTopHVGs(dec.se, n=3000)
+chosen <- top.se
+
+
+# Hierarch by gene exp
+chosen.exprs <- assay(se, "logcounts")[chosen,]
+my.dist = dist(as.matrix(t(chosen.exprs)), method = "euclidean")
+my.tree <- hclust(my.dist, method="ward.D2")
+my.dend <- as.dendrogram(my.tree, hang=0.1)
+my.clusters <- unname(cutreeDynamic(my.tree, 
+                                    distM=as.matrix(my.dist), 
+                                    verbose=0, minClusterSize=10, 
+                                    deepSplit=2))
+#my.clusters <- paste0("k_", my.clusters)
+length(unique(my.clusters))
+
+# Making a prettier dendrogram.
+my.tree$labels <- seq_along(my.tree$labels)
+#dend <- as.dendrogram(my.tree, hang=0.1)
+numClus <- length(unique(my.clusters))
+coltree <- gg_color_hue(n=numClus)
+
+my.tree_or <- my.clusters[order.dendrogram(my.dend)]
+
+# Setting up colours for the FACS population
+cFACS <- coltree[as.factor(se$TreeCut)]
+cFACS <- coltree[as.factor(se$TreeCut)[order.dendrogram(my.dend)]]
+
+no0_unique <- 
+function(x) {
+    u_x <- unique(x)
+    u_x[u_x != 0]
+}
+
+clusters_numbers <- no0_unique(my.tree_or)
+n_clusters <- length(clusters_numbers)
+cols <- gg_color_hue(n=n_clusters)
+dend2 <- branches_attr_by_clusters(my.dend, my.tree_or, values = cols) %>%
+  set("labels_col", "black")
+plot(dend2)
+colored_bars(cFACS, dend2, sort_by_labels_order = FALSE, y_shift=10)
+
+UniqClus <- unique(my.tree_or)
+
+pdf(file.path(outDir_noLMP, "Dend.pdf"),height = 4, width = 12)
+plot(dend2)
+colored_bars(cFACS, dend2, sort_by_labels_order = FALSE, y_shift=10)
+
+plot(UniqClus, ylim = c(-1, length(UniqClus)))
+text(x =1:length(UniqClus), y=-1, UniqClus)
+
+dev.off()
+
+se$TreeCut <- paste0("k_", sprintf("%02d",my.clusters))
+```
+
+Graph based
+
+```{r}
+# Re-run clusters
+g <- buildSNNGraph(se, k=10, use.dimred = 'PCA')
+clust <- igraph::cluster_walktrap(g)$membership
+se$GraphBased <- paste0("g_", sprintf("%02d",clust))
+
+```
+
+
+### Visualise
+
+Visualise UMAP better
+
+```{r}
+umap.df.int <- reducedDim(se, "UMAP") %>%
+  cbind(colData(se)) %>%
+  as.data.frame() %>%
+  dplyr::rename(UMAP_1 = V1,
+                UMAP_2 = V2) %>%
+  dplyr::mutate(UMAP_1 = -1 * UMAP_1)
+```
+
+Plot 
+
+```{r}
+p1 <- 
+  ggplot(umap.df.int, aes(x=UMAP_1, y=UMAP_2, colour=SeqRun)) +
+  geom_point() +
+  gghighlight(use_direct_label = FALSE) +
+  theme(legend.position = "right") +
+  facet_wrap(~SeqRun) +
+  theme_custom +
+  #scale_colour_manual(values=tableau20) + 
+  labs(title="Highlighting the Sequencing batch")
+
+p2 <-        
+  ggplot(umap.df.int, aes(x=UMAP_1, y=UMAP_2, colour=condition)) +
+  geom_point() +
+  gghighlight(use_direct_label = FALSE) +
+  theme(legend.position = "right") +
+  facet_wrap(~condition) +
+  theme_custom +
+  #scale_colour_manual(values=g_hue) + 
+  #scale_colour_manual(values=tableau20) + 
+  labs(title="Highlighting the FACS population")
+
+p3 <-        
+  ggplot(umap.df.int, aes(x=UMAP_1, y=UMAP_2, colour=TreeCut)) +
+  geom_point() +
+  gghighlight(use_direct_label = FALSE) +
+  theme(legend.position = "right") +
+  facet_wrap(~TreeCut) +
+  theme_custom +
+  #scale_colour_manual(values=g_hue) + 
+  #scale_colour_manual(values=tableau20) + 
+  labs(title="Highlighting the in-silico clusters")
+
+
+p3.5 <-        
+  ggplot(umap.df.int, aes(x=UMAP_1, y=UMAP_2, colour=GraphBased)) +
+  geom_point() +
+  gghighlight(use_direct_label = FALSE) +
+  theme(legend.position = "right") +
+  facet_wrap(~GraphBased) +
+  theme_custom +
+  #scale_colour_manual(values=g_hue) + 
+  #scale_colour_manual(values=tableau20) + 
+  labs(title="Highlighting the in-silico clusters")
+
+p4 <-        
+  ggplot(umap.df.int, aes(x=UMAP_1, y=UMAP_2, colour=Phase)) +
+  geom_point() +
+  gghighlight(use_direct_label = FALSE) +
+  theme(legend.position = "right") +
+  facet_wrap(~Phase) +
+  theme_custom +
+  #scale_colour_manual(values=g_hue) + 
+  #scale_colour_manual(values=tableau20) + 
+  labs(title="Highlighting the cell cycle")
+
+
+png(file.path(outDir_noLMP, "facet_SeqBatch.png"), height=350, width = 850)
+p1
+dev.off()
+
+png(file.path(outDir_noLMP, "facet_FACS.png"), height=950, width = 1200)
+p2
+dev.off()
+
+png(file.path(outDir_noLMP, "facet_cluster_tree.png"), height=950, width = 1200)
+p3
+dev.off()
+
+png(file.path(outDir_noLMP, "facet_cluster_graph_default.png"), height=950, width = 1200)
+p3.5
+dev.off()
+
+png(file.path(outDir_noLMP, "facet_CC.png"), height=350, width = 850)
+p4
+dev.off()
+
+```
+
+
+### Fine cluster adjustment  
+
+
+Lets simplify the hierachical clustering
+
+
+```{r,eval=TRUE}
+#my.clusters <- cutree(my.tree, k=3)
+#my.clusters <- unname(cutreeDynamic(my.tree, distM=as.matrix(my.dist), verbose=0, minClusterSize=10, deepSplit=2))
+
+umap.df.int <- umap.df.int %>%
+  dplyr::mutate(TreeCut_re = TreeCut,
+                TreeCut_re = 
+                  case_when(
+                    TreeCut_re == "k_01" ~ 'k_2',
+                    TreeCut_re == "k_02" ~ 'k_3',
+                    TreeCut_re == "k_03" ~ 'k_2',
+                    TreeCut_re == "k_04" ~ 'k_4',
+                    TreeCut_re == "k_05" ~ 'k_5',
+                    TreeCut_re == "k_06" ~ 'k_2',
+                    TreeCut_re == "k_07" ~ 'k_1',
+                    TreeCut_re == "k_08" ~ 'k_1',
+                    TreeCut_re == "k_09" ~ 'k_2',
+                    TreeCut_re == "k_10" ~ 'k_2'
+                    ))
+
+se$TreeCut_re <- umap.df.int$TreeCut_re
+```
+
+
+
+Plot the UMAP
+
+```{r}
+# Setting up colours for the clusters
+pal.YS_clust_simple <- 
+  c(
+  "#A0CBE8", # Blue
+  "#FFBE7D", # Orange-sh
+  "#DE7500", # Brown-ish
+  "#702F7D", "#F148D0" # Pink shades
+  )
+
+
+p3.5 <-        
+  ggplot(umap.df.int, aes(x=UMAP_1, y=UMAP_2, colour=TreeCut_re)) +
+  geom_point() +
+  gghighlight(use_direct_label = FALSE) +
+  theme(legend.position = "right") +
+  facet_wrap(~TreeCut_re) +
+  theme_custom +
+  scale_colour_manual(values=pal.YS_clust_simple) + 
+  #scale_colour_manual(values=tableau20) + 
+  labs(title="Highlighting the in-silico clusters")
+
+png(file.path(outDir_noLMP, "facet_cluster_tree_refactor.png"), height=950, width = 1200)
+p3.5
+dev.off()
+```
+
+#### Dendogram
+
+Re-draw the dendogram. Re draw as it is
+
+
+```{r,eval=TRUE}
+clust_num <- as.integer(gsub("k_", "", umap.df.int$TreeCut_re))
+
+clusters_numbers <- no0_unique(clust_num)
+n_clusters <- length(clusters_numbers)
+my.tree_or2 <- 
+  case_when(
+    my.tree_or == "1" ~ '2',
+    my.tree_or == "2" ~ '3',
+    my.tree_or == "3" ~ '2',
+    my.tree_or == "4" ~ '4',
+    my.tree_or == "5" ~ '5',
+    my.tree_or == "6" ~ '2',
+    my.tree_or == "7" ~ '1',
+    my.tree_or == "8" ~ '1',
+    my.tree_or == "9" ~ '2',
+    my.tree_or == "10" ~ '2') %>%
+  as.integer()
+
+# A finer cluster to order the tree
+my.tree_or3 <- 
+  case_when(
+    my.tree_or == "1" ~ '2.4',
+    my.tree_or == "2" ~ '3',
+    my.tree_or == "3" ~ '2.3',
+    my.tree_or == "4" ~ '4',
+    my.tree_or == "5" ~ '5',
+    my.tree_or == "6" ~ '2.2',
+    my.tree_or == "7" ~ '1.2',
+    my.tree_or == "8" ~ '1.1',
+    my.tree_or == "9" ~ '2.1',
+    my.tree_or == "10" ~ '2.5') %>%
+  as.numeric()
+
+my.tree_or_facs <- se$Cond_fac[order.dendrogram(my.dend)]
+my.tree_or_eStage <- se$Estage[order.dendrogram(my.dend)]
+my.tree_or_Barcode <- se$Barcode[order.dendrogram(my.dend)]
+
+
+df_order <- data.frame(
+  TreeLab = my.dend %>% labels(),
+  Clust = my.tree_or2,
+  Clust_fine = my.tree_or3,
+  FACS = my.tree_or_facs,
+  Estage = my.tree_or_eStage,
+  Barcode = my.tree_or_Barcode
+  ) %>%
+  dplyr::arrange(Clust_fine)
+
+pal.YS_clust_simple_dupe <- pal.YS_clust_simple
+
+cols <- pal.YS_clust_simple[c(3, 4, 5, 1, 2)]
+dend2 <- branches_attr_by_clusters(my.dend, my.tree_or2, values = cols) %>%
+  set("labels_col", "black") %>%
+  rotate(as.character(df_order$TreeLab)) 
+#plot(dend2)
+
+
+df_order2 <- data.frame(
+  TreeLab = dend2 %>% labels()
+) %>%
+  left_join(df_order)
+
+UniqClus <- unique(df_order2$Clust)
+
+
+pdf(file.path(outDir_noLMP, "Dend_reOrder.pdf"),height = 4, width = 12)
+plot(dend2)
+plot(UniqClus, ylim = c(-1, length(UniqClus)))
+text(x =1:length(UniqClus), y=-1, UniqClus)
+
+dev.off()
+
+
+# Specific colours
+pal.YS_basic_1 <- c(pal.YS_basic[1], rep("#FFFFFF", 3)) # Only endo
+pal.YS_basic_2 <- c(rep("#FFFFFF", 1), pal.YS_basic[2], rep("#FFFFFF", 2)) # Only HE
+pal.YS_basic_3 <- c(rep("#FFFFFF", 2), pal.YS_basic[3], rep("#FFFFFF", 1)) # Only EMP
+pal.YS_basic_4 <- c(rep("#FFFFFF", 3), pal.YS_basic[4]) # Only LMP
+
+
+# Lets put a coloured bar under the tree
+c.clust <- pal.YS_clust_simple[df_order$Clust] # Cluster colour
+c.eStage <- df_pal_eStg$Col[df_order$Estage] # FACS colour
+c.FACS <- pal.YS_basic[df_order$FACS] # FACS colour all population
+c.FACS_1 <- pal.YS_basic_1[df_order$FACS] # FACS colour all population
+c.FACS_2 <- pal.YS_basic_2[df_order$FACS] 
+c.FACS_3 <- pal.YS_basic_3[df_order$FACS] 
+c.FACS_4 <- pal.YS_basic_4[df_order$FACS] 
+
+pdf(file.path(outDir_noLMP, "Dend_reOrder.pdf"),height = 4, width = 12)
+plot(dend2)
+
+#colored_bars(c.eStage, dend2, sort_by_labels_order = FALSE, y_shift=10) # Colour eStage
+#colored_bars(c.FACS, dend2, sort_by_labels_order = FALSE, y_shift=-200) # Colour all FACs
+
+colored_bars(c.clust, dend2, sort_by_labels_order = FALSE, y_shift=10)
+colored_bars(c.FACS_1, dend2, sort_by_labels_order = FALSE, y_shift=-100)
+colored_bars(c.FACS_2, dend2, sort_by_labels_order = FALSE, y_shift=-200)
+colored_bars(c.FACS_3, dend2, sort_by_labels_order = FALSE, y_shift=-300)
+colored_bars(c.FACS_4, dend2, sort_by_labels_order = FALSE, y_shift=-400)
+
+plot(UniqClus, ylim = c(-1, length(UniqClus)))
+text(x =1:length(UniqClus), y=-1, UniqClus)
+
+dev.off()
+```
+
+
+#### Heatmap 
+
+Lets make a heatmap. We use a set of known genes. Read the gene list into R.
+
+```{r}
+gene_df <- readxl::read_excel(file.path(dataDir, "Others/Genes_edit_v2.xlsx"))
+gene_df <- as.data.frame(gene_df)
+gene_x <- gene_df %>%
+  # Make the first letter of the gene capital  
+  dplyr::mutate(Gene = mapply(simpleCap, Gene)) 
+row.names(gene_x) <- gene_x$Gene
+gene_x <- dplyr::select(gene_x, Class) 
+
+
+#gene_df <- readxl::read_excel(file.path(dataDir, "Others/Genes_edit.xlsx"))
+#gene_df <- as.data.frame(gene_df)
+#gene_x <- gene_df %>%
+#  # Make the first letter of the gene capital  
+#  dplyr::mutate(Gene = mapply(simpleCap, Gene)) %>%
+#  dplyr::distinct(.keep_all = TRUE)
+#row.names(gene_x) <- gene_x$Gene
+#gene_x <- dplyr::select(gene_x, Class) 
+```
+
+
+Processing to draw heatmap. Note want to maintain the order in the dendogram
+
+```{r}
+# Extract expression
+EXP <-  assay(se, "logcounts")
+selGene <- row.names(EXP)[row.names(EXP) %in% row.names(gene_x)]
+EXP <- EXP[selGene,]
+EXP <- as.matrix(EXP)
+colnames(EXP) <- se$Barcode
+EXP <- EXP[gene_df$Gene,df_order2$Barcode]
+
+# --------- Details for heatmap ------------- #
+# Gene colour (endo / hemto)
+colGene <- paletteer_d(palette = "ggthemes::wsj_dem_rep", n = 2)
+# Expression colour
+mycolor2 <- as.vector(paletteer_c(palette = "viridis::cividis", n = 255))
+
+# Columns (Population colour)
+# This does not have to be ordered. can use any metadata
+ann_col <- data.frame(Cell = df_order2$Barcode,
+                      Cluster = paste0("k",df_order2$Clust),
+                      FACS = df_order2$FACS,
+                      Estage = df_order2$Estage)
+row.names(ann_col) <- ann_col$Cell
+ann_col <- dplyr::select(ann_col, Cluster:Estage)
+
+
+# Specify colours
+pal.Estage <- c("#F7DC05", "#EC0B88", "#5E35B1")
+ann_list <- list(Cluster = 
+                   c("k1" = pal.YS_clust_simple[1],
+                     "k2" = pal.YS_clust_simple[2],
+                     "k3" = pal.YS_clust_simple[3],
+                     "k4" = pal.YS_clust_simple[4],
+                     "k5" = pal.YS_clust_simple[5]),
+                 FACS = 
+                   c("Endo" = pal.YS_basic[1],
+                     "HE" = pal.YS_basic[2],
+                     "EMP" = pal.YS_basic[3],
+                     "LMP" = pal.YS_basic[4]),
+                 Stage = 
+                   c("E9.0" = pal.Estage[1],
+                     "E9.5" = pal.Estage[2],
+                     "E10.5" = pal.Estage[3]),
+                 Class = 
+                   c("Endo" = "#006a8e",
+                     "Hema" =  "#b1283a"))
+
+# Find lenth of each cluster (how many cells in each cluster)
+l_clus <- as.vector(table(ann_col$Cluster))
+l_clus <- cumsum(l_clus) # Get the cummulative sum
+
+
+# ------ Scale expression mattrix -------- #
+# A way to normalise the data
+mat2 = t(apply(EXP, 1, function(x) {
+    q10 = quantile(x, 0.1)
+    q90 = quantile(x, 0.9)
+    x[x < q10] = q10
+    x[x > q90] = q90
+    scale(x)
+}))
+colnames(mat2) <- colnames(EXP)
+# Some NA because of the normalisation, so we remove them
+x <- mat2[,1]
+y <- x[is.na(x)]
+mat22 <- mat2[!row.names(mat2) %in% names(y),]
+
+
+# -------- Plot heatmap ------------- #
+pdf(file.path(outDir_noLMP, "Heatmap_CustomGenes.pdf"), width = 11, height = 4.5)
+pheatmap(mat22,
+         cluster_rows = FALSE, 
+         cluster_cols = FALSE,
+
+         col=mycolor2,
+         key=TRUE, keysize = 1.5, 
+         density.info = "none",
+         trace="none",
+        
+         annotation_row = gene_x,
+         annotation_col = ann_col,
+         annotation_colors = ann_list,
+         gaps_col = l_clus,
+         
+         symkey=FALSE, scale="none",
+         show_colnames =F,
+         show_rownames = T,
+         fontsize_row = 5,
+         width = 6,
+         height = 5)
+dev.off()
+```
+
+
+### Nice Vis
+
+We make a nicer UMAP for publication
+
+```{r,eval=FALSE}
+umap.df.int <- umap.df.int %>%
+  dplyr::mutate(Estage = gsub("_Endo", "", condition),
+                Estage = gsub("_HE.*", "", Estage),
+                Estage = gsub("_EMP.*", "", Estage),
+                Estage = gsub("_LMP.*", "", Estage),
+                Estage = gsub("YS_", "", Estage),
+                Estage_fac = case_when(Estage == "E9.0" ~ "g1",
+                                       Estage == "E9.5" ~ "g2",
+                                       Estage == "E10" ~ "g3",
+                                       Estage == "E10.5" ~ "g3"),
+                Cond_fac = gsub(".*_Endo", "Endo", condition),
+                Cond_fac = gsub(".*Kneg", "Kneg", Cond_fac),
+                Cond_fac = gsub(".*_HE.*", "HE", Cond_fac),
+                Cond_fac = gsub(".*_EMP", "EMP", Cond_fac),
+                Cond_fac = gsub(".*_LMP", "LMP", Cond_fac),
+                Cond_fac = factor(Cond_fac, levels = c("Endo", "Kneg", "HE", "EMP", "LMP"))
+                )
+
+pal.YS <- c(
+  
+  rep("#4E79A7", 3), # Endo
+  #rep("#F28E2B", 3), # Kit Neg
+  rep("#D82526", 6), # Runx1 & GFi1
+  #rep("#69B764", 3), # Gfi1
+  rep("#7a0177", 2), # EMP
+  rep("#f768a1", 2) # LMP
+)
+  
+  
+p1 <-        
+  ggplot(umap.df.int, aes(x=UMAP_1, y=UMAP_2, colour=condition)) +
+  geom_point(size=1) +
+  gghighlight(use_direct_label = FALSE) +
+  theme_custom +
+  facet_wrap( Cond_fac ~ Estage_fac, ncol=3) +
+   theme(
+    axis.text = element_blank(),
+    axis.ticks = element_blank(),
+    legend.position = "none") +
+  scale_colour_manual(values=pal.YS) + 
+  #scale_colour_manual(values=tableau20) + 
+  labs(title="Highlighting the FACS")
+
+p1
+
+pdf(file.path(outDir_noLMP, "facet_eStage_pop.pdf"), height=10, width = 14)
+p1
+dev.off()
+
+ggsave(filename = file.path(outDir_noLMP, "facet_eStage_pop2.pdf"), device = "pdf", width = 8, height = 12, dpi = 300)
+
+```
+
+Nicer UMAP. Showing the FACS
+
+```{r}
+umap.df.int <- umap.df.int %>%
+  dplyr::mutate(Estage_Cond = paste(Estage, Cond_fac, sep="_"),
+                Estage_Cond = factor(Estage_Cond, levels=
+                  c(
+                    "E9.0_Endo", "E9.5_Endo", "E10.5_Endo",
+                    "E9.0_HE", "E9.5_HE", "E10.5_HE",
+                    "E9.5_EMP","E10.5_EMP",
+                    "E9.5_LMP","E10.5_LMP"
+                    )))
+
+p1 <-        
+  ggplot(umap.df.int, aes(x=UMAP_1, y=UMAP_2, colour=Estage)) +
+  geom_point(size=1) +
+  gghighlight(use_direct_label = FALSE) +
+  theme_custom +
+  facet_wrap(~Cond_fac, ncol=2) +
+  theme(
+    axis.text = element_blank(),
+    axis.ticks = element_blank(),
+    legend.position = "right") +
+  scale_colour_manual(values=df_pal_eStg$Col) + 
+  labs(title="Highlighting the FACS")
+
+ggsave(filename = file.path(outDir_noLMP, "facet_FACSmain_eStage.pdf"), device = "pdf", width = 8, height = 7, dpi = 300)
+```
+
+
+
+Show and group clusters
+
+```{r,eval=FALSE}
+umap.df.int <- umap.df.int %>%
+  dplyr::mutate(ClusGroup = 
+                  case_when(TreeCut == "k_02" ~ "g1",
+                            TreeCut == "k_04" ~ "g1",
+                            TreeCut == "k_05" ~ "g1",
+                            TreeCut == "k_08" ~ "g2",
+                            TreeCut == "k_03" ~ "g2",
+                            TreeCut == "k_06" ~ "g2",
+                            TreeCut == "k_07" ~ "g2",
+                            TreeCut == "k_09" ~ "g3",
+                            TreeCut == "k_01" ~ "g3",
+                            ))
+
+p2 <-        
+  ggplot(umap.df.int, aes(x=UMAP_1, y=UMAP_2, colour=TreeCut)) +
+  geom_point() +
+  gghighlight(use_direct_label = FALSE) +
+  theme(legend.position = "right") +
+  facet_wrap(~ ClusGroup, ncol=3) +
+  theme_custom +
+  #scale_colour_manual(values=g_hue) + 
+  #scale_colour_manual(values=tableau20) + 
+  labs(title="Highlighting the cluster")
+
+
+pdf(file.path(outDir_noLMP, "facet_TreeCluster.pdf"), height=3, width = 6)
+p2
+dev.off()
+
+```
+Show the Graph based clustering
+
+```{r,eval=FALSE}
+pal.YS_clus <- c(
+  "#225ea8", "#A0CBE8", # Blue
+  "#F28E2B", "#FFBE7D", "#F1CE63", # Orange-sh
+  "#919C4C", "#C3C377","#BD8A4C", # 6-8 (Green)
+  "#D4A6C8", "#631879", "#A20056" # Pink
+  )
+
+pal.YS_clus <- c(
+  "#225ea8", "#A0CBE8", # Blue
+  "#F28E2B", "#FFBE7D", # Orange-sh
+  "#919C4C", "#C3C377","#BD8A4C", # 6-8 (Green)
+  "#D4A6C8", "#631879", "#A20056" # Pink
+  )
+
+p2 <-        
+  ggplot(umap.df.int, aes(x=UMAP_1, y=UMAP_2, colour=GraphBased)) +
+  geom_point() +
+  gghighlight(use_direct_label = FALSE) +
+  theme(legend.position = "right") +
+  #facet_wrap(~ ClusGroup, ncol=3) +
+  theme_custom +
+  scale_colour_manual(values=pal.YS_clus) + 
+  #scale_colour_manual(values=tableau20) + 
+  labs(title="Highlighting the cluster")
+
+
+# Add text to the plot
+clust_data <- umap.df.int %>%
+  group_by(GraphBased) %>%
+  dplyr::summarise(UMAP_1 = mean(UMAP_1),
+                   UMAP_2 = mean(UMAP_2))
+
+p2.1 <- p2 +
+  geom_point(data = clust_data, aes(fill = GraphBased),
+                 size = 10, shape = 21, colour = "white") +
+      scale_fill_manual(values = pal.YS_clus) +
+      geom_text(data = clust_data, aes(label = GraphBased),
+                colour = "black") +
+  theme(legend.position = "none") 
+
+p2.1
+
+ggsave(filename = file.path(outDir_noLMP, "UMAP_GraphCluster.pdf"), device = "pdf", width = 7, height = 4.5, dpi = 300)
+```
+
+Show the Tree cut
+
+```{r}
+pal.YS_clus <- c(
+  "#225ea8", "#A0CBE8", # Blue
+  "#F28E2B", "#FFBE7D", "#F1CE63", # Orange-sh
+  "#919C4C", "#C3C377","#BD8A4C", # 6-8 (Green)
+  "#D4A6C8", "#631879", "#A20056" # Pink
+  )
+
+pal.YS_clus <- c(
+  "#225ea8", "#A0CBE8", # Blue
+  "#F28E2B", "#FFBE7D", # Orange-sh
+  "#919C4C", "#C3C377","#BD8A4C", # 6-8 (Green)
+  "#D4A6C8", "#631879", "#A20056" # Pink
+  )
+
+
+p2 <-        
+  ggplot(umap.df.int, aes(x=UMAP_1, y=UMAP_2, colour=TreeCut_re)) +
+  geom_point() +
+  gghighlight(use_direct_label = FALSE) +
+  theme(legend.position = "right") +
+  theme_custom +
+  scale_colour_manual(values=pal.YS_clust_simple) + 
+  theme(
+     panel.grid  = element_blank(),
+     axis.ticks = element_blank(),
+     panel.background = element_blank(),
+     panel.border = element_rect(colour = "grey30", fill=NA, size=0.5),
+     strip.background = element_rect(fill="white", colour = "white"),
+     axis.text = element_blank(),
+     axis.title  = element_blank(),
+     legend.position = "none") + 
+  NULL
+
+  
+
+
+# Add text to the plot
+clust_data <- umap.df.int %>%
+  group_by(TreeCut_re) %>%
+  dplyr::summarise(UMAP_1 = mean(UMAP_1),
+                   UMAP_2 = mean(UMAP_2))
+
+p2.1 <- p2 +
+  geom_point(data = clust_data, aes(fill = TreeCut_re),
+                 size = 10, shape = 21, colour = "white") +
+      scale_fill_manual(values = pal.YS_clust_simple) +
+      geom_text(data = clust_data, aes(label = TreeCut_re),
+                colour = "black") +
+  theme(legend.position = "none") 
+
+p2.1
+
+# 35w 25h
+ggsave(p2, filename = file.path(outDir_noLMP, "UMAP_TreeCut.pdf"), device = "pdf", width = 6, height = 4, dpi = 300)
+```
+
+We can show in a hull plot
+
+```{r,eval=FALSE}
+p_hull_1 <-
+ggplot(umap.df.int, aes(x = UMAP_1, y = UMAP_2)) +
+  geom_mark_hull(
+    aes(fill=TreeCut_re, label=TreeCut_re), 
+    alpha=0.5,
+    concavity=10, expand = unit(2, "mm"), radius = unit(1, "mm")) +
+  geom_point(size = 0.5, colour = "grey50") +
+  scale_fill_manual(values = pal.YS_clust_simple) +
+  theme_void() +
+  theme(legend.position = "none") +
+  NULL
+p_hull_1
+
+ggsave(filename = file.path(outDir_inHouse6_scater_outlier, "GraphCluster_hull1.pdf"), device = "pdf", width = 7, height = 5, dpi = 300)
+p_hull_2 <-
+  ggplot(umap.df.int, aes(x = UMAP_1, y = UMAP_2)) +
+  geom_mark_hull(
+    aes(fill=GraphBased, label=GraphBased), 
+    alpha=0.0,
+    concavity=20, expand = unit(1, "mm"), radius = unit(1, "mm")) +
+  geom_point(size = 2, aes(colour = GraphBased)) +
+  scale_colour_manual(values = pal.YS_clus) +
+  theme_void() +
+  theme(legend.position = "none") +
+  NULL
+p_hull_2
+ggsave(filename = file.path(outDir_inHouse6_scater_outlier, "GraphCluster_hull2.pdf"), device = "pdf", width = 7, height = 5, dpi = 300)
+```
+
+### Proportion
+
+
+Show proportion as density plot (FACS like)
+
+```{r}
+p1 <-
+  ggplot(
+  umap.df.int,
+  #dplyr::filter(umap.df.int, TreeCut_re == "k_2"),
+  aes(UMAP_1, UMAP_2)) + 
+  #geom_density_2d(aes(colour = Estage)) +
+  geom_density_2d_filled(contour_var = "ndensity") + 
+  facet_wrap(TreeCut_re ~ Estage, ncol=3) +
+  theme_custom +
+  NULL
+
+umap.df.int_tmp <- umap.df.int %>%
+  dplyr::mutate(TreeCut_re = as.character(TreeCut_re),
+                Estage = as.character(Estage)) %>%
+  dplyr::mutate(Estage = 
+                  case_when(
+                    TreeCut_re %in% c("k_1", "k_2","k_3", "k_4", "k_5")  ~ "E1",
+                    TRUE ~ Estage))
+p2 <-
+  ggplot(
+  umap.df.int_tmp,
+  #dplyr::filter(umap.df.int, TreeCut_re == "k_2"),
+  aes(UMAP_1, UMAP_2)) + 
+  #geom_density_2d(aes(colour = Estage)) +
+  geom_density_2d_filled(contour_var = "ndensity") + 
+  facet_wrap(TreeCut_re ~ Estage, ncol=3) +
+  theme_custom +
+  geom_mark_hull(
+    aes(fill=TreeCut_re, label=TreeCut_re), 
+    alpha=0.5,
+    concavity=10, expand = unit(2, "mm"), radius = unit(1, "mm")) +
+  #scale_colour_manual(values = pal.YS_clus) +
+  NULL
+
+pdf(file.path(outDir_noLMP, "Density_Estage.pdf"), width = 9, height = 7)
+p1
+p2
+dev.off()
+
+```
+
+
+
+Show proportion of cells in each cluster 
+
+```{r}
+meta = umap.df.int %>%
+  dplyr::mutate(
+    Cond_simple =   gsub("HE_Gfi1", "HE", condition),
+    Cond_simple =   gsub("HE_Runx1", "HE", Cond_simple),
+    Cond_simple =   gsub("HE_Kneg", "HE_Gfi1_Kneg", Cond_simple))
+
+tmp.pal <- df.col_FACS_simp %>%
+  dplyr::filter(FACS %in% meta$Cond_simple) #%>%
+  #pull(Pal)
+
+meta <- meta %>%
+  dplyr::mutate(Cond_simple = factor(Cond_simple, levels=tmp.pal$FACS))
+
+pal.YS <- c(
+  
+  rep("#4E79A7", 3), # Endo
+  #rep("#F28E2B", 3), # Kit Neg
+  rep("#D82526", 3), # Runx1 & GFi1
+  #rep("#69B764", 3), # Gfi1
+  rep("#7a0177", 2), # EMP
+  rep("#f768a1", 2) # LMP
+)
+
+# Proportion by FACS
+stat1 <- 
+  meta %>% 
+  dplyr::group_by(TreeCut_re, Cond_simple) %>% 
+  dplyr::summarise(count=n()) %>% 
+  dplyr::mutate(perc=(count/sum(count)*100)) %>%
+  dplyr::mutate(eDay = gsub("YS_", "", Cond_simple),
+                eDay = gsub("_.*", "", eDay),
+                eDay = factor(eDay, levels = c("E9.0", "E9.5", "E10", "E10.5"))) 
+
+ggplot(stat1, aes(x = TreeCut_re, y = perc, fill = Cond_simple, 
+                  colour=eDay, linetype=eDay,
+                  label = round(perc, 0))) +
+  geom_bar(stat="identity", width = 0.5) +
+  geom_text(size = 4, position = position_stack(vjust = 0.5)) +
+  #scale_fill_manual(values = tmp.pal$Pal) +
+  scale_fill_manual(values = pal.YS) +
+  scale_colour_manual(values=c("black", "grey20", "grey50", "black")) +
+  scale_linetype_manual(values=c("blank", "solid", "solid", "longdash")) +
+  labs(x="Cluster", y="Percentage", fill="FACS") +
+   theme(
+     panel.grid.minor = element_blank(),
+     panel.grid.major = element_blank(),
+     panel.background = element_blank(),
+     panel.border = element_rect(colour = "grey30", fill=NA, size=0.5),
+     strip.background = element_rect(fill="white", colour = "white"),
+     legend.position = "right") + 
+  #coord_flip() +
+  NULL
+
+# 75w 20h if flip, opposite if not 
+#ggsave(filename = file.path(outDir_inHouse6_scater_outlier, "BarChart_cluster.pdf"), device = "pdf", width = 12, height = 5, dpi = 300)
+ggsave(filename = file.path(outDir_noLMP, "BarChart_cluster.pdf"), device = "pdf", width = 6, height = 9, dpi = 300)
+```
+
+Show proportion of cells in each FACS 
+
+```{r,eval=TRUE}
+#meta = umap.df.int
+
+tmp.pal <- df.col_FACS_simp %>%
+  dplyr::filter(FACS %in% meta$Cond_simple) %>%
+  pull(Pal)
+
+# Proportion by FACS
+stat1 <- 
+  meta %>% 
+  #dplyr::filter(TreeCut_re == "k_2") %>%
+  dplyr::group_by(Cond_simple, TreeCut_re) %>% 
+  dplyr::summarise(count=n()) %>% 
+  dplyr::mutate(perc=(count/sum(count)*100)) %>%
+  dplyr::mutate(eDay = gsub("YS_", "", Cond_simple),
+                eDay = gsub("_.*", "", eDay),
+                eDay = factor(eDay, levels = c("E9.0", "E9.5", "E10", "E10.5"))) 
+
+ggplot(stat1, aes(x = Cond_simple, y = perc, fill = TreeCut_re, 
+                  #colour=condition,
+                  label = round(perc, 0))) +
+  geom_bar(stat="identity", width = 0.5) +
+  geom_text(size = 4, position = position_stack(vjust = 0.5)) +
+  #scale_fill_manual(values = tmp.pal) +
+  scale_fill_manual(values = pal.YS_clust_simple) +
+  scale_colour_manual(values=c(pal.YS)) +
+  #scale_linetype_manual(values=c("blank", "solid", "solid", "longdash")) +
+  labs(x="Cluster", y="Percentage", fill="FACS") +
+   theme(
+     panel.grid.minor = element_blank(),
+     panel.grid.major = element_blank(),
+     panel.background = element_blank(),
+     panel.border = element_rect(colour = "grey30", fill=NA, size=0.5),
+     strip.background = element_rect(fill="white", colour = "white"),
+     axis.text.x= element_text(angle = 45),
+     legend.position = "right") + 
+  #coord_flip() +
+  NULL
+
+# 75w 20h if flip, opposite if not 
+ggsave(filename = file.path(outDir_noLMP, "BarChart_FACS.pdf"), device = "pdf", width = 12, height = 9, dpi = 300)
+```
+
+Proportion as bar chart, not stacked
+
+```{r}
+ggplot(stat1, aes(x = TreeCut_re, y = perc, fill = TreeCut_re,
+                  label = round(perc, 0))) +
+  geom_bar(stat="identity", width = 0.5) +
+  facet_wrap(~Cond_simple) +
+  #geom_text(size = 4, position = position_stack(vjust = 0.5)) +
+  geom_text(size = 4) +
+  scale_fill_manual(values = pal.YS_clust_simple) +
+  labs(x="Cluster", y="Percentage", fill="Cluster") +
+   theme(
+     panel.grid.minor = element_blank(),
+     panel.grid.major = element_blank(),
+     panel.background = element_blank(),
+     panel.border = element_rect(colour = "grey30", fill=NA, size=0.5),
+     strip.background = element_rect(fill="white", colour = "white"),
+     legend.position = "right") + 
+  #coord_flip() +
+  NULL
+
+ggsave(filename = file.path(outDir_noLMP, "BarChart_facet_FACS.pdf"), device = "pdf", width = 12, height = 8, dpi = 300)
+```
+
+
+
+## Marker gene
+
+We stick with *Tree based clusters*
+
+We find the marker gene in each clusters. Seurat is a more suitable approach to find genes associated with clusters
+
+
+
+```{r}
+inhouse.combined <- merge(seuset_nova, y = seuset_next, add.cell.ids = c("nova", "next"), project = "inhouse")
+```
+
+Do normal processing
+
+```{r}
+seuset <- inhouse.combined
+seuset <- seuset[,seuset$Barcode %in% se$Barcode ]
+
+# Match the order
+dd <- seuset[[]]
+cD <- as.data.frame(colData(se)) %>%
+  dplyr::select(Barcode,TreeCut_re, GraphBased )
+
+dd <- dd %>%
+  dplyr::left_join(cD)
+
+seuset$GraphBased <- factor(dd$GraphBased, levels=paste0("g_", sprintf("%02d",1:length(unique(dd$GraphBased)))))
+seuset$TreeCut_re <- factor(dd$TreeCut_re, levels=paste0("k_", sprintf("%01d",1:length(unique(dd$TreeCut_re)))))
+```
+
+Do normal processing
+
+
+```{r}
+seuset <- NormalizeData(seuset)
+# Feature selections
+seuset <- 
+  FindVariableFeatures(object = seuset, selection.method = "vst", nfeatures = 2500)
+# Scaling the data
+all.genes <- rownames(x = seuset)
+seuset <- CellCycleScoring(seuset, s.features = s.genes, g2m.features = g2m.genes, set.ident = FALSE)
+
+# Add either originated from nova or next
+Seq_name <- colnames(seuset)
+Seq_name <- gsub("_.*", "", Seq_name)
+seuset$Sequencer <- Seq_name
+
+# Dont need to regress anything at this stage as we only want to remove the tech rep and outlier
+seuset <- ScaleData(seuset, 
+                    #vars.to.regress = c("S.Score", "G2M.Score", "Sequencer"), 
+                    features = rownames(seuset))
+seuset <- RunPCA(seuset, verbose = FALSE)
+seuset <- RunUMAP(seuset, dims = 1:30, verbose = FALSE, min.dist = 0.4)
+
+seuset <- FindNeighbors(seuset, dims = 1:30, verbose = FALSE)
+seuset <- FindClusters(seuset, verbose = FALSE)
+
+
+```
+
+Show the UMAP plot
+
+```{r}
+DimPlot(seuset)
+
+ggsave(filename = file.path(outDir_noLMP, "Seurat_UMAP_clusterSeu.pdf"), device = "pdf", width = 7, height = 5, dpi = 300)
+
+```
+Another one
+
+```{r}
+Idents(seuset) <- seuset$TreeCut_re
+DimPlot(seuset)
+
+ggsave(filename = file.path(outDir_noLMP, "Seurat_UMAP_clusterTreeCut.pdf"), device = "pdf", width = 7, height = 5, dpi = 300)
+```
+
+
+```{r}
+dd2 <- dd %>%
+  mutate(seurat_clusters = seuset$seurat_clusters)
+row.names(dd2) <- dd2$Barcode
+dd2 <- dd2[se$Barcode,]
+
+se$seurat_clusters <- dd2$seurat_clusters
+```
+
+Plot
+
+```{r}
+umap.df.int$seurat_clusters <- dd2$seurat_clusters
+
+p2 <-        
+  ggplot(umap.df.int, aes(x=UMAP_1, y=UMAP_2, colour=seurat_clusters)) +
+  geom_point() +
+  gghighlight(use_direct_label = FALSE) +
+  theme(legend.position = "right") +
+  #facet_wrap(~ ClusGroup, ncol=3) +
+  theme_custom +
+  scale_colour_manual(values=pal.YS_clus) + 
+  #scale_colour_manual(values=tableau20) + 
+  labs(title="Highlighting the cluster")
+
+
+# Add text to the plot
+clust_data <- umap.df.int %>%
+  group_by(seurat_clusters) %>%
+  dplyr::summarise(UMAP_1 = mean(UMAP_1),
+                   UMAP_2 = mean(UMAP_2))
+
+p2.1 <- p2 +
+  geom_point(data = clust_data, aes(fill = seurat_clusters),
+                 size = 10, shape = 21, colour = "white") +
+      scale_fill_manual(values = pal.YS_clus) +
+      geom_text(data = clust_data, aes(label = seurat_clusters),
+                colour = "black") +
+  theme(legend.position = "none") 
+
+p2.1
+
+
+ggsave(filename = file.path(outDir_noLMP, "UMAP_SeuratCluster.pdf"), device = "pdf", width = 7, height = 6, dpi = 300)
+```
+
+
+
+Find marker genes 
+
+```{r}
+su.markers <- 
+  FindAllMarkers(seuset, only.pos = TRUE, min.pct = 0.25, logfc.threshold = 0.25)
+
+su.markers <- su.markers %>%
+  dplyr::mutate(isCS = ifelse(gene %in% df_cs$gene_name, "CS", "notCS"))
+
+write.csv(su.markers, file.path(outDir_noLMP, "SeuratMarkers_TreeCut.csv"))
+```
+
+
+Plot a dot plot of the top genes
+
+```{r}
+top10 <- su.markers %>% dplyr::group_by(cluster) %>% top_n(n = 10, wt = avg_log2FC)
+
+pdf(file.path(outDir_noLMP, "DotPlot.pdf"), height = 12, width = 9)
+DotPlot(seuset,features=unique(top10$gene)) + coord_flip()  + 
+  theme(axis.text.y = element_text(size = 9)) +
+  scale_colour_gradient2(low = "#FF00FF", mid = "#000000", high = "#FFFF00") 
+dev.off()
+
+
+pdf(file.path(outDir_noLMP, "Heatmap.pdf"), height = 12, width = 15)
+DoHeatmap(seuset,features=unique(top10$gene), raster = FALSE)  
+  #theme(axis.text.y = element_text(size = 9)) +
+  #scale_colour_gradient2(low = "#FF00FF", mid = "#000000", high = "#FFFF00") 
+dev.off()
+```
+
+Specific DE
+
+```{r}
+su.markers2 <- 
+  FindMarkers(seuset, only.pos = FALSE, 
+              ident.1 = c("k_4"), # EMP
+              ident.2 = c("k_5"), # LMP
+              min.pct = 0.25, logfc.threshold = 0.25) %>%
+  tibble::rownames_to_column(var = "gene") %>%
+  dplyr::mutate(isCS = ifelse(gene %in% df_cs$gene_name, "CS", "notCS"))
+
+write.csv(su.markers2, file.path(outDir_noLMP, "SeuratMarkers_k4_EMP_vs_k6_LMP.csv"))
+```
+
+
+
+## Violin plot
+
+
+Lets view the expression of selected genes 
+
+
+```{r}
+# Plot kit expression
+plotUMAP(se, colour_by="Kit") +
+  scale_fill_viridis(option = "plasma", na.value = "grey80", begin = 0, end = 0.9)
+
+se$Cond_fac <- umap.df.int$Cond_fac
+
+expInt <- assay(se, "logcounts")["Kit",]
+m <- as.data.frame(expInt)
+
+
+df_plot <- umap.df.int %>%
+  mutate(Gene = m$expInt) %>%
+  mutate(xLab = paste(Estage_fac, Cond_fac, sep="_"),
+         xLab = factor(xLab, levels=
+                         c("g1_Endo", "g2_Endo", "g3_Endo",
+                           #"g1_Kneg", "g2_Kneg", "g3_Kneg",
+                           "g1_HE", "g2_HE", "g3_HE",
+                           "g2_EMP", "g3_EMP",
+                           "g2_LMP", "g3_LMP"
+                           )))
+pal.YS <- c(
+  
+  rep("#4E79A7", 3), # Endo
+  #rep("#F28E2B", 3), # Kit Neg
+  rep("#D82526", 3), # Runx1 & GFi1
+  #rep("#69B764", 3), # Gfi1
+  rep("#7a0177", 2), # EMP
+  rep("#f768a1", 2) # LMP
+)
+
+p_viol_gene <- 
+  df_plot %>%
+  ggplot(aes(x = xLab, y = Gene, fill = Cond_fac)) +
+  geom_violin(alpha = 0.5, scale = "width", position = position_dodge(width = 0.9)) +
+  geom_boxplot(alpha = 0.5, width = 0.2, position = position_dodge(width = 0.9)) +
+  scale_fill_manual(values=unique(pal.YS)) +
+  theme_bw() +
+  theme(legend.position = "none",
+        panel.grid.major = element_line(linetype = "blank"), 
+        panel.grid.minor = element_line(linetype = "blank"),
+        axis.text.x = element_text(angle = 45, hjust = 1)) +
+  scale_y_continuous(limits = c(0,12),
+                     breaks = c(0,5,10)) +
+  xlab("") +
+  NULL
+
+pdf(file.path(outDir_noLMP, "Kit_exp.pdf"),height = 3, width = 6)
+p_viol_gene
+dev.off()
+```
+
+Nicer UMAP plot
+
+```{r}
+geneDir <- file.path(outDir_noLMP, "gene_exp")
+dir.create(geneDir)
+```
+
+#### Gene plots
+
+```{r}
+gg <- "Cdh5"
+expInt <- assay(se, "logcounts")[gg,]
+#exp2 <- sacle(expInt)
+#exp2 <- as.vector(exp2)
+df_plot <- umap.df.int %>%
+  mutate(gene = expInt)
+
+ggplot(df_plot, aes(x=UMAP_1, y=UMAP_2, colour=gene)) +
+  geom_point() +
+  theme_custom +
+  theme(axis.text = element_blank(),
+        axis.ticks = element_blank(),
+        axis.title = element_blank(),
+        legend.position = "none") +
+  scale_colour_viridis(option = "plasma", na.value = "grey80", begin = 0, end = 1) +
+  NULL
+
+ggsave(filename = file.path(geneDir, paste0(gg, "_UMAP_noPlat.png")), device = "png", width = 6, height = 4, dpi = 300)
+```
+
+Viol plot one gene
+
+```{r}
+plotViolin_colByCluster(se, "Tuba4a", "TreeCut_re")
+```
+
+
+### Multiple genes
+
+We show violin plot of mulitple genes
+
+
+e make a violin plot of genes expressed in each cluster
+
+```{r}
+geneToPlot <- c(
+
+  "Runx1",
+  "Gfi1",
+  
+  "Gfi1b",
+  "Itga2b",
+  "Itgb3",
+  "Ptprc",
+  
+  "Epor",
+  "Mpl",
+  "Rgs18",
+  "Pf4",
+  
+  
+  "Mpo",
+  "Il7r")
+
+
+geneToPlot <- c(
+
+  "Lyve1",
+
+  "Runx1",
+  "Gfi1",
+  
+  "Gfi1b",
+  #"Rgs18",
+  "Itga2b",
+  "Itgb3",
+  "Ptprc",
+  
+  "Il7r",
+  "Ighm",
+  
+  "Epor",
+  "Mpl",
+  "Pf4")
+
+
+geneToPlot <- c(
+
+  "Pecam1",
+  "Cdh5",
+  "Kdr",
+  "Procr",
+  
+  "Runx1",
+  "Myb",
+  
+  "Ptprc",
+  "Gfi1b"
+  )
+
+geneToPlot <- row.names(se)[grep("Fcg", row.names(se))]
+```
+
+Lets try to make a nice violin plot of these genes
+
+```{r}
+setmp <- se
+setmp$finalCluster2 <- setmp$TreeCut_re
+pal <- pal.YS_clust_simple
+expInt <- assay(setmp, "logcounts")[geneToPlot,]
+m <- as.data.frame(expInt)
+colnames(m) <- setmp$Barcode
+m$gene <- row.names(m)
+m <- melt(m)
+m$gene <- factor(m$gene, levels=geneToPlot)
+dftmp <- as.data.frame(colData(setmp)) 
+cD_sub <- dftmp %>%
+  dplyr::select(Barcode, finalCluster2) # %>%
+#dplyr::filter(cell_cycle %in% "G1")
+m <- m %>%
+  dplyr::left_join(cD_sub, by = c("variable" = "Barcode"))
+# Plot
+p_viol_gene <- 
+  m %>%
+  ggplot(aes(x = finalCluster2, y = value, colour = finalCluster2)) +
+  geom_violin(fill=NA, scale="width") +
+    geom_quasirandom(groupOnX=TRUE, size = 0.8, alpha = 0.5, width = 0.4) +
+    stat_summary(fun.y = mean, fun.ymin = mean, fun.ymax = mean,
+                 geom = "crossbar", width = 0.3, alpha = 0.8, colour="black") +
+
+  facet_grid(gene ~ .) +
+  scale_colour_manual(values=pal) +
+  theme_bw() +
+  theme(legend.position = "none",
+        panel.grid.major = element_line(linetype = "blank"), 
+        panel.grid.minor = element_line(linetype = "blank"),
+        axis.text.x = element_text(angle = 45, hjust = 1)) +
+  scale_y_continuous(limits = c(0,15),
+                     breaks = c(0,5,10, 15)) +
+  xlab("") +
+  NULL
+
+# 45w 77h
+ggsave(filename = file.path(outDir_noLMP, "SelectedGenes.pdf"), device = "pdf", width = 6, height = 8, dpi = 300)
+```
+
+
+
+
+## EMP and LMP sig
+
+
+We derive our own EMP and LMP signature by comparing EMP and LMP. Use EdgeR for differential expression
+
+Frsit lets get detection rate in each of the population
+
+```{r}
+sde <- se
+cD <- as.data.frame(colData(sde))
+group <- as.character(cD$TreeCut_re)
+
+intrsPop <- c("k_4", "k_5")
+# Calculate detection in non-interested population
+sde_non <- sde[, !sde$TreeCut_re %in% intrsPop]
+
+# Calculate the dropout rate in the overall single cell object
+drp_all <- scater::perFeatureQCMetrics(sde) %>%
+  as.data.frame() %>%
+  tibble::rownames_to_column(var = "UniqGeneID") %>%
+  dplyr::rename(otherPop_detc = detected)
+
+# In the interested populations
+sde <- sde[, sde$TreeCut_re %in% intrsPop]
+
+p_list <- as.factor(unique(as.character(sde$TreeCut_re)))
+p_list <- levels(p_list)
+
+
+dpt_list <- list()
+
+# Find the percentage expressing gene per-cluster
+for (i in seq_along(p_list)){
+  x <- dropOut_treeCut(sde, p_list[i])
+  dpt_list[[i]] <- x
+}
+
+
+dpt_df <- as.data.frame(do.call(cbind, dpt_list))
+colnames(dpt_df) <- paste0("pct_detect_", p_list)
+dpt_df$UniqGeneID <- row.names(sde)
+
+# Join the two 
+drp_all <- drp_all %>%
+  dplyr::left_join(dpt_df)
+
+```
+
+Run DE
+
+```{r}
+
+# Set treshold for significance
+up_thresh <- 1.5
+dwn_thresh <- -1.5
+FDR_thresh <- 0.05
+
+# --- Without intercept ---- #
+# Set up the EdgeR object
+rD <- as.data.frame(rowData(sde))
+#sde2 <- sde[rD$gene_type == "protein_coding", ]
+sde2 <- sde
+group <- as.character(sde2$TreeCut_re)
+cts <- assay(sde2, "counts")
+
+
+dge <- DGEList(counts = cts, group =group)
+dge <- calcNormFactors(dge)
+
+# Do the DE
+design <- model.matrix(~0 + group, cD)
+vm <- voom(dge, design = design, plot = TRUE)
+fit <- lmFit(vm, design)
+contrast.matrix <- makeContrasts(groupk_5-groupk_4, levels=design)
+fit2 <- contrasts.fit(fit, contrast.matrix)
+fit2 <- eBayes(fit2)
+# We extract the DE genes in each comparison.
+dge_g1 <- 
+  topTable(fit2, n = Inf, adjust.method = "BH", coef=1) %>%
+  tibble::rownames_to_column(var = "UniqGeneID") %>%
+  dplyr::mutate(isTF = ifelse(UniqGeneID %in% tf_all2, "TF", "notTF"),
+                isCS = ifelse(UniqGeneID %in% df_cs$symbol, "CS", "notCS")) %>%
+  # Add drop-out rate
+  dplyr::left_join(drp_all) 
+
+dge_g1 <- dge_g1 %>%
+  dplyr::mutate(LogpValue = -log10(adj.P.Val)) %>%
+  # Make a significant col or not
+  dplyr::mutate(Sig = dge_g1$UniqGeneID %in% dge_g1_sub$UniqGeneID) 
+
+# Filter
+dge_g1_sub <- dge_g1 %>%
+  dplyr::filter(adj.P.Val < FDR_thresh) %>%
+  dplyr::filter(logFC >= up_thresh | logFC <= dwn_thresh)
+
+write.csv(dge_g1, file.path(outDir_noLMP, "DE_full_EMPk4_vs_LMPk5.csv"))
+write.csv(dge_g1_sub, file.path(outDir_noLMP, "DE_full_EMPk4_vs_LMPk5_filtered.csv"))
+
+table(dge_g1_sub$logFC > 1)
+```
+
+
+Generate a volcano plot
+
+
+```{r}
+
+pVol <- 
+ggplot(dge_g1, aes(y=LogpValue, x=logFC, colour=Sig)) +
+  geom_point(size=1, alpha=0.8) + 
+  scale_colour_manual(values=c("grey50", "red")) +
+  theme_bw() +
+  geom_vline(xintercept = up_thresh, linetype=2, alpha=0.3) +
+  geom_vline(xintercept = dwn_thresh, linetype=2, alpha=0.3) +
+  labs(y=expression(paste("-log"[10], " p-value")),
+       x=expression(paste("log"[2], " Fold Change"))) +
+  guides('colour'=guide_legend(title="Statistically significant")) +
+  theme(panel.grid.major = element_line(linetype = "blank"), 
+        panel.grid.minor = element_line(linetype = "blank")) +
+    #geom_text_repel(
+    #data = subset(LimmaVoom, logFC < dwn_thresh & isTF == "TF") +
+  NULL
+pVol
+
+# Label CS
+pVol <- 
+ggplot(dge_g1, aes(y=LogpValue, x=logFC, colour=Sig, label=UniqGeneID)) +
+  geom_point(size=1, alpha=0.8) + 
+  scale_colour_manual(values=c("grey50", "red")) +
+  theme_bw() +
+  geom_vline(xintercept = up_thresh, linetype=2, alpha=0.3) +
+  geom_vline(xintercept = dwn_thresh, linetype=2, alpha=0.3) +
+  labs(y=expression(paste("-log"[10], "p-value")),
+       x=expression(paste("log"[2], " Fold Change"))) +
+  guides('colour'=guide_legend(title="Statistically significant")) +
+  theme(panel.grid.major = element_line(linetype = "blank"), 
+        panel.grid.minor = element_line(linetype = "blank")) +
+    geom_text_repel(
+    data = base::subset(dge_g1, logFC < dwn_thresh & isCS == "CS")) +
+  NULL
+
+# Label top 10 genes
+top1 <- dge_g1_sub %>%
+  dplyr::filter(logFC > 1) %>%
+  dplyr::top_n(9, LogpValue)
+
+top2 <- dge_g1_sub %>%
+  dplyr::filter(logFC < 1) %>%
+  dplyr::top_n(9, LogpValue)
+
+tops <- c(top1$UniqGeneID, top2$UniqGeneID)
+  
+pVol <- 
+ggplot(dge_g1, aes(y=LogpValue, x=logFC, colour=Sig, label=UniqGeneID)) +
+  geom_point(size=1, alpha=0.8) + 
+  scale_colour_manual(values=c("grey70", "black")) +
+  theme_bw() +
+  geom_vline(xintercept = up_thresh, linetype=2, alpha=0.3) +
+  geom_vline(xintercept = dwn_thresh, linetype=2, alpha=0.3) +
+  labs(y=expression(paste("-log"[10], " p-value")),
+       x=expression(paste("log"[2], " Fold Change"))) +
+  guides('colour'=guide_legend(title="Statistically significant")) +
+  theme(panel.grid.major = element_line(linetype = "blank"), 
+        panel.grid.minor = element_line(linetype = "blank")) +
+    geom_text_repel(
+    data = base::subset(dge_g1, UniqGeneID %in% tops),
+    force=40, seed=999) +
+  NULL
+
+ggsave(filename = file.path(outDir_noLMP, "ViolPlot_k4_vs_k5.pdf"), device = "pdf", width = 8, height = 5, dpi = 300)
+ggsave(filename = file.path(outDir_noLMP, "ViolPlot_k4_vs_k5.png"), device = "png", width = 8, height = 5, dpi = 300)
+
+```
+
+Plot differently
+
+```{r}
+geneToPlot <- c(
+
+  "Ikzf2",
+  "Gata1",
+  "Klf1",
+  "Csf2rb",
+  
+  "Notch1",
+  "Il7r",
+  "Flt3",
+  "Ighm"
+  )
+
+setmp <- se
+setmp$finalCluster2 <- setmp$TreeCut_re
+pal <- pal.YS_clust_simple
+expInt <- assay(setmp, "logcounts")[geneToPlot,]
+m <- as.data.frame(expInt)
+colnames(m) <- setmp$Barcode
+m$gene <- row.names(m)
+m <- melt(m)
+m$gene <- factor(m$gene, levels=geneToPlot)
+dftmp <- as.data.frame(colData(setmp)) 
+cD_sub <- dftmp %>%
+  dplyr::select(Barcode, finalCluster2) # %>%
+#dplyr::filter(cell_cycle %in% "G1")
+m <- m %>%
+  dplyr::left_join(cD_sub, by = c("variable" = "Barcode"))
+
+# Find number of cells expressing in each group and write it on the top of the plot
+df_g <- m %>%
+  dplyr::group_by(finalCluster2, gene) %>%
+  summarise(Ncell = n(),
+            Nexp = sum( value >0 )) %>%
+  dplyr::mutate(PecExp = round(Nexp / Ncell * 100, 0),
+                  Text = paste0("(", PecExp, "%", ")")) %>%
+  dplyr::arrange(gene, finalCluster2)
+
+# Plot
+p_viol_gene <- 
+  m %>%
+  ggplot(aes(x = finalCluster2, y = value, colour = finalCluster2)) +
+  geom_violin(fill=NA, scale="width", size=1.5) +
+    geom_quasirandom(groupOnX=TRUE, size = 0.8, alpha = 0.5, width = 0.4) +
+    stat_summary(fun.y = mean, fun.ymin = mean, fun.ymax = mean,
+                 geom = "crossbar", width = 0.3, alpha = 0.8, colour="black") +
+
+  facet_wrap(~gene, ncol=8) +
+  scale_colour_manual(values=pal) +
+  theme_bw() +
+  theme(legend.position = "none",
+        panel.grid.major = element_line(linetype = "blank"), 
+        panel.grid.minor = element_line(linetype = "blank"),
+        axis.text.x = element_text(angle = 45, hjust = 1)) +
+  scale_y_continuous(limits = c(0,13),
+                     breaks = c(0,5,10)) +
+    #geom_text(data=df_g ,
+    #        aes(x = finalCluster2, y=12, label=Text),
+    #        color="black", size = 8) +
+  xlab("") +
+  NULL
+#p_viol_gene
+
+ggsave(filename = file.path(outDir_noLMP, "ViolPlot_k4_vs_k5_wide.pdf"), device = "pdf", width = 30, height = 7, dpi = 300)
+```
+
+
+
+Read the results from enricher
+
+```{r}
+enrc_k4 <- read.delim(file.path(dataDir, "Others/enricher/k4_vs_k5_high_k4_GO_Biological_Process_2021_table.txt")) %>%
+  dplyr::mutate(LogpValue = -log10(Adjusted.P.value),
+                term = gsub(".*\\(", "", Term),
+                term = gsub(")", "", term),
+                name = gsub("\\(.*", "", Term)) %>%
+  dplyr::slice_max(LogpValue, n=5, with_ties=FALSE) %>%
+  dplyr::arrange(desc(LogpValue)) %>%
+  dplyr::mutate(term = factor(term, levels=rev(term)))
+  
+  
+p_k4 <-
+  ggplot(enrc_k4, aes(x=term, y=LogpValue)) +
+  geom_bar(fill=pal.YS_clust_simple[4], size=5, stat="identity") +
+  theme_bw() +
+  theme(panel.grid.major = element_line(linetype = "blank"),
+        panel.grid.minor = element_line(linetype = "blank")) +
+  geom_hline(yintercept = -log10(0.05), linetype=2, alpha=0.3) +
+  geom_text(aes(label=name),color="white",size=4,position=position_stack(vjust=0.5)) +
+  scale_y_continuous(breaks=c(0,2,4,6)) +
+  coord_flip()
+
+# Repeat for k5
+enrc_k5 <- read.delim(file.path(dataDir, "Others/enricher/k4_vs_k5_high_k5_GO_Biological_Process_2021_table.txt")) %>%
+  dplyr::mutate(LogpValue = -log10(Adjusted.P.value),
+                term = gsub(".*\\(", "", Term),
+                term = gsub(")", "", term),
+                name = gsub("\\(.*", "", Term)) %>%
+  dplyr::slice_max(LogpValue, n=5, with_ties=FALSE) %>%
+  dplyr::arrange(desc(LogpValue)) %>%
+  dplyr::mutate(term = factor(term, levels=rev(term)))
+  
+  
+p_k5 <-
+  ggplot(enrc_k5, aes(x=term, y=LogpValue)) +
+  geom_bar(fill=pal.YS_clust_simple[5], size=5, stat="identity") +
+  theme_bw() +
+  theme(panel.grid.major = element_line(linetype = "blank"),
+        panel.grid.minor = element_line(linetype = "blank")) +
+  geom_hline(yintercept = -log10(0.05), linetype=2, alpha=0.3) +
+  geom_text(aes(label=name),color="white",size=4,position=position_stack(vjust=0.5)) +
+  scale_y_continuous(breaks=c(0,2,4,6)) +
+  coord_flip()
+
+p_k4 + p_k5 + plot_layout(ncol=1)
+  
+ggsave(filename = file.path(outDir_noLMP, "Enricher_k4_k5.pdf"), device = "pdf", width = 7, height = 5, dpi = 300)
+```
+
+Show example genes
+
+```{r}
+geneToPlot <- c("Gata1", "Csf2rb", "Prss2", "Gsn", "Ptprc")
+setmp <- se
+setmp$finalCluster2 <- setmp$TreeCut_re
+pal <- pal.YS_clust_simple
+expInt <- assay(setmp, "logcounts")[geneToPlot,]
+m <- as.data.frame(expInt)
+colnames(m) <- setmp$Barcode
+m$gene <- row.names(m)
+m <- melt(m)
+m$gene <- factor(m$gene, levels=geneToPlot)
+dftmp <- as.data.frame(colData(setmp)) 
+cD_sub <- dftmp %>%
+  dplyr::select(Barcode, finalCluster2) # %>%
+#dplyr::filter(cell_cycle %in% "G1")
+m <- m %>%
+  dplyr::left_join(cD_sub, by = c("variable" = "Barcode"))
+
+# Find number of cells expressing in each group and write it on the top of the plot
+df_g <- m %>%
+  dplyr::group_by(finalCluster2, gene) %>%
+  summarise(Ncell = n(),
+            Nexp = sum( value >0 )) %>%
+  dplyr::mutate(PecExp = round(Nexp / Ncell * 100, 0),
+                  Text = paste0("(", PecExp, "%", ")")) %>%
+  dplyr::arrange(gene, finalCluster2)
+df_g$value <- c(rep(10,5), rep(12,5),rep(13,5),rep(13,5),rep(10,5))
+  
+  
+# Plot
+p_viol_gene <- 
+  m %>%
+  ggplot(aes(x = finalCluster2, y = value, colour = finalCluster2)) +
+  geom_violin(fill=NA, scale="width") +
+    geom_quasirandom(groupOnX=TRUE, size = 0.8, alpha = 0.5, width = 0.4) +
+    stat_summary(fun.y = mean, fun.ymin = mean, fun.ymax = mean,
+                 geom = "crossbar", width = 0.3, alpha = 0.8, colour="black") +
+
+  facet_wrap(~gene, ncol=5, scales = "free_y") +
+  scale_colour_manual(values=pal) +
+  theme_bw() +
+  theme(legend.position = "none",
+        panel.grid.major = element_line(linetype = "blank"), 
+        panel.grid.minor = element_line(linetype = "blank"),
+        axis.text.x = element_text(angle = 45, hjust = 1)) +
+  scale_y_continuous(breaks = c(0,4,8,12,16)) +
+  geom_text(data=df_g ,
+            aes(x = finalCluster2, y = value, label=Text),
+            color="black", size = 4) +
+  xlab("") +
+  NULL
+p_viol_gene
+
+ggsave(filename = file.path(outDir_noLMP, "SelectedGenes_wide.pdf"), device = "pdf", width = 14, height = 4.5, dpi = 300)
+```
+
+
+Once we have the differentially expresed genes. We now select the genes as an EMP or LMP signature genes. The signature genes should ;
+
+ - NOT be expresesed in more than 80% of other YS cell populations
+ - NOT be expressed in the other population >50%
+
+```{r}
+# Create signature
+dge_g1_sig <- dge_g1_sub %>%
+  dplyr::mutate(Sig = case_when(logFC >= 1.5 & otherPop_detc <=80 & 
+                                  pct_detect_k_4 <= 50 
+                                  ~ "LMP_sig",
+                                logFC <= -1.5 & otherPop_detc <=80 &
+                                  pct_detect_k_5 <= 50 
+                                ~ "EMP_sig",
+                                TRUE ~ "non_sig_genes"))
+
+write.csv(dge_g1_sig, file.path(outDir_noLMP, "DE_full_EMPk4_vs_LMPk5_filtered_sig.csv"))
+
+EMP_sig <- dge_g1_sig %>%
+  dplyr::filter(Sig == "EMP_sig") %>%
+  pull(UniqGeneID)
+
+LMP_sig <- dge_g1_sig %>%
+  dplyr::filter(Sig == "LMP_sig") %>%
+  pull(UniqGeneID)
+```
+
+
+Now put back these signature in the main paper
+
+```{r}
+dge_g1_v2 <- dge_g1 %>%
+  dplyr::mutate(Signature = 
+                  case_when(UniqGeneID %in% EMP_sig ~ "EMP_sig",
+                            UniqGeneID %in% LMP_sig ~ "LMP_sig",
+                            TRUE ~ "non-signature"))
+
+# Extra for thesis. Load the EMP and LMP from blood paper
+public_emp <- read.csv("~/Desktop/tmp/emp_sig.csv")
+public_lmp <- read.csv("~/Desktop/tmp/lmp_sig.csv")
+
+dge_g1_v2 <- dge_g1_v2 %>%
+  dplyr::mutate(Public_EMP = case_when(UniqGeneID %in% public_emp$EMP ~ "TRUE",
+                            TRUE ~ "FALSE"),
+                Public_LMP = case_when(UniqGeneID %in% public_lmp$LMP ~ "TRUE",
+                            TRUE ~ "FALSE"))
+
+write.csv(dge_g1_v2, file.path(outDir_noLMP, "DE_full_EMPk4_vs_LMPk5.csv"))
+```
+
+
+
+## Save
+
+Save the seObject with the cluster information
+
+```{r}
+# Cells to exclude
+toRemove <- c(toRemove, toRemove_nonLMP)
+
+saveRDS(se, file.path(outData_dir, "se_YS_only_fullInfo.RDS"))
+write.csv(umap.df.int, file.path(outDir_noLMP, "Metadata_YS_only.csv"))
+saveRDS(toRemove, file.path(outData_dir, "Cells_to_exclude.csv"))
+
+# Full image
+save.image(file=file.path(outDir_noLMP, "Full_image.Rdata"))
+#load(file=file.path(outDir_noLMP, "Full_image.Rdata"))
+```
+
+
+## Session Info
+
+```{r}
+sessionInfo()
+```
+
+
+
+
+# Not RUN 
+
+If we want to show numb of expressing cells
+
+```{r,eval=FALSE}
+  # Find number of cells expressing in each group and write it on the top of the plot
+df_g <- m %>%
+    group_by(finalCluster2, gene) %>%
+    dplyr::summarise(Ncell = n(),
+              Nexp = sum( value >0 )) %>%
+    dplyr::mutate(PecExp = round(Nexp / Ncell * 100, 1),
+                  #Text = paste0(Nexp, " (", PecExp, "%", ")")) 
+                  Text = paste0(" (", PecExp, "%", ")")) 
+                  #Text = paste0(Nexp, "/", Ncell, "=", PecExp, "%")) 
+
+p_viol_gene2 <-
+   m %>%
+  ggplot(aes(x = finalCluster2, y = value, colour = finalCluster2)) +
+  geom_violin(fill=NA, scale="width") +
+    geom_quasirandom(groupOnX=TRUE, size = 2.2, alpha = 0.7, width = 0.4) +
+    stat_summary(fun.y = mean, fun.ymin = mean, fun.ymax = mean,
+                 geom = "crossbar", width = 0.3, alpha = 0.8, colour="black") +
+
+  facet_grid(gene ~ .) +
+  scale_colour_manual(values=pal) +
+  theme_bw() +
+  theme(legend.position = "none",
+        panel.grid.major = element_line(linetype = "blank"), 
+        panel.grid.minor = element_line(linetype = "blank"),
+        axis.text.x = element_text(angle = 45, hjust = 1)) +
+  scale_y_continuous(limits = c(0,15),
+                     breaks = c(0,5,10, 15)) +
+  xlab("") +
+  xlab("") +
+  geom_text(data=df_g ,
+              aes(x = finalCluster2, y = max(m$value + 1), label=Text),
+              color="black", size = 4) +
+  NULL
+
+pdf(file.path(outDir_DE, "MarkerGenes_perCluster_v4.pdf"), height = 21.6, width = 19.6)
+p_viol_gene2
+dev.off()
+```
+
+## Index correlation
+
+We want to see if we can say antyhing about the index sort values. Subset to only the interested YS populations
+
+```{r,eval=FALSE}
+cD <- as.data.frame(colData(se))
+
+# Join with index FACS info
+dd <- cD %>%
+  mutate(UniqID = paste(SC_project, SC_plate, FACS_well, sep="_")) %>%
+  left_join(df_indx)
+
+
+# Add a column to simplify the annotation
+dd <- dd %>%
+  mutate(
+    MainPop = gsub("AGM_", "", condition),
+    MainPop = gsub("YS_", "", condition),
+    
+    MainPop = gsub("HE_Gfi1", "HE", MainPop),
+    MainPop = gsub("HE_Runx1", "HE", MainPop)
+  )
+
+
+umap.df.int <- umap.df.int %>%
+  dplyr::mutate(Barcode = se$Barcode)
+
+dd_sub <- dd %>%
+  dplyr::filter(condition %in% c("YS_E9.0_HE_Runx1", "YS_E9.5_HE_Runx1", "YS_E10.5_HE_Runx1",
+                                 "YS_E9.0_HE_Gfi1", "YS_E9.5_HE_Gfi1", "YS_E10.5_HE_Gfi1")) %>%
+  #dplyr::filter(Allele == "RG") %>%
+  mutate(lRUNX1b = log10(Runx1b_RFP + 200) ,
+         lGfi1 = log10(Gfi1_GFP+ 200) ) %>%
+  mutate(MainPop = factor(MainPop, levels=c("E9.0_HE", "E9.5_HE", "E10.5_HE"))) %>%
+  dplyr::left_join(dplyr::select(umap.df.int, UMAP_1, UMAP_2, Barcode))
+
+```
+
+Plot RFP in UMAP
+
+```{r,eval=FALSE}
+gg <- "RFP"
+expInt <- data.frame(
+  gene = assay(se, "logcounts")[gg,],
+  Barcode = se$Barcode)
+
+df_plot <- dd_sub %>%
+  left_join(expInt)
+
+ggplot(df_plot, aes(x=UMAP_1, y=UMAP_2, colour=gene)) +
+  geom_point() +
+  theme_custom +
+  theme(axis.text = element_blank(),
+        axis.ticks = element_blank(),
+        axis.title = element_blank(),
+        legend.position = "none") +
+  scale_colour_viridis(option = "plasma", na.value = "grey80", begin = 0, end = 1) +
+  NULL
+
+```
+
+
+
+
+
+```{r,eval=FALSE}
+p2 <-
+ggplot(dd_sub, aes(y=(lRUNX1b), x=(lGfi1), colour=Allele)) +
+  geom_point(alpha = 0.5, size=3) +
+  #gghighlight(use_direct_label = FALSE) +
+  theme(legend.position = "right") +
+  facet_wrap(~MainPop) +
+  theme_custom +
+  geom_vline(xintercept = 3.5, linetype = "dashed") +
+  geom_hline(yintercept = 3, linetype = "dashed") +
+  #scale_colour_manual(values=c("#00B050", "#FF006D")) +
+  scale_colour_manual(values=c("black", "firebrick")) +
+  NULL
+
+
+pdf(file.path(outDir_inHouse6_scater_outlier, "INDEX_corelatiion.pdf"), height=4, width = 9)
+p2
+dev.off()
+```
+
+Extract the cells with really high Gfi1 or Runx1
+
+```{r,eval=FALSE}
+dd_sub <- dd_sub %>%
+  dplyr::mutate(FACSgate  = case_when(
+    lRUNX1b >= 3.5 & lGfi1 >= 4  & condition == "YS_E10.5_HE_Gfi1" ~ "High",
+    lRUNX1b <= 3.2 & lGfi1 <= 3.2 ~ "Low",
+    TRUE ~ "notAssigned")) 
+
+
+ggplot(dd_sub, aes(y=(lRUNX1b), x=(lGfi1), colour=FACSgate)) +
+  geom_point(alpha = 0.5, size=3) +
+  #gghighlight(use_direct_label = FALSE) +
+  theme(legend.position = "right") +
+  facet_wrap(~MainPop) +
+  theme_custom +
+  geom_vline(xintercept = 4, linetype = "dashed") +
+  geom_hline(yintercept = 3.5, linetype = "dashed") +
+  geom_vline(xintercept = 3.2, linetype = "dashed", colour="red") +
+  geom_hline(yintercept = 3.2, linetype = "dashed", colour="red") +
+  NULL
+
+ggplot(dd_sub, aes(y=(lRUNX1b), x=(lGfi1), colour=condition)) +
+  geom_point(alpha = 0.5, size=3) +
+  #gghighlight(use_direct_label = FALSE) +
+  theme(legend.position = "right") +
+  facet_wrap(~MainPop) +
+  theme_custom +
+  geom_vline(xintercept = 4, linetype = "dashed") +
+  geom_hline(yintercept = 3.5, linetype = "dashed") +
+  geom_vline(xintercept = 3.2, linetype = "dashed", colour="red") +
+  geom_hline(yintercept = 3.2, linetype = "dashed", colour="red") +
+  NULL
+```
+
+Plot where they are in UMAP
+
+```{r,eval=FALSE}
+dd_sub2 <- dd_sub %>%
+  dplyr::select(Barcode, FACSgate)
+
+
+
+dd2 <- dd %>%
+  left_join(dd_sub2) 
+
+
+dd_dim <- reducedDim(se, "UMAP")
+colnames(dd_dim) <- c("UMAP_1", "UMAP_2")
+
+
+dd2 <- cbind(dd2, dd_dim)
+
+ggplot(dd2, aes(x=UMAP_1, y=UMAP_2, colour=FACSgate)) +
+    geom_point(size=3) +
+    theme_custom +
+  NULL
+```
+
+
+
+
